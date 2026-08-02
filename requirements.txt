@@ -1,0 +1,25 @@
+streamlit>=1.30
+pandas>=2.0
+numpy>=1.24
+pymongo>=4.5
+openpyxl>=3.1
+python-dotenv>=1.0
+plotly>=5.18
+requests>=2.31
+# FastAPI backend layer (api/) — the Streamlit app above still runs standalone
+# and does not need these; they're only imported by api/*.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pyjwt>=2.8
+python-multipart>=0.0.9
+# Encryption at rest for per-client broker credentials (credentials_vault.py).
+# Usually already present as a pymongo dependency; pinned explicitly so it is
+# never relied on transitively.
+cryptography>=42.0
+# Optional broker SDKs — install only the ones you actually use.
+# The bot runs fully in Paper/Simulation mode without any of these.
+upstox-python-sdk>=2.9
+# dhanhq>=2.0
+kiteconnect>=5.0  # Zerodha
+# neo-api-client   # Kotak Neo (from their GitHub)
+# yfinance>=0.2    # optional: real historical data for the backtester
