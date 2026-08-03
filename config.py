@@ -57,6 +57,15 @@ def _env(key: str, default: str = "") -> str:
 MONGO_URI = _env("MONGO_URI", "mongodb://localhost:27017/")
 MONGO_DB_NAME = _env("MONGO_DB_NAME", "trading_bot")
 
+# Connection-pool ceiling for the single shared MongoClient (mongo_client.py).
+# pymongo's own default is 100 sockets, each TLS-wrapped to Atlas — far more
+# than this workload needs and a real cost on a 1 GB server. A handful of
+# concurrent users and one engine thread never exceed a pool of 5.
+try:
+    MONGO_MAX_POOL_SIZE = max(1, int(_env("MONGO_MAX_POOL_SIZE", "5")))
+except ValueError:
+    MONGO_MAX_POOL_SIZE = 5
+
 UPSTOX_SANDBOX_TOKEN = _env("UPSTOX_SANDBOX_TOKEN")
 UPSTOX_LIVE_ACCESS_TOKEN = _env("UPSTOX_LIVE_ACCESS_TOKEN")
 UPSTOX_LIVE_API_KEY = _env("UPSTOX_LIVE_API_KEY")

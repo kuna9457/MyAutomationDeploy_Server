@@ -90,7 +90,8 @@ def main() -> int:
         print("Not saved. Copy this into your .env when ready:")
         print(f'UPSTOX_LIVE_ACCESS_TOKEN="{token}"')
 
-    print("\nDone. Restart the bot (streamlit run app.py) to use the new token.")
+    print("\nDone. Restart the API (sudo systemctl restart trading-api) to use "
+          "the new token.")
     return 0
 
 

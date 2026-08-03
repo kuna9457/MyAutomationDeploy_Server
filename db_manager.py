@@ -21,11 +21,16 @@ from typing import Any, Optional
 import pandas as pd
 
 import config
+import mongo_client
 from config import Environment
 
 
 PAPER_COLLECTION = "paper_trades"
 LIVE_COLLECTION = "live_trades"
+
+#: Indexes are created once per process, not once per DBManager — see
+#: DBManager._ensure_indexes.
+_indexes_ready = False
 
 
 def _collection_name(env: Environment) -> str:
@@ -40,14 +45,20 @@ class DBManager:
 
     # -- connection --------------------------------------------------------- #
     def _connect_mongo(self) -> None:
+        """Attach to the process-wide MongoClient (see mongo_client.py).
+
+        Every DBManager used to build its OWN client and pool. They now share
+        one, but the semantics here are unchanged: we still ping at construction
+        so `self.db` is only set when Mongo genuinely answers, and a failure
+        still leaves this instance on the local-JSON path."""
         try:
-            from pymongo import MongoClient  # type: ignore
-            client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=1500)
+            client = mongo_client.get_client()
+            if client is None:
+                raise RuntimeError("no Mongo client available")
             client.admin.command("ping")            # force a real connection test
             self.client = client
             self.db = client[config.MONGO_DB_NAME]
             self._ensure_indexes()
-            print("[DBManager] Connected to MongoDB.")
         except Exception as exc:
             print(f"[DBManager] MongoDB unavailable ({exc}); using local JSON.")
             self.client = None
@@ -56,12 +67,19 @@ class DBManager:
     def _ensure_indexes(self) -> None:
         """One-time index setup for query speed at cloud scale. Best-effort and
         idempotent — never raised past this method, since missing an index is a
-        performance detail, never a reason to fail startup or drop to local JSON."""
+        performance detail, never a reason to fail startup or drop to local JSON.
+
+        Guarded by a process-wide flag: with a shared client the indexes only
+        ever need creating once, not on every DBManager construction."""
+        global _indexes_ready
+        if _indexes_ready:
+            return
         try:
             for coll_name in (PAPER_COLLECTION, LIVE_COLLECTION):
                 coll = self.db[coll_name]
                 coll.create_index("trade_id", unique=True)
                 coll.create_index([("status", 1), ("timestamp", -1)])
+            _indexes_ready = True
         except Exception as exc:
             print(f"[DBManager] Index setup skipped ({exc}).")
 

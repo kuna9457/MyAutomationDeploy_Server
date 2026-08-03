@@ -29,10 +29,16 @@ from api import engine_registry
 from api.auth import CurrentUser, get_current_user
 from api.schemas import StartBotRequest
 from config import Broker, Environment, Mode
+from db_manager import DBManager
 from engine import TradingEngine
 from fastapi import APIRouter, Depends, HTTPException
 
 router = APIRouter(prefix="/bot", tags=["bot"])
+
+# One long-lived manager for this router, matching trades.py/admin_users.py.
+# `reset_environment` below used to construct a throwaway DBManager per request
+# and never close it, leaking a client and its monitor threads on every call.
+_db = DBManager()
 
 _BROKER_LABELS = {"Upstox": Broker.UPSTOX, "Dhan": Broker.DHAN,
                   "Zerodha": Broker.ZERODHA, "Kotak Neo": Broker.KOTAK}
@@ -215,6 +221,5 @@ def reset_portfolio(environment: str, user: CurrentUser = Depends(get_current_us
     if eng is not None and eng.environment == env:
         stats = eng.reset_portfolio()
     else:
-        from db_manager import DBManager
-        stats = DBManager().reset_environment(env, user_id=user.username)
+        stats = _db.reset_environment(env, user_id=user.username)
     return stats

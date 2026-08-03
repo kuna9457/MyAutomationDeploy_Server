@@ -1,13 +1,13 @@
-streamlit>=1.30
+# Core runtime. The UI is the React app in frontend/ — this process serves the
+# API only, so no Streamlit/plotly here (removed; charting is Recharts client-side).
 pandas>=2.0
 numpy>=1.24
 pymongo>=4.5
-openpyxl>=3.1
+openpyxl>=3.1          # Excel export in db_manager.export_*
 python-dotenv>=1.0
-plotly>=5.18
 requests>=2.31
-# FastAPI backend layer (api/) — the Streamlit app above still runs standalone
-# and does not need these; they're only imported by api/*.
+# FastAPI backend layer (api/) — this is the process you actually run:
+#   uvicorn api.main:app --host 127.0.0.1 --port 8000
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pyjwt>=2.8

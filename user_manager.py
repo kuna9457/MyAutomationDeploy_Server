@@ -40,15 +40,19 @@ def _public(user: Optional[dict]) -> Optional[dict]:
         return None
     return {k: v for k, v in user.items() if k not in _SENSITIVE_FIELDS}
 
+# Shares the one process-wide MongoClient with DBManager rather than opening a
+# second pool of its own (see mongo_client.py). The fallback contract is
+# unchanged: if Mongo is unreachable, _db stays None and every accessor below
+# transparently uses the local JSON store.
 _client = None
 _db = None
 try:
-    from pymongo import MongoClient  # type: ignore
-    _client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=1500)
-    _client.admin.command("ping")
+    import mongo_client as _mongo
+    _client = _mongo.get_client()
+    if _client is None:
+        raise RuntimeError("no Mongo client available")
     _db = _client[config.MONGO_DB_NAME]
     _db["users"].create_index("username", unique=True)
-    print("[user_manager] Connected to MongoDB.")
 except Exception as exc:
     print(f"[user_manager] MongoDB unavailable ({exc}); using local JSON.")
     _client = None
