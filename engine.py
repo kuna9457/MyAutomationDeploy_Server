@@ -27,6 +27,7 @@ import time as _time
 
 import config
 import risk_manager
+import symbol_config
 from broker_api import BaseBroker, fetch_upstox_margin, make_broker
 from config import (Broker, Environment, Instrument, Mode, Segment,
                     market_hours_for_segment, now_ist, params_for_mode)
@@ -118,6 +119,7 @@ class TradingEngine:
         broker_access_token: str = "",
         broker_api_key: str = "",
         risk_reward: float = 0.0,
+        symbol_rules: Optional[dict[str, "symbol_config.SymbolRules"]] = None,
     ):
         self.environment = environment
         self.mode = mode
@@ -161,6 +163,21 @@ class TradingEngine:
         if risk_reward and risk_reward > 0:
             params = replace(params, risk_reward=float(risk_reward))
         self.params = params
+        # PER-SYMBOL overrides (symbol_config.py): trading days, an intraday
+        # entry window, and that symbol's own RR. Resolved by the caller into
+        # SymbolRules and keyed ONLY by symbols that actually change something,
+        # so an unconfigured symbol is a dict miss and takes exactly the code
+        # path it took before this feature existed.
+        #
+        # Scope is deliberately narrow: these gate whether a NEW entry may be
+        # opened and where the target sits. They never touch signal generation,
+        # sizing, or the management of an already-open position — the one
+        # exception being the explicitly opt-in square_off_at_end.
+        self.symbol_rules = dict(symbol_rules or {})
+        # symbol -> the last window/day skip reason logged for it. The loop
+        # re-evaluates every poll (twice a second on the Scalper), so the skip
+        # is logged once per REASON CHANGE rather than on every tick.
+        self._window_skip_logged: dict[str, str] = {}
         # The Scalper trades 1-minute bars with a 7-minute time exit, so a 3s loop
         # would be a meaningful share of the whole trade. Poll sub-second there.
         self.poll_seconds = poll_seconds or (
@@ -254,6 +271,10 @@ class TradingEngine:
             f"risk {self.params.risk_per_trade:.1%} per trade / "
             f"RR 1:{self.params.risk_reward:g} / "
             f"SL {self.params.atr_sl_mult:g}×ATR({self.params.atr_period})")
+        # Name every symbol that deviates from the line above, so the log makes
+        # a custom window/RR visible instead of it silently changing behaviour.
+        for rules in self.symbol_rules.values():
+            self.state.push_log(f"⚙️ Custom settings — {rules.describe()}")
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -393,7 +414,8 @@ class TradingEngine:
             self._stop.wait(self.poll_seconds)
 
     def _tick(self) -> None:
-        now_t = now_ist().time()
+        now_dt = now_ist()
+        now_t = now_dt.time()
         # Reset the live day-PnL counter when the calendar day turns over.
         self._rollover_if_new_day()
         with self.state.lock:
@@ -409,6 +431,9 @@ class TradingEngine:
         for inst in self.instruments:
             hours = market_hours_for_segment(inst.segment)
             market_open = hours.is_open(now_t)
+            # None for any symbol the user hasn't given custom settings — the
+            # whole feature is inert from here down when that is the case.
+            rules = self.symbol_rules.get(inst.symbol)
 
             quote = self.feed.get_quote(inst)
             self._publish_quote(inst, quote, market_open)
@@ -422,6 +447,18 @@ class TradingEngine:
 
             # 1) manage an open position (exit on SL/TP/time) regardless of signals
             if inst.symbol in self.state.open_positions:
+                # Opt-in per-symbol exit: close out when this symbol's own
+                # trading window ends. Checked BEFORE _manage_open so the
+                # window is honoured on the same tick it lapses. Default off,
+                # so an unconfigured symbol (or one with only a day/RR
+                # override) never reaches this branch and its SL/TP/time-exit
+                # remain the only things that can close it.
+                if (rules is not None and rules.square_off_at_end
+                        and not (rules.day_allowed(now_dt)
+                                 and rules.window_open(now_t))):
+                    if self._close_for_window(inst, live_price, rules) and bar_ts is not None:
+                        self._last_action_bar[inst.symbol] = bar_ts
+                    continue
                 if self._manage_open(inst, live_price) and bar_ts is not None:
                     # Record the exit bar so the cooldown starts from here.
                     self._last_action_bar[inst.symbol] = bar_ts
@@ -430,6 +467,18 @@ class TradingEngine:
             # 2) only look for new entries while that segment's market is open
             if not market_open or df.empty:
                 continue
+
+            # 2b) ...and, for a symbol with custom settings, only on its own
+            # configured days and inside its own time window. This gates NEW
+            # entries ONLY — everything above (position management, exits) has
+            # already run, so a position opened earlier is still carried to its
+            # stop/target exactly as before.
+            if rules is not None:
+                blocked = rules.entry_block_reason(now_dt)
+                if blocked:
+                    self._log_window_skip(inst.symbol, blocked)
+                    continue
+                self._window_skip_logged.pop(inst.symbol, None)
 
             # LIVE risk kill-switch: existing open positions above are still
             # managed to their SL/TP/time-exit either way — this only blocks
@@ -518,12 +567,21 @@ class TradingEngine:
                         f"₹{deployed:,.0f} (live funds check).")
                     qty = 0
 
+            # Report the RR (and therefore the target) this trade will ACTUALLY
+            # be entered at — the per-symbol override, else admin's per-mode
+            # one, else the strategy's own. sig.target still carries only the
+            # strategy's own RR at this point; _enter re-derives it from the
+            # real fill the same way, so the row matches the resulting trade.
+            eff_rr = self._rr_for(inst.symbol)
+            risk_dist = abs(sig.entry_price - sig.stop_loss)
+            eff_target = (sig.entry_price + eff_rr * risk_dist if sig.side == "BUY"
+                          else sig.entry_price - eff_rr * risk_dist)
             sig_row = {
                 "time": now_ist().strftime("%H:%M:%S"),
                 "symbol": inst.symbol, "segment": inst.segment.value,
                 "side": sig.side, "entry": round(sig.entry_price, 2),
-                "stop": round(sig.stop_loss, 2), "target": round(sig.target, 2),
-                "rr": round(sig.risk_reward, 2), "qty": qty,
+                "stop": round(sig.stop_loss, 2), "target": round(eff_target, 2),
+                "rr": round(eff_rr, 2), "qty": qty,
                 "deployed": round(deployed, 2), "reason": sig.reason,
             }
             with self.state.lock:
@@ -572,6 +630,48 @@ class TradingEngine:
 
             if self._enter(inst, sig, qty, risk_amt, quote, live_qty_clip, lev):
                 self._last_action_bar[inst.symbol] = bar_ts
+
+    # -- per-symbol settings (symbol_config.py) ----------------------------- #
+    def _rr_for(self, symbol: str) -> float:
+        """The risk:reward this symbol trades at, most specific first:
+        its own override -> the run's RR (admin's per-mode override, else the
+        strategy's own).
+
+        RR moves the TARGET only — position size is risk_budget /
+        stop_distance and never reads it (Immutable Rule #1) — so nothing
+        resolved here can widen the risk taken on a trade.
+        """
+        rules = self.symbol_rules.get(symbol)
+        if rules is not None and rules.risk_reward > 0:
+            return rules.risk_reward
+        return self.params.risk_reward
+
+    def _log_window_skip(self, symbol: str, reason: str) -> None:
+        """Log a day/window entry block ONCE per reason, not once per poll.
+        At the Scalper's 0.5s loop an unthrottled message would bury the log
+        (and the 200-line buffer) within seconds of the window closing."""
+        if self._window_skip_logged.get(symbol) == reason:
+            return
+        self._window_skip_logged[symbol] = reason
+        self.state.push_log(
+            f"⏸️ {symbol}: new entries paused — {reason} (custom settings). "
+            f"Open positions are still managed normally.")
+
+    def _close_for_window(self, inst: Instrument, live_price: float,
+                          rules: "symbol_config.SymbolRules") -> bool:
+        """Square off an open position because this symbol's configured
+        trading window has ended (square_off_at_end). Claims the position
+        under the lock first — exactly like _manage_open and close_position —
+        so the trading loop and a concurrent manual close can never both
+        square the same position off."""
+        with self.state.lock:
+            trade = self.state.open_positions.pop(inst.symbol, None)
+        if trade is None:
+            return False
+        window = (f"{rules.start_t.strftime('%H:%M') if rules.start_t else 'open'}"
+                  f"–{rules.end_t.strftime('%H:%M') if rules.end_t else 'close'}")
+        self._finalize_close(inst, trade, live_price, f"WINDOW-END ({window})")
+        return True
 
     # -- commodity (MCX) fixed-lot sizing ----------------------------------- #
     def _mcx_fixed_size(
@@ -876,10 +976,14 @@ class TradingEngine:
                 f"(tick {tick}).")
             self.broker.square_off(inst, sig.side, qty, fill)  # unwind the fill
             return False
+        # This symbol's own RR when it has one, else the run's — see _rr_for.
+        # Resolved here, off the REAL fill, so the stored target and the RR in
+        # the log below can never disagree with what the position is managed to.
+        rr = self._rr_for(inst.symbol)
         if sig.side == "BUY":
-            target = round(fill + self.params.risk_reward * risk_dist, 2)
+            target = round(fill + rr * risk_dist, 2)
         else:
-            target = round(fill - self.params.risk_reward * risk_dist, 2)
+            target = round(fill - rr * risk_dist, 2)
 
         # LIVE-only: mirror this trade's SL/TP as a REAL protective order at
         # the broker (e.g. a Kite GTT OCO), so it's still protected if this
@@ -932,7 +1036,7 @@ class TradingEngine:
         self._trades_today += 1
         self.state.push_log(
             f"ENTER {inst.symbol} {sig.side} qty={qty} @ {fill:.2f} via {how} | "
-            f"SL={stop:.2f} TP={target:.2f} | RR 1:{self.params.risk_reward:g} "
+            f"SL={stop:.2f} TP={target:.2f} | RR 1:{rr:g} "
             f"| risk ₹{risk_amt:,.0f} ({risk_amt / self.total_capital:.2%}) "
             f"| notional ₹{notional:,.0f} "
             f"({notional / self.total_capital:.2f}x capital)"

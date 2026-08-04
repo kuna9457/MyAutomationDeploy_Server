@@ -12,14 +12,17 @@ import os
 
 import admin_config
 import config
+import presets
+import symbol_config
 import user_manager
 from admin_config import BotConfig
 from api import engine_registry
 from api.auth import CurrentUser, require_admin
 from api.schemas import (AdminConfigRequest, ClientModesRequest,
-                         CreateClientRequest, SetPasswordRequest,
-                         SetStatusRequest)
-from config import Environment
+                         CreateClientRequest, PresetSaveRequest,
+                         SetPasswordRequest, SetStatusRequest,
+                         SymbolConfigRequest)
+from config import Environment, Mode
 from db_manager import DBManager
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -182,6 +185,102 @@ def set_bot_config(req: AdminConfigRequest) -> BotConfig:
                  f"{', '.join(config.rr_label(c) for c in config.RR_CHOICES)}, "
                  f"or 0 to use the strategy's own.")
     return admin_config.set_mode_config(mode, **payload)
+
+
+# -- per-symbol settings (symbol_config.py) ------------------------------------ #
+# ADMIN-ONLY, like everything else in this router: these decide when and at what
+# RR an instrument trades, so a client must not be able to set them for
+# themselves — they arrive at the engine server-side from here, never from a
+# client's own /bot/start body.
+
+def _valid_mode(mode: str) -> str:
+    try:
+        return Mode(mode).value
+    except ValueError:
+        raise HTTPException(
+            400, f"Invalid mode {mode!r}. Use one of "
+                 f"{', '.join(m.value for m in Mode)}.")
+
+
+@router.get("/symbol-config")
+def get_symbol_configs(mode: str):
+    """Every instrument with custom settings under this mode, as
+    {symbol: {...}}. Symbols absent from the map run the plain strategy."""
+    from dataclasses import asdict as _asdict
+    return {sym: _asdict(cfg)
+            for sym, cfg in symbol_config.get_all(_valid_mode(mode)).items()}
+
+
+@router.put("/symbol-config")
+def set_symbol_config(req: SymbolConfigRequest):
+    """Save one instrument's settings for one mode. Other symbols and other
+    modes are untouched, and a body that is entirely defaults RESETS the
+    symbol (the entry is deleted) rather than storing an inert one."""
+    mode = _valid_mode(req.mode)
+    if req.symbol not in config.INSTRUMENTS_BY_SYMBOL:
+        raise HTTPException(400, f"Unknown instrument: {req.symbol}.")
+    try:
+        cfg = symbol_config.validate(symbol_config.SymbolConfig(
+            trade_days=req.trade_days, start_time=req.start_time,
+            end_time=req.end_time, risk_reward=req.risk_reward,
+            square_off_at_end=req.square_off_at_end))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    symbol_config.set_symbol(mode, req.symbol, cfg)
+    return get_symbol_configs(mode)
+
+
+@router.delete("/symbol-config/{mode}/{symbol}")
+def delete_symbol_config(mode: str, symbol: str):
+    """Drop one instrument's settings — it goes back to trading exactly as the
+    strategy alone dictates."""
+    mode = _valid_mode(mode)
+    symbol_config.delete_symbol(mode, symbol)
+    return get_symbol_configs(mode)
+
+
+# -- saved Controls presets (presets.py) --------------------------------------- #
+# A preset is INERT: saving one never touches a running bot, and loading one
+# only repopulates the sidebar and restores that mode's per-symbol settings.
+# Nothing here starts, stops or reconfigures an engine.
+
+@router.get("/presets")
+def list_presets():
+    """Every saved setup as {name: preset}, for the picker."""
+    from dataclasses import asdict as _asdict
+    return {name: _asdict(p) for name, p in presets.load_all().items()}
+
+
+@router.put("/presets")
+def save_preset(req: PresetSaveRequest):
+    """Save (or overwrite) the whole Controls sidebar under a name."""
+    payload = req.model_dump()
+    name = payload.pop("name")
+    try:
+        presets.save(presets.clean_name(name), presets.validate(
+            presets.ControlPreset(**payload)))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return list_presets()
+
+
+@router.post("/presets/{name}/load")
+def load_preset(name: str):
+    """Restore a saved setup. Its per-symbol settings are written back for the
+    preset's OWN mode (replacing that mode's current ones — see presets.apply);
+    the rest is returned for the sidebar to repopulate itself with. The bot is
+    not started: that stays a separate, deliberate action."""
+    preset = presets.apply(name)
+    if preset is None:
+        raise HTTPException(404, f"No preset named {name!r}.")
+    from dataclasses import asdict as _asdict
+    return _asdict(preset)
+
+
+@router.delete("/presets/{name}")
+def delete_preset(name: str):
+    presets.delete(name)
+    return list_presets()
 
 
 @router.put("/config/client-modes")

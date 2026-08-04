@@ -104,3 +104,46 @@ class AdminConfigRequest(BaseModel):
 
 class ClientModesRequest(BaseModel):
     modes: list[str]          # subset of admin_config.CLIENT_SELECTABLE_MODES
+
+
+class SymbolConfigRequest(BaseModel):
+    """One instrument's own settings within one mode (symbol_config.py).
+
+    EVERY field defaults to its "not configured" value, so an omitted field
+    means "leave this at the strategy's behaviour" — and a body of all
+    defaults is treated as a reset, deleting the entry rather than storing an
+    inert one. The route validates via symbol_config.validate() before writing.
+    """
+    mode: str                          # "Intraday" | "Swing" | "Scalper"
+    symbol: str
+    #: Weekdays new entries may open on, 0=Mon .. 6=Sun. [] = every day.
+    trade_days: list[int] = []
+    #: "HH:MM" IST. "" = the segment's own session open/close.
+    start_time: str = ""
+    end_time: str = ""
+    #: 0 = inherit the mode/strategy RR. Validated against config.RR_CHOICES.
+    risk_reward: float = 0.0
+    #: Close an open position when the window ends. Default off.
+    square_off_at_end: bool = False
+
+
+class PresetSaveRequest(BaseModel):
+    """A named snapshot of the whole Controls sidebar (presets.py).
+
+    Purely a transport shape — every field mirrors one sidebar widget, and the
+    route hands them straight to presets.validate(). Saving is inert: it never
+    starts, stops or reconfigures a running bot.
+    """
+    name: str
+    environment: str = "Paper"
+    mode: str = "Intraday"
+    broker: str = ""
+    strategy_key: str = ""
+    segments: list[str] = ["NSE_EQUITY"]
+    symbols: list[str] = []
+    capital: float = 100_000.0
+    mcx_lots: dict[str, int] = {}
+    #: symbol -> that symbol's settings for `mode`, as SymbolConfigRequest's
+    #: fields. Omitted entirely, the preset simply carries no per-symbol
+    #: customisation and loading it clears the mode's settings.
+    symbol_configs: dict[str, dict] = {}

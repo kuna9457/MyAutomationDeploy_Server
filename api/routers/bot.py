@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import admin_config
 import config
+import symbol_config
 import user_manager
 from api import engine_registry
 from api.auth import CurrentUser, get_current_user
@@ -150,10 +151,18 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
     if existing and existing.state.running:
         existing.stop()
 
+    # Per-symbol settings (trading days / entry window / that symbol's own RR)
+    # are read SERVER-SIDE from admin's saved config for this mode, never from
+    # the request body — the same rule as strategy/instruments, so a client
+    # cannot widen their own trading window. Only symbols with settings that
+    # actually change something come back; everything else runs untouched.
+    rules = symbol_config.rules_for(mode.value, [i.symbol for i in selected])
+
     eng = TradingEngine(environment, mode, broker_choice, selected, req.capital,
                         strategy_key=strategy_key, mcx_lots=mcx_lots,
                         user_id=user.username, broker_access_token=access_token,
-                        broker_api_key=broker_api_key, risk_reward=risk_reward)
+                        broker_api_key=broker_api_key, risk_reward=risk_reward,
+                        symbol_rules=rules)
     try:
         eng.start()
     except RuntimeError as exc:
