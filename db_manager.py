@@ -478,7 +478,7 @@ class DBManager:
                      user_id: Optional[str] = None) -> str:
         """High-level analysis workbook: raw trades + a summary sheet."""
         if path is None:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stamp = config.now_ist().strftime("%Y%m%d_%H%M%S")
             path = os.path.join(config.LOCAL_DB_DIR,
                                 f"{_collection_name(env)}_analysis_{stamp}.xlsx")
         trades = self.get_trades(env, user_id=user_id)

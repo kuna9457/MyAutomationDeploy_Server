@@ -38,7 +38,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import Instrument, Mode, Segment
+from config import Instrument, Mode, Segment, now_ist
 
 
 CANDLE_COLUMNS = ["open", "high", "low", "close", "volume"]
@@ -141,7 +141,7 @@ class SimulatedFeed(MarketDataFeed):
             vol = int(abs(random.gauss(50_000, 20_000))) + 1000
             rows.append([o, hi, lo, c, vol])
             price = new
-        idx = pd.date_range(end=datetime.now(), periods=self.seed_bars,
+        idx = pd.date_range(end=now_ist(), periods=self.seed_bars,
                             freq=f"{self.tf_min}min")
         return pd.DataFrame(rows, columns=CANDLE_COLUMNS, index=idx)
 
@@ -205,8 +205,10 @@ def _fetch_rest_candles(hist_api, inst: Instrument, mode: Mode,
                         history_days: int) -> pd.DataFrame:
     """Pull real candles for one instrument and return an ascending OHLCV df
     indexed in IST wall-clock time. Raises on hard API errors (Swing path)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    frm = (datetime.now() - timedelta(days=history_days)).strftime("%Y-%m-%d")
+    # IST trading date, not the server's date — a UTC box before 05:30 IST would
+    # otherwise ask Upstox for *yesterday* and seed a stale session.
+    today = now_ist().strftime("%Y-%m-%d")
+    frm = (now_ist() - timedelta(days=history_days)).strftime("%Y-%m-%d")
     if mode == Mode.SWING:
         resp = hist_api.get_historical_candle_data1(
             inst.instrument_key, "day", today, frm, api_version="v2")
@@ -297,7 +299,7 @@ class UpstoxWebSocketFeed(MarketDataFeed):
             return (pd.Timestamp(int(ltt_ms), unit="ms", tz="UTC")
                     .tz_convert("Asia/Kolkata").tz_localize(None))
         except Exception:
-            return pd.Timestamp(datetime.now())
+            return pd.Timestamp(now_ist())
 
     def _seed_history(self, instruments: list[Instrument]) -> int:
         ok = 0
@@ -436,7 +438,7 @@ class UpstoxWebSocketFeed(MarketDataFeed):
             if ltp is None:
                 continue
             ts = (self._to_ist(ltpc["ltt"]) if ltpc.get("ltt")
-                  else pd.Timestamp(datetime.now()))
+                  else pd.Timestamp(now_ist()))
             vtt = ff.get("vtt")
             bid, ask = self._best_bid_ask(ff)
             try:

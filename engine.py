@@ -28,7 +28,7 @@ import config
 import risk_manager
 from broker_api import BaseBroker, fetch_upstox_margin, make_broker
 from config import (Broker, Environment, Instrument, Mode, Segment,
-                    market_hours_for_segment, params_for_mode)
+                    market_hours_for_segment, now_ist, params_for_mode)
 from data_feed import LiveQuote, MarketDataFeed, SimulatedFeed, make_feed
 from db_manager import DBManager
 from strategy import position_size, resolve_strategy, run_strategy
@@ -77,7 +77,7 @@ class BotState:
         self.risk_status: dict = {}
 
     def push_log(self, msg: str) -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
+        stamp = now_ist().strftime("%H:%M:%S")
         with self.lock:
             self.log.insert(0, f"[{stamp}] {msg}")
             self.log = self.log[:200]
@@ -340,9 +340,9 @@ class TradingEngine:
         minutes since the reload (the stored timestamp is UTC)."""
         try:
             entry_utc = datetime.fromisoformat(str(trade["timestamp"]))
-            return datetime.now() - (datetime.utcnow() - entry_utc)
+            return now_ist() - (datetime.utcnow() - entry_utc)
         except Exception:
-            return datetime.now()
+            return now_ist()
 
     def _refresh_daily(self) -> None:
         """Reload the day-wise history snapshot from storage into state."""
@@ -382,7 +382,7 @@ class TradingEngine:
             self._stop.wait(self.poll_seconds)
 
     def _tick(self) -> None:
-        now_t = datetime.now().time()
+        now_t = now_ist().time()
         # Reset the live day-PnL counter when the calendar day turns over.
         self._rollover_if_new_day()
         with self.state.lock:
@@ -508,7 +508,7 @@ class TradingEngine:
                     qty = 0
 
             sig_row = {
-                "time": datetime.now().strftime("%H:%M:%S"),
+                "time": now_ist().strftime("%H:%M:%S"),
                 "symbol": inst.symbol, "segment": inst.segment.value,
                 "side": sig.side, "entry": round(sig.entry_price, 2),
                 "stop": round(sig.stop_loss, 2), "target": round(sig.target, 2),
@@ -904,7 +904,7 @@ class TradingEngine:
         # Local-only bookkeeping (leading underscore = never persisted): set after
         # insert so the stored document stays exactly the Section-5 schema.
         trade["_live_price"] = fill
-        trade["_entry_dt"] = datetime.now()
+        trade["_entry_dt"] = now_ist()
         # Capital this position ties up, deducted from available capital until it
         # closes (see _available_capital). EQUITY is 1×, so it commits its full
         # notional. MCX posts the broker's REAL futures margin (SPAN + exposure +
@@ -956,7 +956,7 @@ class TradingEngine:
         if exit_price is None and self.params.max_hold_minutes > 0:
             entered = trade.get("_entry_dt")
             if entered is not None:
-                held_min = (datetime.now() - entered).total_seconds() / 60.0
+                held_min = (now_ist() - entered).total_seconds() / 60.0
                 if held_min >= self.params.max_hold_minutes:
                     exit_price = live_price
                     reason = f"TIME-EXIT ({self.params.max_hold_minutes}m)"

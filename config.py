@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import time
+from datetime import datetime, time, timedelta, timezone
 from enum import Enum
 
 try:
@@ -218,6 +218,29 @@ def mcx_margin_per_lot(symbol: str) -> float:
 
 def instruments_for_segment(segment: Segment) -> list[Instrument]:
     return [i for i in ALL_INSTRUMENTS if i.segment == segment]
+
+
+# --------------------------------------------------------------------------- #
+#  The clock. EVERY wall-clock decision in this system is IST — market hours,
+#  candle timestamps (Upstox candles are tz-converted to Asia/Kolkata and then
+#  stripped of tzinfo in data_feed), log stamps, session-open offsets.
+#
+#  Never use datetime.now() for those: it returns the SERVER's local clock, and
+#  the deployed box runs UTC. That made is_open() compare 09:15-15:30 against a
+#  UTC time, so the bot read "market CLOSED" through the entire real session and
+#  never opened a position — while the same code on an IST laptop traded fine.
+#  now_ist() derives IST from UTC, so behaviour is identical on both.
+#
+#  India has no DST and has been a fixed UTC+05:30 offset since 1945, so a fixed
+#  offset is used rather than a zoneinfo lookup (no tzdata dependency needed on
+#  slim containers or Windows).
+# --------------------------------------------------------------------------- #
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def now_ist() -> datetime:
+    """Current IST wall-clock time as a NAIVE datetime, independent of server TZ."""
+    return datetime.now(IST).replace(tzinfo=None)
 
 
 # --------------------------------------------------------------------------- #

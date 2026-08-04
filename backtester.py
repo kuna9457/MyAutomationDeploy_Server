@@ -243,7 +243,7 @@ def synthetic_history(start: str, end: str, interval: str = "1d",
     freq = {"1d": "1D", "15m": "15min", "1m": "1min"}.get(interval, "15min")
     idx = pd.date_range(start=start, end=end, freq=freq)
     if len(idx) < 50:
-        idx = pd.date_range(end=datetime.now(), periods=400, freq=freq)
+        idx = pd.date_range(end=config.now_ist(), periods=400, freq=freq)
     # Real intraday history (e.g. yfinance) only spans ~60 days, so a multi-year
     # 15m range would balloon to 100k+ bars and stall the backtest for no realism.
     # Cap to the most recent slice, mirroring what a real intraday feed would give.
