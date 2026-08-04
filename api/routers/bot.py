@@ -94,6 +94,9 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         strategy_key = mode_cfg.strategy_key
         symbols = mode_cfg.symbols
         mcx_lots = mode_cfg.mcx_lots
+        # A client's RR comes from admin's saved config for this mode, never
+        # from the request body — same rule as strategy/instruments.
+        risk_reward = mode_cfg.risk_reward
         if environment == Environment.LIVE:
             if req.broker not in _CLIENT_LIVE_BROKERS:
                 raise HTTPException(
@@ -125,6 +128,12 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         strategy_key = req.strategy_key
         symbols = req.symbols
         mcx_lots = req.mcx_lots
+        risk_reward = req.risk_reward
+        if not config.is_valid_rr(risk_reward):
+            raise HTTPException(
+                400, f"risk_reward {risk_reward:g} is not offered. Pick one of "
+                     f"{', '.join(config.rr_label(c) for c in config.RR_CHOICES)}, "
+                     f"or 0 to use the strategy's own.")
 
     selected = [config.INSTRUMENTS_BY_SYMBOL[s] for s in symbols
                if s in config.INSTRUMENTS_BY_SYMBOL]
@@ -144,7 +153,7 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
     eng = TradingEngine(environment, mode, broker_choice, selected, req.capital,
                         strategy_key=strategy_key, mcx_lots=mcx_lots,
                         user_id=user.username, broker_access_token=access_token,
-                        broker_api_key=broker_api_key)
+                        broker_api_key=broker_api_key, risk_reward=risk_reward)
     try:
         eng.start()
     except RuntimeError as exc:

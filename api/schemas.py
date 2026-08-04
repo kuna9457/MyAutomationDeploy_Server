@@ -27,6 +27,10 @@ class StartBotRequest(BaseModel):
     capital: float
     broker: Optional[str] = None          # required when environment == "Live"
     mcx_lots: dict[str, int] = {}
+    #: ADMIN-ONLY, like the fields above. Risk:reward for this run; 0 = the
+    #: strategy's own. A client's value is ignored — theirs comes from the
+    #: admin's saved ModeConfig, so they cannot widen or narrow their target.
+    risk_reward: float = 0.0
 
 
 class RiskLimitsRequest(BaseModel):
@@ -45,6 +49,9 @@ class BacktestRequest(BaseModel):
     start: str
     end: str
     initial_capital: float = 100_000.0
+    #: 0 = the strategy's own RR. Lets you compare 1:1 against 1:2 on the same
+    #: symbol and window before committing the change to live.
+    risk_reward: float = 0.0
 
 
 class WatchlistSaveRequest(BaseModel):
@@ -89,6 +96,10 @@ class AdminConfigRequest(BaseModel):
     segments: list[str]
     symbols: list[str]
     mcx_lots: dict[str, int] = {}
+    #: Risk:reward for this mode. 0 = inherit the strategy's own. Validated
+    #: against config.RR_CHOICES in the route, so a client of the API can't
+    #: post an arbitrary ratio.
+    risk_reward: float = 0.0
 
 
 class ClientModesRequest(BaseModel):

@@ -283,11 +283,16 @@ def run_backtest(
     mode: Mode,
     lot_size: int = 1,
     strategy_key: str = "",
+    risk_reward: float = 0.0,
 ) -> BacktestResult:
     # Same resolution the engine uses, so a backtest measures exactly the
-    # strategy the bot would trade — parameters included.
+    # strategy the bot would trade — parameters included. That has to include
+    # the RR override (engine.TradingEngine applies the identical replace), or
+    # a backtest would silently model a different target than the live bot.
     sd = resolve_strategy(mode, strategy_key)
     params = sd.params
+    if risk_reward and risk_reward > 0:
+        params = replace(params, risk_reward=float(risk_reward))
     interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
     # Resolve the Upstox instrument key + live token so we backtest on REAL data.
     inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)

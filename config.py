@@ -301,6 +301,38 @@ def add_minutes(t: time, minutes: int) -> time:
 
 
 # --------------------------------------------------------------------------- #
+#  Risk : reward
+#
+#  INTRADAY_RR_NOTE — Intraday's default moved from 1:2 to 1:1 (owner's call,
+#  2026-08-04). This is a deliberate amendment to the "Hard 1:2" rule that
+#  CLAUDE.md previously stated; the doc has been updated to match, so the code
+#  and the rule agree. What did NOT change is the risk CAP: risk_per_trade
+#  stays at 1% (ceiling 2%), because RR only moves the TARGET — it never
+#  affects position size, which is risk_budget / stop_distance.
+#
+#  Worth knowing what 1:1 costs: at 1:2 the break-even win rate is ~33%; at 1:1
+#  it is >50% before brokerage and slippage. Backtest before trusting it live.
+#
+#  RR is now selectable per mode by admin (admin_config.ModeConfig.risk_reward);
+#  0.0 there means "use the strategy's own value declared below".
+# --------------------------------------------------------------------------- #
+#: Risk:reward values admin may pick, as reward-per-1-unit-of-risk. A fixed list
+#: rather than a free number field — it keeps the UI honest and stops a typo
+#: like 0.1 silently turning every trade into a 10:1 loser.
+RR_CHOICES: tuple[float, ...] = (1.0, 1.5, 2.0, 2.5, 3.0)
+
+
+def rr_label(rr: float) -> str:
+    """Format an RR for display: 1.0 -> "1:1", 1.5 -> "1:1.5"."""
+    return f"1:{rr:g}"
+
+
+def is_valid_rr(rr: float) -> bool:
+    """0 is valid and means 'inherit the strategy's own RR'."""
+    return rr == 0.0 or rr in RR_CHOICES
+
+
+# --------------------------------------------------------------------------- #
 #  Strategy parameters — one place, enforcing the Immutable Risk Rules.
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -399,7 +431,7 @@ INTRADAY_PARAMS = StrategyParams(
     mode=Mode.INTRADAY, timeframe="15m",
     # 1% max loss per trade (₹1,000 on a ₹1L account). Scales with capital, and
     # stays well inside the 2% ceiling Immutable Rule #1 forbids exceeding.
-    risk_per_trade=0.01, risk_reward=2.0,   # Hard 1:2
+    risk_per_trade=0.01, risk_reward=1.0,   # 1:1 — see INTRADAY_RR_NOTE
     max_leverage=15.0,                      # defer to the segment's real cap
     max_capital_per_trade_pct=0.20,         # <=20% of the account per trade
 )
@@ -489,7 +521,7 @@ CANDLE_SCALPER_PARAMS = StrategyParams(
 CANDLE_INTRADAY_PARAMS = StrategyParams(
     mode=Mode.INTRADAY, timeframe="15m",
     # 1% max loss per trade (₹1,000 on a ₹1L account), inside the 2% ceiling.
-    risk_per_trade=0.01, risk_reward=2.0,   # Hard 1:2
+    risk_per_trade=0.01, risk_reward=1.0,   # 1:1 — see INTRADAY_RR_NOTE
     max_capital_per_trade_pct=0.20,         # <=20% of the account per trade
     atr_period=14,
     allow_short=True,           # MIS permits shorting, and half of the pattern

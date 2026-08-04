@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 
 import admin_config
+import config
 import user_manager
 from admin_config import BotConfig
 from api import engine_registry
@@ -174,6 +175,12 @@ def set_bot_config(req: AdminConfigRequest) -> BotConfig:
         raise HTTPException(
             400, f"Clients can only be given {', '.join(admin_config.CLIENT_SELECTABLE_MODES)} "
                  f"— {mode!r} is admin-only.")
+    rr = float(payload.get("risk_reward") or 0.0)
+    if not config.is_valid_rr(rr):
+        raise HTTPException(
+            400, f"risk_reward {rr:g} is not offered. Pick one of "
+                 f"{', '.join(config.rr_label(c) for c in config.RR_CHOICES)}, "
+                 f"or 0 to use the strategy's own.")
     return admin_config.set_mode_config(mode, **payload)
 
 

@@ -45,6 +45,14 @@ class ModeConfig:
     segments: list[str] = field(default_factory=lambda: ["NSE_EQUITY"])
     symbols: list[str] = field(default_factory=list)
     mcx_lots: dict[str, int] = field(default_factory=dict)
+    #: Risk:reward override for this mode, as reward per 1 unit of risk (see
+    #: config.RR_CHOICES). 0.0 = inherit whatever the chosen strategy declares,
+    #: which is what every pre-existing saved config reads as — so adding this
+    #: field changes nothing until an admin actually picks a value.
+    #:
+    #: Overrides the TARGET only. Position size is risk_budget / stop_distance
+    #: and never consults RR, so this cannot widen a client's risk per trade.
+    risk_reward: float = 0.0
 
 
 @dataclass

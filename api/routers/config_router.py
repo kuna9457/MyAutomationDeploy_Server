@@ -85,10 +85,24 @@ def list_client_modes():
         out.append({
             "key": mode_name,
             "label": admin_config.MODE_LABELS.get(mode_name, mode_name),
-            "risk_reward": bound.params.risk_reward,
+            # Admin's per-mode override wins; 0 falls back to the strategy's own.
+            # Resolved here so the client sees the RR they will ACTUALLY trade,
+            # not the strategy default the engine is about to replace.
+            "risk_reward": mode_cfg.risk_reward or bound.params.risk_reward,
             "instrument_count": len(mode_cfg.symbols),
         })
     return out
+
+
+@router.get("/rr-choices")
+def list_rr_choices():
+    """Risk:reward values admin may pick, for the config dropdown. 0 is offered
+    first as "use the strategy's own"."""
+    return {
+        "choices": [{"value": rr, "label": config.rr_label(rr)}
+                    for rr in config.RR_CHOICES],
+        "inherit_value": 0.0,
+    }
 
 
 @router.get("/watchlists")

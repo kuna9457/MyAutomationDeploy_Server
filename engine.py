@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import threading
+from dataclasses import replace
 from datetime import datetime
 from typing import Optional
 
@@ -116,6 +117,7 @@ class TradingEngine:
         user_id: str = "admin",
         broker_access_token: str = "",
         broker_api_key: str = "",
+        risk_reward: float = 0.0,
     ):
         self.environment = environment
         self.mode = mode
@@ -149,7 +151,16 @@ class TradingEngine:
         # The strategy owns its parameters — risk, RR, stop multiple and filters
         # all travel with it, so switching strategy switches the whole contract.
         self.strategy = resolve_strategy(mode, strategy_key)
-        self.params = self.strategy.params
+        # ...except risk:reward, which admin may override per mode without
+        # forking the strategy (config.RR_CHOICES). 0.0 = keep the strategy's
+        # own value, so an unset override is a no-op. Applied ONCE here rather
+        # than at each target calculation, so every downstream reader — signals,
+        # entry fills, the dashboard's "RR 1:x" line, the stored trade — sees a
+        # single consistent number. StrategyParams is frozen, hence `replace`.
+        params = self.strategy.params
+        if risk_reward and risk_reward > 0:
+            params = replace(params, risk_reward=float(risk_reward))
+        self.params = params
         # The Scalper trades 1-minute bars with a 7-minute time exit, so a 3s loop
         # would be a meaningful share of the whole trade. Poll sub-second there.
         self.poll_seconds = poll_seconds or (

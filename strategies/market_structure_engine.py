@@ -215,7 +215,7 @@ _SCALPER = StrategyParams(
     use_atr_gate=True, max_leverage=15.0,
 )
 _INTRADAY = StrategyParams(
-    mode=Mode.INTRADAY, timeframe="15m", risk_per_trade=0.01, risk_reward=2.0,
+    mode=Mode.INTRADAY, timeframe="15m", risk_per_trade=0.01, risk_reward=1.0,  # 1:1, see config.INTRADAY_RR_NOTE
     atr_period=14, allow_short=True, max_leverage=15.0,
     max_capital_per_trade_pct=0.20,
 )
