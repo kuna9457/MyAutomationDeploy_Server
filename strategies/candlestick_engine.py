@@ -586,4 +586,7 @@ register(StrategyDef(
     summary="plan.md Phase 1: 40+ single/double/triple candle patterns, scored by "
             "strength and confirmed against the prior trend. Stop sits beyond the "
             "pattern; RR follows the mode. Runs on 1m, 15m and daily.",
+    # This strategy gates on params.cs_min_score, so the admin panel's signal
+    # score control is meaningful here (see StrategyDef.uses_min_score).
+    uses_min_score=True,
 ))

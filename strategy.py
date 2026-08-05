@@ -494,6 +494,12 @@ class StrategyDef:
     params_by_mode: dict[Mode, StrategyParams]
     fn: SignalFn
     summary: str             # one line shown under the dropdown
+    #: Does this strategy actually gate on params.cs_min_score? Declared here
+    #: rather than inferred, so the UI can tell an admin when the signal-score
+    #: control will do nothing — setting a threshold on a strategy that never
+    #: reads it is silent, and silent settings are how people lose an evening.
+    #: A new scoring strategy opts in by setting this True at registration.
+    uses_min_score: bool = False
 
     @property
     def modes(self) -> tuple[Mode, ...]:
@@ -505,7 +511,8 @@ class StrategyDef:
     def bind(self, mode: Mode) -> "BoundStrategy":
         return BoundStrategy(key=self.key, name=self.name, mode=mode,
                              params=self.params_by_mode[mode], fn=self.fn,
-                             summary=self.summary)
+                             summary=self.summary,
+                             uses_min_score=self.uses_min_score)
 
 
 @dataclass(frozen=True)
@@ -522,6 +529,7 @@ class BoundStrategy:
     params: StrategyParams
     fn: SignalFn
     summary: str
+    uses_min_score: bool = False
 
 
 _REGISTRY: dict[str, StrategyDef] = {}

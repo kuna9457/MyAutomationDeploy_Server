@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import config
 import credentials_vault
+import mailer
 from security import hash_password, verify_password
 
 _USERS_PATH = os.path.join(config.LOCAL_DB_DIR, "users.json")
@@ -30,7 +31,11 @@ _lock = threading.Lock()
 #: Never leaves this module in a record handed to an API layer. Stripping is
 #: centralised here (rather than at each call site) so a new endpoint cannot
 #: forget it — `list_users` previously returned raw `broker_tokens`.
-_SENSITIVE_FIELDS = ("password_hash", "broker_tokens", "broker_credentials")
+_SENSITIVE_FIELDS = ("password_hash", "broker_tokens", "broker_credentials",
+                     # The reset OTP is stored HASHED, but even the hash plus
+                     # its expiry is an oracle worth withholding — no endpoint
+                     # has any reason to see it.
+                     "password_reset")
 
 
 def _public(user: Optional[dict]) -> Optional[dict]:
@@ -82,7 +87,7 @@ def _write_local(users: list[dict]) -> None:
 
 # -- CRUD ---------------------------------------------------------------------- #
 def create_user(username: str, password: str, role: str = "client",
-                display_name: str = "") -> dict:
+                display_name: str = "", email: str = "") -> dict:
     if get_user(username) is not None:
         raise ValueError(f"Username '{username}' already exists.")
     doc = {
@@ -92,7 +97,16 @@ def create_user(username: str, password: str, role: str = "client",
         "role": role,
         "status": "active",
         "display_name": display_name or username,
+        # Where a password-reset code is sent. Optional: an account without
+        # one simply cannot self-serve a reset (admin still can), which is why
+        # nothing here requires it.
+        "email": mailer.normalise(email),
         "created_at": _now(),
+        # Bumped on every password change so previously-issued JWTs stop
+        # validating — see api/auth.py. Starts at 0, and a token minted before
+        # this field existed carries no claim, which also reads as 0, so
+        # deploying this does not log anyone out.
+        "token_version": 0,
         "broker_tokens": {},
         "broker_credentials": {},
     }
@@ -159,7 +173,74 @@ def set_status(user_id: str, status: str) -> Optional[dict]:
 
 
 def set_password(user_id: str, new_password: str) -> Optional[dict]:
-    return _public(_update(user_id, {"password_hash": hash_password(new_password)}))
+    """Change a password AND invalidate every session issued under the old one.
+
+    The token bump is not optional bookkeeping: without it a stolen JWT stays
+    valid for its full lifetime after the victim changes their password, which
+    makes the reset feel effective while doing nothing about the intruder. Any
+    outstanding reset code is dropped at the same time, so a code mailed out
+    before the change cannot be redeemed after it.
+    """
+    user = get_user_by_id(user_id)
+    if user is None:
+        return None
+    return _public(_update(user_id, {
+        "password_hash": hash_password(new_password),
+        "token_version": int(user.get("token_version", 0) or 0) + 1,
+        "password_reset": None,
+    }))
+
+
+def token_version(user: dict) -> int:
+    """A record written before this field existed reads as 0, matching a token
+    minted before the claim existed — so adding this logs nobody out."""
+    try:
+        return int(user.get("token_version", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# -- email ---------------------------------------------------------------------- #
+def set_email(user_id: str, email: str) -> Optional[dict]:
+    """Set (or clear, with "") the address reset codes are sent to."""
+    return _public(_update(user_id, {"email": mailer.normalise(email)}))
+
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    """First account with this address, or None. Case-insensitive.
+
+    Addresses are deliberately NOT unique-indexed: a person may legitimately
+    hold both an admin and a client login on one mailbox. Reset therefore
+    identifies the account by USERNAME and only uses the address to deliver,
+    so a shared mailbox can never be used to reset the wrong account.
+    """
+    target = mailer.normalise(email)
+    if not target:
+        return None
+    with _lock:
+        if _db is not None:
+            return _db["users"].find_one({"email": target}, {"_id": 0})
+        for u in _read_local():
+            if mailer.normalise(u.get("email", "")) == target:
+                return u
+    return None
+
+
+# -- password-reset OTP --------------------------------------------------------- #
+# Shape: password_reset = {code_hash, expires_at (ISO), attempts, sent_at (ISO)}
+# The code itself is NEVER stored — only a PBKDF2 hash of it, the same
+# primitive used for passwords. A dump of the users collection therefore does
+# not hand over a live reset code.
+
+def set_reset_challenge(user_id: str, challenge: Optional[dict]) -> None:
+    _update(user_id, {"password_reset": challenge})
+
+
+def get_reset_challenge(user_id: str) -> dict:
+    user = get_user_by_id(user_id)
+    if user is None:
+        return {}
+    return dict(user.get("password_reset") or {})
 
 
 # -- per-client broker credentials (encrypted) --------------------------------- #

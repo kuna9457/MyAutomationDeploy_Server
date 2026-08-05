@@ -65,6 +65,13 @@ def create_access_token(user: CurrentUser) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {"sub": user.username, "uid": user.user_id, "role": user.role,
                "exp": expire}
+    # Session generation. Every password change bumps the stored counter
+    # (user_manager.set_password), so tokens minted before it stop validating
+    # in get_current_user — without this, changing a password would leave a
+    # stolen session alive for its full 12-hour lifetime.
+    record = user_manager.get_user_by_id(user.user_id)
+    if record is not None:
+        payload["tv"] = user_manager.token_version(record)
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
@@ -85,6 +92,12 @@ def get_current_user(token: str = Depends(_oauth2_scheme)) -> CurrentUser:
     # disabled client is locked out immediately, not just at their next login.
     user = user_manager.get_user_by_id(user_id)
     if user is None or user.get("status") != "active":
+        raise credentials_error
+    # A token issued before the last password change is dead. `tv` is absent
+    # on tokens minted before this claim existed and defaults to 0, which
+    # matches an untouched record — so shipping this does not log anyone out,
+    # but the first password change after it invalidates every old session.
+    if int(payload.get("tv", 0) or 0) != user_manager.token_version(user):
         raise credentials_error
     return CurrentUser(user_id=user_id, username=username, role=role,
                        display_name=user.get("display_name", ""))

@@ -12,6 +12,7 @@ import os
 
 import admin_config
 import config
+import mailer
 import presets
 import symbol_config
 import user_manager
@@ -20,8 +21,8 @@ from api import engine_registry
 from api.auth import CurrentUser, require_admin
 from api.schemas import (AdminConfigRequest, ClientModesRequest,
                          CreateClientRequest, PresetSaveRequest,
-                         SetPasswordRequest, SetStatusRequest,
-                         SymbolConfigRequest)
+                         SetEmailRequest, SetPasswordRequest,
+                         SetStatusRequest, SymbolConfigRequest)
 from config import Environment, Mode
 from db_manager import DBManager
 from fastapi import APIRouter, Depends, HTTPException
@@ -35,15 +36,44 @@ _db = DBManager()
 # -- client accounts ----------------------------------------------------------- #
 @router.post("/users")
 def create_client(req: CreateClientRequest):
+    """Create a client login. Username, password AND email are all required.
+
+    Email is mandatory rather than nice-to-have: it is the only way the
+    client can ever recover their own account. Allowing it to be skipped
+    produced accounts that looked fine until the day someone forgot their
+    password, at which point the only route left was admin resetting it by
+    hand — so the requirement is enforced here, at the one place accounts are
+    created, instead of chased later.
+    """
     if len(req.password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters.")
+    email = mailer.normalise(req.email)
+    if not email:
+        raise HTTPException(
+            400, "An email address is required — it's how this client resets "
+                 "their own password if they forget it.")
+    if not mailer.looks_valid(email):
+        raise HTTPException(400, "That doesn't look like a valid email address.")
     try:
         user = user_manager.create_user(
             req.username, req.password, role="client",
-            display_name=req.display_name)
+            display_name=req.display_name, email=email)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {k: v for k, v in user.items() if k not in ("password_hash", "broker_tokens")}
+
+
+@router.put("/users/{user_id}/email")
+def set_client_email(user_id: str, req: SetEmailRequest):
+    """Set where a client's forgot-password code is sent. Without one they
+    cannot self-serve a reset — only the admin reset below works for them."""
+    email = mailer.normalise(req.email)
+    if email and not mailer.looks_valid(email):
+        raise HTTPException(400, "That doesn't look like a valid email address.")
+    user = user_manager.set_email(user_id, email)
+    if user is None:
+        raise HTTPException(404, "User not found.")
+    return {"ok": True, "email": email, "email_masked": mailer.mask(email)}
 
 
 @router.get("/users")
@@ -93,6 +123,10 @@ def clients_overview():
             "display_name": client.get("display_name", username),
             "status": client.get("status", "active"),
             "created_at": client.get("created_at", ""),
+            # Full address, not masked: admin set it and needs to correct
+            # typos — a wrong address here silently breaks that client's
+            # ability to ever reset their own password.
+            "email": mailer.optional_recipient(client.get("email")),
             "running": running,
             "environment": eng.environment.value if eng else None,
             "broker": eng.broker.name if (eng and eng.broker) else None,
@@ -184,6 +218,12 @@ def set_bot_config(req: AdminConfigRequest) -> BotConfig:
             400, f"risk_reward {rr:g} is not offered. Pick one of "
                  f"{', '.join(config.rr_label(c) for c in config.RR_CHOICES)}, "
                  f"or 0 to use the strategy's own.")
+    score = float(payload.get("min_score") or 0.0)
+    if not config.is_valid_min_score(score):
+        raise HTTPException(
+            400, f"min_score {score:g} is out of range. Use "
+                 f"{config.MIN_SCORE_MIN:g}-{config.MIN_SCORE_MAX:g}, or 0 to "
+                 f"use the strategy's own.")
     return admin_config.set_mode_config(mode, **payload)
 
 

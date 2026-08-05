@@ -102,6 +102,7 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         # A client's RR comes from admin's saved config for this mode, never
         # from the request body — same rule as strategy/instruments.
         risk_reward = mode_cfg.risk_reward
+        min_score = mode_cfg.min_score
         if environment == Environment.LIVE:
             if req.broker not in _CLIENT_LIVE_BROKERS:
                 raise HTTPException(
@@ -134,6 +135,12 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         symbols = req.symbols
         mcx_lots = req.mcx_lots
         risk_reward = req.risk_reward
+        min_score = req.min_score
+        if not config.is_valid_min_score(min_score):
+            raise HTTPException(
+                400, f"min_score {min_score:g} is out of range. Use "
+                     f"{config.MIN_SCORE_MIN:g}-{config.MIN_SCORE_MAX:g}, or 0 "
+                     f"to use the strategy's own.")
         if not config.is_valid_rr(risk_reward):
             raise HTTPException(
                 400, f"risk_reward {risk_reward:g} is not offered. Pick one of "
@@ -166,7 +173,7 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
                         strategy_key=strategy_key, mcx_lots=mcx_lots,
                         user_id=user.username, broker_access_token=access_token,
                         broker_api_key=broker_api_key, risk_reward=risk_reward,
-                        symbol_rules=rules)
+                        min_score=min_score, symbol_rules=rules)
     try:
         eng.start()
     except RuntimeError as exc:
@@ -225,12 +232,14 @@ def _client_runner_key() -> str:
     mode = Mode(mode_name)
     bound = strategy.resolve_strategy(mode, mode_cfg.strategy_key)
     rr = mode_cfg.risk_reward or bound.params.risk_reward
+    score = mode_cfg.min_score or bound.params.cs_min_score
     instruments = [config.INSTRUMENTS_BY_SYMBOL[s] for s in mode_cfg.symbols
                    if s in config.INSTRUMENTS_BY_SYMBOL]
     if not instruments:
         return ""
     token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
-    return strategy_runner.runner_key(mode, bound.key, instruments, rr, token)
+    return strategy_runner.runner_key(mode, bound.key, instruments, rr, token,
+                                      score)
 
 
 @router.get("/platform-signals")

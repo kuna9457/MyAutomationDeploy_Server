@@ -27,8 +27,8 @@ from fastapi.security import OAuth2PasswordRequestForm  # noqa: E402
 
 from api.auth import (CurrentUser, TokenResponse, authenticate,  # noqa: E402
                       create_access_token, get_current_user)
-from api.routers import (admin_users, backtest, bot, broker,  # noqa: E402
-                         config_router, risk, trades)
+from api.routers import (account, admin_users, backtest, bot,  # noqa: E402
+                         broker, config_router, risk, trades)
 
 app = FastAPI(title="Trading Bot API")
 
@@ -69,3 +69,4 @@ app.include_router(risk.router)
 app.include_router(backtest.router)
 app.include_router(config_router.router)
 app.include_router(admin_users.router)
+app.include_router(account.router)

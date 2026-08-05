@@ -514,15 +514,19 @@ _runners: dict[str, StrategyRunner] = {}
 
 
 def runner_key(mode: Mode, strategy_key: str, instruments: list[Instrument],
-               risk_reward: float, feed_token: str) -> str:
+               risk_reward: float, feed_token: str,
+               min_score: float = 0.0) -> str:
     """Everything that must match for two accounts to share a decision.
 
     risk_reward is in the key because it moves the TARGET, and the runner's
-    exit trigger quotes that target — two accounts on different RRs are not
-    running the same decision and must not share one.
+    exit trigger quotes that target. min_score is in it because it decides
+    WHETHER a signal fires at all — two accounts on different thresholds are
+    not running the same decision and must never share one runner, or the
+    stricter account would silently receive the looser one's entries.
     """
     syms = ",".join(sorted(i.symbol for i in instruments))
-    return f"{mode.value}|{strategy_key}|{risk_reward:g}|{syms}|{hash(feed_token)}"
+    return (f"{mode.value}|{strategy_key}|{risk_reward:g}|{min_score:g}"
+            f"|{syms}|{hash(feed_token)}")
 
 
 def acquire(key: str, factory) -> StrategyRunner:

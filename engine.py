@@ -138,6 +138,7 @@ class TradingEngine:
         broker_access_token: str = "",
         broker_api_key: str = "",
         risk_reward: float = 0.0,
+        min_score: float = 0.0,
         symbol_rules: Optional[dict[str, "symbol_config.SymbolRules"]] = None,
     ):
         self.environment = environment
@@ -181,7 +182,23 @@ class TradingEngine:
         params = self.strategy.params
         if risk_reward and risk_reward > 0:
             params = replace(params, risk_reward=float(risk_reward))
+        # ...and the signal-score threshold, admin-tunable per mode for the
+        # same reason and by the same mechanism (config.MIN_SCORE_MIN..MAX).
+        # 0.0 = keep the strategy's own, so an unset override is a no-op.
+        # This changes how SELECTIVE entries are, never how large they are:
+        # position size is risk_budget / stop_distance and never reads it.
+        if min_score and min_score > 0:
+            params = replace(params, cs_min_score=float(min_score))
         self.params = params
+        # Rebind the strategy to the overridden params so the SIGNAL FUNCTION
+        # sees them too. run_strategy() evaluates against `sd.params`, not
+        # this class's — and the score gate lives INSIDE the signal function
+        # (candlestick_engine reads params.cs_min_score), so without this a
+        # score override would be stored, displayed and logged while the
+        # strategy quietly kept using its own threshold. A no-op when neither
+        # override is set, since `params` is then the same object.
+        if params is not self.strategy.params:
+            self.strategy = replace(self.strategy, params=params)
         # PER-SYMBOL overrides (symbol_config.py): trading days, an intraday
         # entry window, and that symbol's own RR. Resolved by the caller into
         # SymbolRules and keyed ONLY by symbols that actually change something,
@@ -235,7 +252,8 @@ class TradingEngine:
         # off, which is precisely the original one-engine-per-user behaviour.
         self._runner_key = (
             strategy_runner.runner_key(mode, self.strategy.key, instruments,
-                                       self.params.risk_reward, self._feed_token)
+                                       self.params.risk_reward, self._feed_token,
+                                       self.params.cs_min_score)
             if strategy_runner.replication_enabled()
             else f"solo:{user_id}:{id(self)}")
         self._runner = strategy_runner.acquire(

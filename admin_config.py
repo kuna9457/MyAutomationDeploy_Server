@@ -53,6 +53,15 @@ class ModeConfig:
     #: Overrides the TARGET only. Position size is risk_budget / stop_distance
     #: and never consults RR, so this cannot widen a client's risk per trade.
     risk_reward: float = 0.0
+    #: Signal-score threshold for this mode (config.MIN_SCORE_MIN..MAX).
+    #: 0.0 = inherit whatever the chosen strategy declares, which is what every
+    #: pre-existing saved config reads as — so adding this field changes
+    #: nothing until an admin picks a value.
+    #:
+    #: Moves ENTRY SELECTIVITY only: higher trades less often with more
+    #: agreement behind each entry, lower trades more often on weaker
+    #: evidence. It never touches position size, the risk cap or the stop.
+    min_score: float = 0.0
 
 
 @dataclass

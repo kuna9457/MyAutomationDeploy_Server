@@ -31,6 +31,10 @@ class StartBotRequest(BaseModel):
     #: strategy's own. A client's value is ignored — theirs comes from the
     #: admin's saved ModeConfig, so they cannot widen or narrow their target.
     risk_reward: float = 0.0
+    #: ADMIN-ONLY. Signal-score threshold for this run; 0 = the strategy's
+    #: own. Decides how much pattern evidence an entry needs. A client's
+    #: value is ignored — theirs comes from the admin's saved ModeConfig.
+    min_score: float = 0.0
 
 
 class RiskLimitsRequest(BaseModel):
@@ -52,6 +56,10 @@ class BacktestRequest(BaseModel):
     #: 0 = the strategy's own RR. Lets you compare 1:1 against 1:2 on the same
     #: symbol and window before committing the change to live.
     risk_reward: float = 0.0
+    #: 0 = the strategy's own threshold. The point of exposing it here is to
+    #: measure a score change on real history BEFORE putting it in front of
+    #: the market — same symbol, same window, one variable moved.
+    min_score: float = 0.0
 
 
 class WatchlistSaveRequest(BaseModel):
@@ -77,7 +85,39 @@ class ZerodhaExchangeRequest(BaseModel):
 class CreateClientRequest(BaseModel):
     username: str
     password: str
+    #: REQUIRED: where this client's forgot-password code is sent. Mandatory
+    #: at creation because an account without one can never self-serve a
+    #: reset — it silently becomes admin's problem forever. `display_name`
+    #: stays optional; it is cosmetic, this is not.
+    email: str
     display_name: str = ""
+
+
+class SetEmailRequest(BaseModel):
+    email: str
+
+
+class ChangePasswordRequest(BaseModel):
+    """Signed-in password change. The current password is required so a
+    hijacked session cannot lock the real owner out of their own account."""
+    current_password: str
+    new_password: str
+
+
+class PasswordResetRequest(BaseModel):
+    """Step 1 of forgot-password: mail a one-time code.
+
+    Identifies the account by USERNAME, not email — one mailbox may hold more
+    than one login, and the address alone would be ambiguous.
+    """
+    username: str
+
+
+class PasswordResetConfirm(BaseModel):
+    """Step 2: redeem the code and set the new password."""
+    username: str
+    code: str
+    new_password: str
 
 
 class SetStatusRequest(BaseModel):
@@ -100,6 +140,9 @@ class AdminConfigRequest(BaseModel):
     #: against config.RR_CHOICES in the route, so a client of the API can't
     #: post an arbitrary ratio.
     risk_reward: float = 0.0
+    #: Signal-score threshold for this mode. 0 = inherit the strategy's own.
+    #: Range-checked in the route (config.is_valid_min_score).
+    min_score: float = 0.0
 
 
 class ClientModesRequest(BaseModel):
@@ -142,6 +185,7 @@ class PresetSaveRequest(BaseModel):
     segments: list[str] = ["NSE_EQUITY"]
     symbols: list[str] = []
     capital: float = 100_000.0
+    min_score: float = 0.0
     mcx_lots: dict[str, int] = {}
     #: symbol -> that symbol's settings for `mode`, as SymbolConfigRequest's
     #: fields. Omitted entirely, the preset simply carries no per-symbol

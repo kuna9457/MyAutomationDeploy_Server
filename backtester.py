@@ -284,6 +284,7 @@ def run_backtest(
     lot_size: int = 1,
     strategy_key: str = "",
     risk_reward: float = 0.0,
+    min_score: float = 0.0,
 ) -> BacktestResult:
     # Same resolution the engine uses, so a backtest measures exactly the
     # strategy the bot would trade — parameters included. That has to include
@@ -293,6 +294,17 @@ def run_backtest(
     params = sd.params
     if risk_reward and risk_reward > 0:
         params = replace(params, risk_reward=float(risk_reward))
+    # ...and the signal-score threshold, for the same reason: it decides
+    # WHETHER a setup is taken, so a backtest run at a different threshold
+    # than the live bot is measuring a different strategy entirely. This is
+    # the control that makes "change the score and test the market" honest.
+    if min_score and min_score > 0:
+        params = replace(params, cs_min_score=float(min_score))
+    # NOTE: this local `params` is what actually reaches the strategy — both
+    # enrich() and sd.fn() below are called with it explicitly rather than
+    # through run_strategy(), so the overrides take effect without rebinding
+    # `sd`. (The live engine DOES rebind, because its runner goes through
+    # run_strategy(sd, ...) and would otherwise read the strategy's own.)
     interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
     # Resolve the Upstox instrument key + live token so we backtest on REAL data.
     inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)

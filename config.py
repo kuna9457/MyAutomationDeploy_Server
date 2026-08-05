@@ -333,6 +333,32 @@ def is_valid_rr(rr: float) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+#  Signal score (pattern-evidence threshold)
+#
+#  How much weighted evidence a setup must carry before it is traded — see
+#  StrategyParams.cs_min_score and strategies/candlestick_engine.py. Raising it
+#  trades LESS but with more agreement behind each entry; lowering it trades
+#  MORE and takes weaker setups. It is admin-tunable per mode so the threshold
+#  can be tested against a real market without editing code.
+#
+#  The scale comes from the pattern weights: STRENGTH_WEIGHT (weak 1.0 /
+#  medium 2.0 / high 3.0) x SPAN_WEIGHT (1-candle 1.0 ... 5-candle 1.75), so
+#  ONE pattern is worth 1.0-5.25 and several agreeing ones sum. Useful
+#  landmarks: 1.0 = any single weak pattern (very loose), 3.0 = one
+#  high-strength single-candle pattern, ~6.0 = roughly two agreeing patterns.
+#
+#  This moves ENTRY SELECTIVITY only. It has no effect on position size, the
+#  risk cap, or the stop — Immutable Rule #1 is untouched by any value here.
+# --------------------------------------------------------------------------- #
+MIN_SCORE_MIN, MIN_SCORE_MAX = 0.5, 20.0
+
+
+def is_valid_min_score(score: float) -> bool:
+    """0 is valid and means 'inherit the strategy's own threshold'."""
+    return score == 0.0 or MIN_SCORE_MIN <= score <= MIN_SCORE_MAX
+
+
+# --------------------------------------------------------------------------- #
 #  Strategy parameters — one place, enforcing the Immutable Risk Rules.
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)

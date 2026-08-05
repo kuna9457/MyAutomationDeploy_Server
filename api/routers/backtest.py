@@ -42,7 +42,7 @@ def run_backtest(req: BacktestRequest):
     result = backtester.run_backtest(
         req.ticker, req.start, req.end, req.initial_capital, mode,
         lot_size=inst.lot_size, strategy_key=req.strategy_key,
-        risk_reward=req.risk_reward,
+        risk_reward=req.risk_reward, min_score=req.min_score,
     )
     equity = result.equity_curve
     return {

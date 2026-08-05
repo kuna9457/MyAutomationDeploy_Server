@@ -57,6 +57,8 @@ class ControlPreset:
     segments: list[str] = field(default_factory=lambda: ["NSE_EQUITY"])
     symbols: list[str] = field(default_factory=list)
     capital: float = 100_000.0
+    #: Signal-score threshold saved with this setup. 0 = the strategy's own.
+    min_score: float = 0.0
     mcx_lots: dict[str, int] = field(default_factory=dict)
     #: symbol -> that symbol's settings, as they were for `mode` when saved.
     #: Stored as plain dicts so the file stays readable and this module needs
@@ -117,6 +119,13 @@ def validate(preset: ControlPreset) -> ControlPreset:
     if capital <= 0:
         raise ValueError("Capital must be greater than zero.")
 
+    min_score = float(preset.min_score or 0.0)
+    if not config.is_valid_min_score(min_score):
+        raise ValueError(
+            f"min_score {min_score:g} is out of range. Use "
+            f"{config.MIN_SCORE_MIN:g}-{config.MIN_SCORE_MAX:g}, or 0 for the "
+            f"strategy's own.")
+
     # Each per-symbol entry goes through symbol_config's own validation, so a
     # preset can never carry a window or RR the live editor would have refused.
     symbol_configs: dict[str, dict] = {}
@@ -137,6 +146,7 @@ def validate(preset: ControlPreset) -> ControlPreset:
         segments=segments,
         symbols=symbols,
         capital=capital,
+        min_score=min_score,
         mcx_lots={str(k): int(v) for k, v in (preset.mcx_lots or {}).items()},
         symbol_configs=symbol_configs,
         saved_at=preset.saved_at or _now_iso(),

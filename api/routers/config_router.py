@@ -55,6 +55,11 @@ def list_strategies(mode: str):
             "name": s.name,
             "summary": s.summary,
             "is_default": s.key == default_key,
+            # Does this strategy actually gate on the signal score? The admin
+            # panel shows its control either way, but must be able to say when
+            # setting it would do nothing — a silently-ignored threshold is
+            # worse than no control at all.
+            "uses_min_score": s.uses_min_score,
             "params": {
                 "timeframe": p.timeframe,
                 "risk_per_trade": p.risk_per_trade,
@@ -63,6 +68,9 @@ def list_strategies(mode: str):
                 "atr_period": p.atr_period,
                 "allow_short": p.allow_short,
                 "max_hold_minutes": p.max_hold_minutes,
+                # The strategy's OWN threshold, shown as the "inherit" value
+                # so an admin can see what they are deviating from.
+                "cs_min_score": p.cs_min_score,
             },
         })
     return out
@@ -102,6 +110,24 @@ def list_rr_choices():
         "choices": [{"value": rr, "label": config.rr_label(rr)}
                     for rr in config.RR_CHOICES],
         "inherit_value": 0.0,
+    }
+
+
+@router.get("/score-range")
+def score_range():
+    """Bounds for the admin panel's signal-score control, plus the landmarks
+    that make the number mean something (see config.MIN_SCORE_MIN)."""
+    return {
+        "min": config.MIN_SCORE_MIN,
+        "max": config.MIN_SCORE_MAX,
+        "step": 0.5,
+        "inherit_value": 0.0,
+        "landmarks": [
+            {"value": 1.0, "label": "1.0 — any single weak pattern (very loose)"},
+            {"value": 3.0, "label": "3.0 — one high-strength single candle"},
+            {"value": 4.0, "label": "4.0 — Scalper's own default"},
+            {"value": 6.0, "label": "6.0 — roughly two agreeing patterns (strict)"},
+        ],
     }
 
 
