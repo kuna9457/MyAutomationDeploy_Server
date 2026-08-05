@@ -27,13 +27,15 @@ import time as _time
 
 import config
 import risk_manager
+import strategy_runner
 import symbol_config
-from broker_api import BaseBroker, fetch_upstox_margin, make_broker
+from broker_api import (BaseBroker, SimulatedBroker, fetch_upstox_margin,
+                        make_broker)
 from config import (Broker, Environment, Instrument, Mode, Segment,
-                    market_hours_for_segment, now_ist, params_for_mode)
-from data_feed import LiveQuote, MarketDataFeed, SimulatedFeed, make_feed
+                    now_ist)
+from data_feed import LiveQuote
 from db_manager import DBManager
-from strategy import position_size, resolve_strategy, run_strategy
+from strategy import position_size, resolve_strategy
 
 # TTL for the cached broker-reported available-funds check (engine._broker_available_
 # funds). Account-wide and read-only, but re-fetched on every tick would hammer the
@@ -49,6 +51,23 @@ BROKER_POSITION_TTL_SECONDS = 5.0
 # A tick older than this during market hours means the stream has stalled; we
 # stop calling it "live" in the UI rather than pricing PnL off stale data.
 STALE_QUOTE_SECONDS = 30.0
+
+
+class StartupBlocked(RuntimeError):
+    """A pre-flight refusal raised by TradingEngine.start().
+
+    Carries TWO messages because the person who can fix the problem is not
+    always the person reading the error. The default text is operator-facing
+    ("refresh the Upstox market-data token"); `client_message` is what a
+    client account is shown, and must only ever name an action that a client
+    can actually take — otherwise they are handed a dead end for something
+    only the admin controls. Subclasses RuntimeError so every existing
+    `except RuntimeError` around start() keeps working unchanged.
+    """
+
+    def __init__(self, message: str, client_message: str = ""):
+        super().__init__(message)
+        self.client_message = client_message or message
 
 
 class BotState:
@@ -174,10 +193,6 @@ class TradingEngine:
         # sizing, or the management of an already-open position — the one
         # exception being the explicitly opt-in square_off_at_end.
         self.symbol_rules = dict(symbol_rules or {})
-        # symbol -> the last window/day skip reason logged for it. The loop
-        # re-evaluates every poll (twice a second on the Scalper), so the skip
-        # is logged once per REASON CHANGE rather than on every tick.
-        self._window_skip_logged: dict[str, str] = {}
         # The Scalper trades 1-minute bars with a 7-minute time exit, so a 3s loop
         # would be a meaningful share of the whole trade. Poll sub-second there.
         self.poll_seconds = poll_seconds or (
@@ -186,10 +201,8 @@ class TradingEngine:
         self.state = BotState()
         self.db = DBManager()
         self.broker: Optional[BaseBroker] = None
-        self.feed: Optional[MarketDataFeed] = None
-        # Last candle on which we entered or exited each symbol. Guards against
-        # re-trading the same bar (see reentry_cooldown_bars).
-        self._last_action_bar: dict[str, object] = {}
+        # NOTE: `feed` is a property backed by the runner (see below) — the
+        # market-data stream is shared, so this account does not own one.
         # Cache of real MCX margins keyed by (symbol, quantity, side), so we hit the
         # broker's margin API at most once per distinct size per session instead of
         # on every tick. Margin drifts intraday but not enough to matter for a
@@ -211,14 +224,69 @@ class TradingEngine:
         self._trades_today = 0
         self._live_halt_logged = False
 
-        self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
+        # LIVE risk state for the tick in progress, refreshed by begin_tick and
+        # read by on_signal within that same tick.
+        self._live_limits = None
+        self._live_halt_reason: Optional[str] = None
+
+        # The DECIDING half. Shared with every other account trading the same
+        # mode/strategy/instruments when replication is on — one socket, one
+        # evaluation, simultaneous entries. Private to this account when it is
+        # off, which is precisely the original one-engine-per-user behaviour.
+        self._runner_key = (
+            strategy_runner.runner_key(mode, self.strategy.key, instruments,
+                                       self.params.risk_reward, self._feed_token)
+            if strategy_runner.replication_enabled()
+            else f"solo:{user_id}:{id(self)}")
+        self._runner = strategy_runner.acquire(
+            self._runner_key,
+            lambda: strategy_runner.StrategyRunner(
+                key=self._runner_key, mode=mode, strategy=self.strategy,
+                params=self.params, instruments=instruments,
+                feed_token=self._feed_token, poll_seconds=self.poll_seconds,
+                symbol_rules=self.symbol_rules))
+
+    # -- the shared decider -------------------------------------------------- #
+    @property
+    def feed(self):
+        """This account's market-data feed — owned by the runner, since it is
+        shared. Exposed here so callers (and tests) that reach for
+        `engine.feed` still find it."""
+        return self._runner.feed if self._runner else None
+
+    @feed.setter
+    def feed(self, value) -> None:
+        if self._runner is not None:
+            self._runner.feed = value
+
+    def _tick(self) -> None:
+        """Drive one poll of this account's runner. The loop normally does
+        this on its own thread; kept callable for deterministic tests."""
+        if self._runner is not None:
+            self._runner.tick()
+
+    # -- market data source -------------------------------------------------- #
+    @property
+    def _feed_token(self) -> str:
+        """The Upstox token candles and ticks are fetched with.
+
+        Deliberately the SHARED admin token for every account, client or not —
+        a client's own broker token is for EXECUTION only and is never read
+        here. Market data is one account-independent stream (the same candles
+        drive every user's signals), so it stays a single operator-owned
+        connection rather than something each client has to provision.
+
+        The consequence is operational and worth stating plainly: if this
+        token lapses, LIVE is blocked for EVERYONE until the admin refreshes
+        it. That is why the refusal below carries a separate client-facing
+        message — it is not a client's to fix.
+        """
+        return config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> None:
         if self.state.running:
             return
-        self._stop.clear()
 
         # Broker: real if creds exist for the chosen env, else Simulated.
         # A non-empty broker_access_token (a client's own OAuth token) takes
@@ -227,15 +295,35 @@ class TradingEngine:
                                   access_token=self.broker_access_token,
                                   api_key=self.broker_api_key)
 
-        # Feed: real Upstox data if a token is present, else simulated.
-        # Market data is READ-ONLY, so we prefer the LIVE token (which is the one
-        # that stays valid) for real candles even in Paper mode — that gives true
-        # paper trading = real market data + simulated execution. Fall back to the
-        # sandbox token, then to the simulator.
-        token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
-        self.feed = make_feed(prefer_real=bool(token), access_token=token,
-                              mode=self.mode)
-        self._start_feed_resilient()
+        # SAFETY: in LIVE, a real broker was ASKED FOR — so getting the
+        # simulator back means the broker session failed to connect, and
+        # make_broker's fallback (deliberately silent, to avoid unintended
+        # orders) has handed us something that will never place one.
+        #
+        # Starting anyway is the worst outcome available: the dashboard shows
+        # a running Live bot, signals fire, "fills" are logged to live_trades
+        # — and not one order ever reaches the account. Refuse instead, so a
+        # dead session is visible at the moment it matters rather than
+        # discovered from an empty broker book hours later.
+        if (self.environment == Environment.LIVE
+                and self.broker_choice != Broker.SIMULATED
+                and isinstance(self.broker, SimulatedBroker)):
+            broker_name = self.broker_choice.value
+            # Same action either way here — this one IS the client's own
+            # session to reconnect — so both messages say to reconnect it.
+            raise StartupBlocked(
+                f"Live trading blocked: could not open a {broker_name} session, "
+                f"so no real order could be placed. Reconnect {broker_name} and "
+                f"try again.",
+                f"Live trading blocked: your {broker_name} connection isn't "
+                f"active, so no order could reach your account. Reconnect "
+                f"{broker_name} in the Broker panel, then start again.")
+
+        # Bring the shared decider up (feed + loop). We deliberately do NOT
+        # subscribe yet — see the end of this method: an account must be fully
+        # rehydrated before it can receive a signal, or it could open a second
+        # position on a symbol it already holds from the previous session.
+        self._runner.ensure_started()
 
         # SAFETY: never place real orders against simulated prices.
         #
@@ -245,13 +333,26 @@ class TradingEngine:
         # would size and fire genuine orders off invented candles, so refuse
         # to run instead. Paper is unaffected: simulated fills against
         # simulated prices is a coherent (and intended) mode.
+        #
+        # Only THIS account backs out — the runner is shared, so it is left
+        # running for whoever else is on it (release stops it if we were the
+        # last one).
         if (self.environment == Environment.LIVE
-                and isinstance(self.feed, SimulatedFeed)):
-            self.feed.stop()
-            raise RuntimeError(
+                and self._runner.feed_is_simulated()):
+            strategy_runner.release(self._runner_key, self)
+            # The market-data connection is shared and admin-owned (see
+            # _feed_token), so a client cannot act on the operator message —
+            # telling them to "refresh the Upstox token" sends them looking
+            # for something they have no access to, and is doubly confusing
+            # for a client who connected Zerodha and has no Upstox at all.
+            raise StartupBlocked(
                 "Live trading blocked: real market data is unavailable, so the "
                 "bot would be trading on simulated prices. Refresh the Upstox "
-                "market-data token and try again.")
+                "market-data token and try again.",
+                "Live trading is temporarily unavailable: the market-data feed "
+                "is down. This is a platform connection your admin maintains, "
+                "not your broker login — your account is fine. Ask your admin "
+                "to refresh it, then start again.")
 
         with self.state.lock:
             self.state.running = True
@@ -275,24 +376,19 @@ class TradingEngine:
         # a custom window/RR visible instead of it silently changing behaviour.
         for rules in self.symbol_rules.values():
             self.state.push_log(f"⚙️ Custom settings — {rules.describe()}")
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-
-    def _start_feed_resilient(self) -> None:
-        """Start the chosen feed; if a real feed fails (no data / auth / network),
-        fall back to the SimulatedFeed so Start Bot never throws in the UI."""
-        try:
-            self.feed.start(self.instruments)
-        except Exception as exc:
+        if self._runner.account_count():
             self.state.push_log(
-                f"⚠️ Live feed unavailable ({exc}); using simulated feed.")
-            self.feed = SimulatedFeed(mode=self.mode)
-            self.feed.start(self.instruments)
+                f"🔗 Sharing one market-data feed and one signal calculation "
+                f"with {self._runner.account_count()} other account(s).")
+
+        # LAST: now that positions, PnL and limits are all restored, start
+        # receiving events.
+        self._runner.subscribe(self)
 
     def stop(self) -> None:
-        self._stop.set()
-        if self.feed:
-            self.feed.stop()
+        # Leave the shared decider. It keeps running for whoever else is on
+        # it; release() stops the feed only once the last account is gone.
+        strategy_runner.release(self._runner_key, self)
         with self.state.lock:
             self.state.running = False
             self.state.feed_status = "🔴 Stopped"
@@ -404,232 +500,220 @@ class TradingEngine:
         self._refresh_daily()
         self.state.push_log(f"📆 New trading day {today} — daily PnL reset.")
 
-    # -- main loop ---------------------------------------------------------- #
-    def _run_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._tick()
-            except Exception as exc:  # never let one bad tick kill the bot
-                self.state.push_log(f"⚠️ tick error: {exc}")
-            self._stop.wait(self.poll_seconds)
+    # -- execution-account handlers ----------------------------------------- #
+    #
+    # The DECIDING half of this class (feed, indicator evaluation, signal
+    # generation, exit triggers) now lives in strategy_runner.StrategyRunner,
+    # which owns one socket and runs the strategy ONCE for every account on
+    # the platform. What remains here is the EXECUTING half, unchanged: sizing
+    # against this account's own capital, this account's risk limits, its own
+    # broker, its own trade book.
+    #
+    # The three methods below are what the runner calls. Everything they call
+    # in turn (_manage_open, _enter, _available_capital, _live_risk_check,
+    # position_size, ...) is the original code, in the original order.
 
-    def _tick(self) -> None:
-        now_dt = now_ist()
-        now_t = now_dt.time()
-        # Reset the live day-PnL counter when the calendar day turns over.
+    def begin_tick(self, now_dt: datetime, feed_status: str) -> None:
+        """Once per poll, before any instrument is looked at."""
         self._rollover_if_new_day()
         with self.state.lock:
-            self.state.feed_status = self.feed.status()
-
+            self.state.feed_status = feed_status
         # LIVE-only risk guardrails (risk_manager.py). Computed ONCE per tick —
         # never in Paper/backtest, and never touching strategy/signal logic,
         # only whether/how big a NEW entry may be. Read fresh every tick (not
         # cached at start()) so editing the sidebar's risk panel takes effect
-        # on THIS running bot immediately.
-        live_limits, live_halt_reason = self._live_risk_check()
+        # on THIS running bot immediately. Cached on self for the signal
+        # handlers that follow within the same tick.
+        self._live_limits, self._live_halt_reason = self._live_risk_check()
 
-        for inst in self.instruments:
-            hours = market_hours_for_segment(inst.segment)
-            market_open = hours.is_open(now_t)
-            # None for any symbol the user hasn't given custom settings — the
-            # whole feature is inert from here down when that is the case.
-            rules = self.symbol_rules.get(inst.symbol)
+    def holds(self, symbol: str) -> bool:
+        with self.state.lock:
+            return symbol in self.state.open_positions
 
-            quote = self.feed.get_quote(inst)
-            self._publish_quote(inst, quote, market_open)
+    def push_log(self, msg: str) -> None:
+        self.state.push_log(msg)
 
-            df = self.feed.get_candles(inst, lookback=260)
-            live_price, price_src = self._live_price(quote, df)
-            if live_price is None:
-                continue
+    def on_tick(self, ev) -> bool:
+        """Refresh this account's view of one instrument and manage any
+        position it holds in it. Returns True if a position was closed."""
+        inst = ev.instrument
+        self._publish_quote(inst, ev.quote, ev.market_open)
+        if not self.holds(inst.symbol):
+            return False
+        rules = self.symbol_rules.get(inst.symbol)
+        # Opt-in per-symbol exit: close out when this symbol's own trading
+        # window ends. Checked BEFORE _manage_open so the window is honoured
+        # on the same tick it lapses. Default off, so an unconfigured symbol
+        # (or one with only a day/RR override) never reaches this branch and
+        # its SL/TP/time-exit remain the only things that can close it.
+        if (rules is not None and rules.square_off_at_end
+                and not (rules.day_allowed(ev.now_dt)
+                         and rules.window_open(ev.now_dt.time()))):
+            return self._close_for_window(inst, ev.live_price, rules)
+        return self._manage_open(inst, ev.live_price)
 
-            bar_ts = df.index[-1] if not df.empty else None
+    def on_exit(self, inst: Instrument, price: float, reason: str) -> bool:
+        """Platform-wide exit fired by the runner, so every account leaves the
+        trade at the same moment regardless of where each one filled. A no-op
+        for an account that is already flat (its own stop got there first)."""
+        with self.state.lock:
+            trade = self.state.open_positions.pop(inst.symbol, None)
+        if trade is None:
+            return False
+        self._finalize_close(inst, trade, price, reason)
+        return True
 
-            # 1) manage an open position (exit on SL/TP/time) regardless of signals
-            if inst.symbol in self.state.open_positions:
-                # Opt-in per-symbol exit: close out when this symbol's own
-                # trading window ends. Checked BEFORE _manage_open so the
-                # window is honoured on the same tick it lapses. Default off,
-                # so an unconfigured symbol (or one with only a day/RR
-                # override) never reaches this branch and its SL/TP/time-exit
-                # remain the only things that can close it.
-                if (rules is not None and rules.square_off_at_end
-                        and not (rules.day_allowed(now_dt)
-                                 and rules.window_open(now_t))):
-                    if self._close_for_window(inst, live_price, rules) and bar_ts is not None:
-                        self._last_action_bar[inst.symbol] = bar_ts
-                    continue
-                if self._manage_open(inst, live_price) and bar_ts is not None:
-                    # Record the exit bar so the cooldown starts from here.
-                    self._last_action_bar[inst.symbol] = bar_ts
-                continue
+    def on_signal(self, ev) -> bool:
+        """Size the runner's signal against THIS account's capital and risk
+        limits, then punch it. Returns True if a position was opened.
 
-            # 2) only look for new entries while that segment's market is open
-            if not market_open or df.empty:
-                continue
+        Every ₹ figure below is this account's own: available capital derives
+        from its total_capital capped by its capital_allocated, and each risk
+        gate is read from its own limits. That is what lets one account skip a
+        trade for want of margin while the rest of the platform still takes
+        it.
+        """
+        inst, sig, quote = ev.instrument, ev.signal, ev.quote
+        # Never stack a second position on a symbol this account already holds.
+        if self.holds(inst.symbol):
+            return False
+        live_limits = getattr(self, "_live_limits", None)
+        # LIVE risk kill-switch: open positions are still managed to their
+        # SL/TP/time-exit either way — this only blocks OPENING new risk once
+        # today's loss/trade-count ceiling is hit.
+        if getattr(self, "_live_halt_reason", None):
+            return False
 
-            # 2b) ...and, for a symbol with custom settings, only on its own
-            # configured days and inside its own time window. This gates NEW
-            # entries ONLY — everything above (position management, exits) has
-            # already run, so a position opened earlier is still carried to its
-            # stop/target exactly as before.
-            if rules is not None:
-                blocked = rules.entry_block_reason(now_dt)
-                if blocked:
-                    self._log_window_skip(inst.symbol, blocked)
-                    continue
-                self._window_skip_logged.pop(inst.symbol, None)
+        lev = config.max_leverage_for(inst.segment, self.params)
+        # LIVE-only: equity Intraday/Scalper sizes against the REAL MIS
+        # leverage configured in the risk panel instead of the pinned 1x
+        # (config.SEGMENT_MAX_LEVERAGE) used everywhere else — Paper/backtest
+        # and Swing (overnight = delivery = 1x, non-negotiable) are untouched.
+        # The strategy's own ceiling (self.params.max_leverage) still bounds
+        # it either way, so this can only move the effective cap DOWN from 15x,
+        # never past the mode's own limit.
+        if (live_limits is not None and inst.segment == Segment.EQUITY
+                and self.mode in (Mode.INTRADAY, Mode.SCALPER)):
+            lev = min(self.params.max_leverage,
+                     max(live_limits.intraday_leverage, 1.0))
+        available = self._available_capital()
+        # Two completely separate sizing paths — kept apart on purpose so the
+        # commodity logic never leaks into equity (and vice-versa):
+        #   * MCX commodity  -> FIXED lots the user configured in the sidebar.
+        #                       No risk %, no 20% cap; the only limit is whether
+        #                       the account can fund the margin (checked inside).
+        #   * NSE equity/etc -> risk-based sizing (qty = risk_budget / stop
+        #                       distance), bounded by leverage and the 20%-of-
+        #                       account cap. Sized against AVAILABLE capital so an
+        #                       unfundable trade floors to qty=0 and is skipped.
+        mcx_skip: Optional[str] = None
+        if inst.segment == Segment.MCX:
+            qty, risk_amt, mcx_skip = self._mcx_fixed_size(
+                inst, sig, available, lev)
+        else:
+            qty, risk_amt = position_size(
+                available, sig, self.params, inst.lot_size,
+                inst.contract_multiplier, lev,
+                account_capital=self.total_capital)
 
-            # LIVE risk kill-switch: existing open positions above are still
-            # managed to their SL/TP/time-exit either way — this only blocks
-            # OPENING new risk once today's loss/trade-count ceiling is hit.
-            if live_halt_reason:
-                continue
+        # LIVE-only: hard clip on the SIZE of a single order, independent of
+        # (and always at least as strict as) the risk/notional maths above.
+        live_qty_clip = ""
+        if (live_limits is not None and live_limits.max_qty_per_trade > 0
+                and qty > live_limits.max_qty_per_trade):
+            live_qty_clip = (f" (clipped from {qty} by the live max-qty/"
+                             f"trade cap of {live_limits.max_qty_per_trade})")
+            qty = live_limits.max_qty_per_trade
 
-            # 3) never act twice on the same candle. The strategy re-evaluates the
-            # same bar every poll, so without this an exit is immediately followed
-            # by re-entry into the identical setup — a loss loop. It also stops us
-            # trading a feed whose bars have stopped advancing.
-            if not self._cooldown_elapsed(inst.symbol, df):
-                continue
+        # Capital this trade would deploy = notional ÷ effective leverage —
+        # the SAME margin figure booked as `_margin` on entry (see _enter).
+        # Shown so the dashboard's signal row states what the trade ties up;
+        # qty=0 (skipped) correctly reads ₹0 deployed.
+        mult = max(inst.contract_multiplier, 1)
+        notional = sig.entry_price * qty * mult
+        deployed = notional / lev if lev > 0 else notional
 
-            # The segment's own open time drives the "skip the first 15 minutes"
-            # filter — equity skips to 09:30, MCX to 09:15.
-            sig = run_strategy(self.strategy, df, session_open=hours.open_t)
-            if sig is None:
-                continue
+        # LIVE-only: independent real-broker-funds gate. Every ₹ ceiling
+        # above (capital_allocated, risk sizing, notional cap) is OUR
+        # bookkeeping of what should be free — this instead asks the
+        # broker directly what actually IS free right now, catching drift
+        # from anything outside the bot (manual trades, other margin use
+        # in the same account). Skips the trade rather than trusting our
+        # own accounting alone. Brokers that don't implement
+        # available_funds() (returns None) are silently skipped — this is
+        # an ADDITIONAL check, never the only one.
+        live_funds_block = ""
+        if live_limits is not None and qty > 0:
+            broker_avail = self._broker_available_funds()
+            if broker_avail is not None and deployed > broker_avail:
+                live_funds_block = (
+                    f"{inst.symbol}: signal skipped — broker reports only "
+                    f"₹{broker_avail:,.0f} available but this trade needs "
+                    f"₹{deployed:,.0f} (live funds check).")
+                qty = 0
 
-            lev = config.max_leverage_for(inst.segment, self.params)
-            # LIVE-only: equity Intraday/Scalper sizes against the REAL MIS
-            # leverage configured in the risk panel instead of the pinned 1x
-            # (config.SEGMENT_MAX_LEVERAGE) used everywhere else — Paper/backtest
-            # and Swing (overnight = delivery = 1x, non-negotiable) are untouched.
-            # The strategy's own ceiling (self.params.max_leverage) still bounds
-            # it either way, so this can only move the effective cap DOWN from 15x,
-            # never past the mode's own limit.
-            if (live_limits is not None and inst.segment == Segment.EQUITY
-                    and self.mode in (Mode.INTRADAY, Mode.SCALPER)):
-                lev = min(self.params.max_leverage,
-                         max(live_limits.intraday_leverage, 1.0))
-            available = self._available_capital()
-            # Two completely separate sizing paths — kept apart on purpose so the
-            # commodity logic never leaks into equity (and vice-versa):
-            #   * MCX commodity  -> FIXED lots the user configured in the sidebar.
-            #                       No risk %, no 20% cap; the only limit is whether
-            #                       the account can fund the margin (checked inside).
-            #   * NSE equity/etc -> risk-based sizing (qty = risk_budget / stop
-            #                       distance), bounded by leverage and the 20%-of-
-            #                       account cap. Sized against AVAILABLE capital so an
-            #                       unfundable trade floors to qty=0 and is skipped.
-            mcx_skip: Optional[str] = None
-            if inst.segment == Segment.MCX:
-                qty, risk_amt, mcx_skip = self._mcx_fixed_size(
-                    inst, sig, available, lev)
-            else:
-                qty, risk_amt = position_size(
-                    available, sig, self.params, inst.lot_size,
-                    inst.contract_multiplier, lev,
-                    account_capital=self.total_capital)
+        # Report the RR (and therefore the target) this trade will ACTUALLY
+        # be entered at — the per-symbol override, else admin's per-mode
+        # one, else the strategy's own. sig.target still carries only the
+        # strategy's own RR at this point; _enter re-derives it from the
+        # real fill the same way, so the row matches the resulting trade.
+        eff_rr = self._rr_for(inst.symbol)
+        risk_dist = abs(sig.entry_price - sig.stop_loss)
+        eff_target = (sig.entry_price + eff_rr * risk_dist if sig.side == "BUY"
+                      else sig.entry_price - eff_rr * risk_dist)
+        sig_row = {
+            "time": now_ist().strftime("%H:%M:%S"),
+            "symbol": inst.symbol, "segment": inst.segment.value,
+            "side": sig.side, "entry": round(sig.entry_price, 2),
+            "stop": round(sig.stop_loss, 2), "target": round(eff_target, 2),
+            "rr": round(eff_rr, 2), "qty": qty,
+            "deployed": round(deployed, 2), "reason": sig.reason,
+        }
+        with self.state.lock:
+            self.state.last_signals.insert(0, sig_row)
+            self.state.last_signals = self.state.last_signals[:50]
 
-            # LIVE-only: hard clip on the SIZE of a single order, independent of
-            # (and always at least as strict as) the risk/notional maths above.
-            live_qty_clip = ""
-            if (live_limits is not None and live_limits.max_qty_per_trade > 0
-                    and qty > live_limits.max_qty_per_trade):
-                live_qty_clip = (f" (clipped from {qty} by the live max-qty/"
-                                 f"trade cap of {live_limits.max_qty_per_trade})")
-                qty = live_limits.max_qty_per_trade
-
-            # Capital this trade would deploy = notional ÷ effective leverage —
-            # the SAME margin figure booked as `_margin` on entry (see _enter).
-            # Shown so the dashboard's signal row states what the trade ties up;
-            # qty=0 (skipped) correctly reads ₹0 deployed.
+        if qty <= 0:
+            # The live broker-funds gate has its own precise reason —
+            # report that verbatim rather than the generic maths below,
+            # which would otherwise describe a trade that funds check
+            # already rejected for an unrelated reason.
+            if live_funds_block:
+                self.state.push_log(live_funds_block)
+                return False
+            # MCX fixed-lot sizing carries its OWN skip reason (zero lots
+            # configured, or the account can't fund the margin for the lots
+            # chosen). Report that verbatim instead of the equity risk maths.
+            if mcx_skip:
+                self.state.push_log(mcx_skip)
+                return False
+            # Report BOTH bounds — qty=0 can mean "stop too wide for the risk
+            # budget" or "position too expensive to fund from available cash",
+            # and the fix differs.
             mult = max(inst.contract_multiplier, 1)
-            notional = sig.entry_price * qty * mult
-            deployed = notional / lev if lev > 0 else notional
+            pct_budget = available * self.params.risk_per_trade
+            cash_cap = self.params.risk_per_trade_cash
+            risk_budget = (min(cash_cap, pct_budget)
+                           if cash_cap and cash_cap > 0 else pct_budget)
+            by_risk = risk_budget / max(
+                abs(sig.entry_price - sig.stop_loss) * mult, 1e-9)
+            by_notional = ((available * lev)
+                           / max(sig.entry_price * mult, 1e-9))
+            cap_pct = getattr(self.params, "max_capital_per_trade_pct", 0.0)
+            cap_msg = ""
+            if cap_pct and cap_pct > 0:
+                by_capital = ((self.total_capital * cap_pct)
+                              / max(sig.entry_price * mult, 1e-9))
+                cap_msg = (f" {cap_pct:.0%}-of-account capital cap allows "
+                           f"{by_capital:.2f};")
+            self.state.push_log(
+                f"{inst.symbol}: signal skipped (qty=0). Available capital "
+                f"₹{available:,.0f}; risk budget ₹{risk_budget:,.0f} allows "
+                f"{by_risk:.2f} units; {lev:g}x notional cap allows "
+                f"{by_notional:.2f};{cap_msg} lot size is {inst.lot_size}.")
+            return False
 
-            # LIVE-only: independent real-broker-funds gate. Every ₹ ceiling
-            # above (capital_allocated, risk sizing, notional cap) is OUR
-            # bookkeeping of what should be free — this instead asks the
-            # broker directly what actually IS free right now, catching drift
-            # from anything outside the bot (manual trades, other margin use
-            # in the same account). Skips the trade rather than trusting our
-            # own accounting alone. Brokers that don't implement
-            # available_funds() (returns None) are silently skipped — this is
-            # an ADDITIONAL check, never the only one.
-            live_funds_block = ""
-            if live_limits is not None and qty > 0:
-                broker_avail = self._broker_available_funds()
-                if broker_avail is not None and deployed > broker_avail:
-                    live_funds_block = (
-                        f"{inst.symbol}: signal skipped — broker reports only "
-                        f"₹{broker_avail:,.0f} available but this trade needs "
-                        f"₹{deployed:,.0f} (live funds check).")
-                    qty = 0
-
-            # Report the RR (and therefore the target) this trade will ACTUALLY
-            # be entered at — the per-symbol override, else admin's per-mode
-            # one, else the strategy's own. sig.target still carries only the
-            # strategy's own RR at this point; _enter re-derives it from the
-            # real fill the same way, so the row matches the resulting trade.
-            eff_rr = self._rr_for(inst.symbol)
-            risk_dist = abs(sig.entry_price - sig.stop_loss)
-            eff_target = (sig.entry_price + eff_rr * risk_dist if sig.side == "BUY"
-                          else sig.entry_price - eff_rr * risk_dist)
-            sig_row = {
-                "time": now_ist().strftime("%H:%M:%S"),
-                "symbol": inst.symbol, "segment": inst.segment.value,
-                "side": sig.side, "entry": round(sig.entry_price, 2),
-                "stop": round(sig.stop_loss, 2), "target": round(eff_target, 2),
-                "rr": round(eff_rr, 2), "qty": qty,
-                "deployed": round(deployed, 2), "reason": sig.reason,
-            }
-            with self.state.lock:
-                self.state.last_signals.insert(0, sig_row)
-                self.state.last_signals = self.state.last_signals[:50]
-
-            if qty <= 0:
-                # The live broker-funds gate has its own precise reason —
-                # report that verbatim rather than the generic maths below,
-                # which would otherwise describe a trade that funds check
-                # already rejected for an unrelated reason.
-                if live_funds_block:
-                    self.state.push_log(live_funds_block)
-                    continue
-                # MCX fixed-lot sizing carries its OWN skip reason (zero lots
-                # configured, or the account can't fund the margin for the lots
-                # chosen). Report that verbatim instead of the equity risk maths.
-                if mcx_skip:
-                    self.state.push_log(mcx_skip)
-                    continue
-                # Report BOTH bounds — qty=0 can mean "stop too wide for the risk
-                # budget" or "position too expensive to fund from available cash",
-                # and the fix differs.
-                mult = max(inst.contract_multiplier, 1)
-                pct_budget = available * self.params.risk_per_trade
-                cash_cap = self.params.risk_per_trade_cash
-                risk_budget = (min(cash_cap, pct_budget)
-                               if cash_cap and cash_cap > 0 else pct_budget)
-                by_risk = risk_budget / max(
-                    abs(sig.entry_price - sig.stop_loss) * mult, 1e-9)
-                by_notional = ((available * lev)
-                               / max(sig.entry_price * mult, 1e-9))
-                cap_pct = getattr(self.params, "max_capital_per_trade_pct", 0.0)
-                cap_msg = ""
-                if cap_pct and cap_pct > 0:
-                    by_capital = ((self.total_capital * cap_pct)
-                                  / max(sig.entry_price * mult, 1e-9))
-                    cap_msg = (f" {cap_pct:.0%}-of-account capital cap allows "
-                               f"{by_capital:.2f};")
-                self.state.push_log(
-                    f"{inst.symbol}: signal skipped (qty=0). Available capital "
-                    f"₹{available:,.0f}; risk budget ₹{risk_budget:,.0f} allows "
-                    f"{by_risk:.2f} units; {lev:g}x notional cap allows "
-                    f"{by_notional:.2f};{cap_msg} lot size is {inst.lot_size}.")
-                continue
-
-            if self._enter(inst, sig, qty, risk_amt, quote, live_qty_clip, lev):
-                self._last_action_bar[inst.symbol] = bar_ts
+        return self._enter(inst, sig, qty, risk_amt, quote, live_qty_clip, lev)
 
     # -- per-symbol settings (symbol_config.py) ----------------------------- #
     def _rr_for(self, symbol: str) -> float:
@@ -645,17 +729,6 @@ class TradingEngine:
         if rules is not None and rules.risk_reward > 0:
             return rules.risk_reward
         return self.params.risk_reward
-
-    def _log_window_skip(self, symbol: str, reason: str) -> None:
-        """Log a day/window entry block ONCE per reason, not once per poll.
-        At the Scalper's 0.5s loop an unthrottled message would bury the log
-        (and the 200-line buffer) within seconds of the window closing."""
-        if self._window_skip_logged.get(symbol) == reason:
-            return
-        self._window_skip_logged[symbol] = reason
-        self.state.push_log(
-            f"⏸️ {symbol}: new entries paused — {reason} (custom settings). "
-            f"Open positions are still managed normally.")
 
     def _close_for_window(self, inst: Instrument, live_price: float,
                           rules: "symbol_config.SymbolRules") -> bool:
@@ -763,25 +836,6 @@ class TradingEngine:
         self._mcx_margin_cache[key] = margin
         return margin, src
 
-    # -- re-entry guard ----------------------------------------------------- #
-    def _cooldown_elapsed(self, symbol: str, df) -> bool:
-        """True if enough NEW bars have closed since we last traded this symbol.
-
-        Counts bars strictly after the last action, so acting on the same bar
-        twice is impossible regardless of how fast the poll loop spins.
-        """
-        last = self._last_action_bar.get(symbol)
-        if last is None:
-            return True
-        need = max(self.params.reentry_cooldown_bars, 0)
-        if need <= 0:
-            return True
-        try:
-            fresh = int((df.index > last).sum())
-        except Exception:
-            return True
-        return fresh >= need
-
     # -- capital tracking --------------------------------------------------- #
     def _available_capital(self) -> float:
         """The capital ceiling minus the margin already committed to open
@@ -871,25 +925,6 @@ class TradingEngine:
             val = None
         self._funds_cache = (now, val)
         return val
-
-    # -- live pricing (WebSocket is the source of truth) --------------------- #
-    @staticmethod
-    def _live_price(quote: Optional[LiveQuote],
-                    df) -> tuple[Optional[float], str]:
-        """Resolve the price used to mark positions and fire stops.
-
-        Order matters: a fresh WebSocket tick wins over everything. Only when no
-        usable tick exists do we read a candle close, and a stale tick is the last
-        resort — never preferred over fresher candle data.
-        """
-        if (quote is not None and quote.ltp > 0
-                and quote.age_seconds <= STALE_QUOTE_SECONDS):
-            return float(quote.ltp), quote.source
-        if df is not None and not df.empty:
-            return float(df["close"].iloc[-1]), "candle"
-        if quote is not None and quote.ltp > 0:
-            return float(quote.ltp), f"{quote.source}:stale"
-        return None, "none"
 
     def _publish_quote(self, inst: Instrument, quote: Optional[LiveQuote],
                        market_open: bool) -> None:

@@ -17,14 +17,14 @@ Start Bot is unaffected — this module is only consulted for role="client".
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 from dataclasses import asdict, dataclass, field
 
-import config
+import config_store
 
-_PATH = os.path.join(config.LOCAL_DB_DIR, "admin_bot_config.json")
+#: Storage key (was the filename admin_bot_config.json — kept identical so an
+#: existing deployment's file is picked up and migrated, not orphaned).
+_KEY = "admin_bot_config"
 _lock = threading.Lock()
 
 #: Modes a client is ever allowed to run. Swing is deliberately excluded — it
@@ -65,10 +65,8 @@ class BotConfig:
 
 
 def _from_disk() -> BotConfig:
-    try:
-        with open(_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
+    data = config_store.load(_KEY)
+    if not data:
         return BotConfig()
 
     # Pre-per-mode files stored one flat {mode, strategy_key, segments,
@@ -99,9 +97,7 @@ def _from_disk() -> BotConfig:
 
 
 def _to_disk(cfg: BotConfig) -> None:
-    os.makedirs(config.LOCAL_DB_DIR, exist_ok=True)
-    with open(_PATH, "w", encoding="utf-8") as fh:
-        json.dump(asdict(cfg), fh, indent=2)
+    config_store.save(_KEY, asdict(cfg))
 
 
 def get_config() -> BotConfig:
@@ -141,6 +137,21 @@ def is_set(mode: str) -> bool:
     signal a client's Start Bot uses to tell "not configured yet" apart from a
     legitimate empty-by-choice state."""
     return len(get_mode_config(mode).symbols) > 0
+
+
+def active_client_mode() -> str:
+    """THE mode clients trade, or "" if admin hasn't configured one.
+
+    Clients do not choose what to trade — admin does, and everything about
+    the trade (mode, strategy, instruments, risk:reward, per-symbol windows)
+    comes from admin's saved config. A client's account only decides HOW BIG
+    the trade is for them and pushes it to their own broker.
+
+    `client_modes` remains a list on disk for backward compatibility, but only
+    the first configured entry is used; the admin UI offers a single choice.
+    """
+    modes = available_client_modes()
+    return modes[0] if modes else ""
 
 
 def available_client_modes() -> list[str]:

@@ -7,23 +7,30 @@ reached over HTTP instead of a Streamlit rerun. TradingEngine itself
 signals, or order placement changes.
 
 Each logged-in user gets their own TradingEngine, keyed by username in
-engine_registry — Phase 1's one shared admin bot and Phase 2's many
-concurrent client bots are the same code path.
+engine_registry. That engine is an EXECUTION ACCOUNT: what to trade is
+decided once by a shared StrategyRunner (strategy_runner.py) and broadcast to
+every account, which then sizes it against its own capital and punches it
+through its own broker.
 
-role="client" is handled differently at start: strategy/segments/instruments
-are NEVER taken from the request body — they're read server-side from
-admin_config, so a client can't select or bypass what they trade even by
-editing the request. `mode` IS a client choice, but only from the set admin
-enabled (admin_config.available_client_modes()); anything else is rejected
-rather than silently substituted, and the strategy/instruments that come
-with it are still the admin's, looked up per mode. Their own broker access
-token (saved via /broker/*/exchange) is required for Live and resolved
-server-side too, never accepted as input.
+role="client" therefore decides NOTHING about the trade. mode, strategy,
+segments, instruments, risk:reward and per-symbol windows are ALL read
+server-side from admin_config — `req.mode` is ignored outright rather than
+validated, so it cannot be steered from the request body any more than the
+instrument list can. Their own broker access token (saved via
+/broker/*/exchange) is required for Live and resolved server-side too, never
+accepted as input.
+
+What a client DOES control is their own money: environment (Paper/Live),
+total capital, allocated capital and their risk guardrails. That is the whole
+client surface — see /platform-signals for how they watch the platform trade
+before starting their own bot.
 """
 from __future__ import annotations
 
 import admin_config
 import config
+import strategy
+import strategy_runner
 import symbol_config
 import user_manager
 from api import engine_registry
@@ -78,18 +85,15 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
     broker_api_key = ""
 
     if user.role == "client":
-        allowed = admin_config.available_client_modes()
-        if not allowed:
+        # A client does not choose WHAT to trade — admin does. `req.mode` is
+        # ignored outright rather than validated, so the mode cannot be
+        # steered from the request body any more than the strategy or the
+        # instrument list can. The client's bot only sizes and punches.
+        requested = admin_config.active_client_mode()
+        if not requested:
             raise HTTPException(
                 400, "Trading hasn't been configured yet — ask your admin to "
                      "set a strategy and instruments before you can start.")
-        # An omitted mode means "the only one on offer"; with several enabled
-        # the client must name one rather than get an arbitrary default.
-        requested = req.mode or (allowed[0] if len(allowed) == 1 else "")
-        if requested not in allowed:
-            raise HTTPException(
-                400, f"Pick a trading mode to run. Available to you: "
-                     f"{', '.join(allowed)}.")
         mode_cfg = admin_config.get_mode_config(requested)
         mode = Mode(requested)
         strategy_key = mode_cfg.strategy_key
@@ -166,7 +170,14 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
     try:
         eng.start()
     except RuntimeError as exc:
-        raise HTTPException(400, str(exc))
+        # StartupBlocked carries a second, client-safe message; a plain
+        # RuntimeError has none and falls through to str(exc) as before. The
+        # role check lives HERE rather than in the engine so engine.py stays
+        # unaware of who is asking — it only states the two framings.
+        detail = str(exc)
+        if user.role == "client":
+            detail = getattr(exc, "client_message", "") or detail
+        raise HTTPException(400, detail)
     engine_registry.set_engine(user.username, eng)
     return {"ok": True, "strategy": eng.strategy.name, "broker": eng.broker.name}
 
@@ -195,6 +206,63 @@ def bot_status(user: CurrentUser = Depends(get_current_user)):
     if user.role != "client":
         out["strategy"] = {"key": eng.strategy.key, "name": eng.strategy.name}
     return out
+
+
+def _client_runner_key() -> str:
+    """The runner key a CLIENT resolves to, derived purely from admin's saved
+    config — no engine required.
+
+    This is what lets a client watch the platform's signals before starting:
+    the decisions are already being made under this key by whoever started
+    first, so we can look them up without the client owning anything. It
+    mirrors exactly what TradingEngine.__init__ computes, so a client who
+    then presses Start joins the very runner they were watching.
+    """
+    mode_name = admin_config.active_client_mode()
+    if not mode_name or not strategy_runner.replication_enabled():
+        return ""
+    mode_cfg = admin_config.get_mode_config(mode_name)
+    mode = Mode(mode_name)
+    bound = strategy.resolve_strategy(mode, mode_cfg.strategy_key)
+    rr = mode_cfg.risk_reward or bound.params.risk_reward
+    instruments = [config.INSTRUMENTS_BY_SYMBOL[s] for s in mode_cfg.symbols
+                   if s in config.INSTRUMENTS_BY_SYMBOL]
+    if not instruments:
+        return ""
+    token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
+    return strategy_runner.runner_key(mode, bound.key, instruments, rr, token)
+
+
+@router.get("/platform-signals")
+def platform_signals(user: CurrentUser = Depends(get_current_user)):
+    """Signals the platform is generating right now, whether or not THIS
+    account has started its bot.
+
+    A client who logs in mid-session sees the trades being taken around them
+    immediately, instead of a blank screen until they press Start. Carries no
+    quantity — that is per-account and only exists once an account actually
+    takes the trade — and no strategy identity, matching what
+    /config/client-modes already withholds from clients.
+
+    `running` is deliberately about the CALLER's own bot, not the platform's:
+    watching is not trading, and the dashboard must not imply otherwise.
+    """
+    eng = engine_registry.get_engine(user.username)
+    running = bool(eng and eng.state.running)
+    if eng is not None and getattr(eng, "_runner", None) is not None:
+        key = eng._runner_key
+    elif user.role == "client":
+        key = _client_runner_key()
+    else:
+        key = ""
+    runner = strategy_runner.get(key) if key else None
+    return {
+        "running": running,
+        "live": runner is not None,
+        "mode": runner.mode.value if runner is not None else
+                (admin_config.active_client_mode() if user.role == "client" else ""),
+        "signals": runner.recent_signals() if runner is not None else [],
+    }
 
 
 @router.get("/broker-positions")

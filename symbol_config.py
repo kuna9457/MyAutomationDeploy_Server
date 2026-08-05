@@ -31,16 +31,17 @@ Intraday run on the same ticker want different windows. It imports only
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time
 from typing import Optional
 
 import config
+import config_store
 
-_PATH = os.path.join(config.LOCAL_DB_DIR, "symbol_configs.json")
+#: Storage key (was the filename symbol_configs.json — kept identical so an
+#: existing local file is migrated rather than orphaned).
+_KEY = "symbol_configs"
 _lock = threading.Lock()
 
 #: Weekday numbers as Python's datetime.weekday() reports them.
@@ -213,11 +214,7 @@ def to_rules(symbol: str, cfg: SymbolConfig) -> Optional[SymbolRules]:
 def _from_disk() -> dict[str, dict[str, SymbolConfig]]:
     """Everything on disk. Never raises: a missing or corrupt file reads as
     'nothing configured', which is precisely the safe default here."""
-    try:
-        with open(_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        return {}
+    data = config_store.load(_KEY)
     if not isinstance(data, dict):
         return {}
     out: dict[str, dict[str, SymbolConfig]] = {}
@@ -237,10 +234,9 @@ def _from_disk() -> dict[str, dict[str, SymbolConfig]]:
 
 
 def _to_disk(data: dict[str, dict[str, SymbolConfig]]) -> None:
-    os.makedirs(config.LOCAL_DB_DIR, exist_ok=True)
-    with open(_PATH, "w", encoding="utf-8") as fh:
-        json.dump({mode: {sym: asdict(cfg) for sym, cfg in entries.items()}
-                   for mode, entries in data.items()}, fh, indent=2)
+    config_store.save(_KEY, {
+        mode: {sym: asdict(cfg) for sym, cfg in entries.items()}
+        for mode, entries in data.items()})
 
 
 def get_all(mode: str) -> dict[str, SymbolConfig]:

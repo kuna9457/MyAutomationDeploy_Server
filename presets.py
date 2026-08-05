@@ -28,16 +28,16 @@ broker or strategy code, so it cannot affect a running bot.
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 import config
+import config_store
 import symbol_config
 
-_PATH = os.path.join(config.LOCAL_DB_DIR, "control_presets.json")
+#: Storage key (was the filename control_presets.json).
+_KEY = "control_presets"
 _lock = threading.Lock()
 
 #: Guard against a name that would make the file unwieldy or the UI unreadable.
@@ -149,11 +149,7 @@ def validate(preset: ControlPreset) -> ControlPreset:
 def load_all() -> dict[str, ControlPreset]:
     """Every saved preset. Never raises — a missing or corrupt file reads as
     'no presets', so the sidebar always renders."""
-    try:
-        with open(_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        return {}
+    data = config_store.load(_KEY)
     if not isinstance(data, dict):
         return {}
     out: dict[str, ControlPreset] = {}
@@ -167,9 +163,7 @@ def load_all() -> dict[str, ControlPreset]:
 
 
 def _write(data: dict[str, ControlPreset]) -> None:
-    os.makedirs(config.LOCAL_DB_DIR, exist_ok=True)
-    with open(_PATH, "w", encoding="utf-8") as fh:
-        json.dump({name: asdict(p) for name, p in data.items()}, fh, indent=2)
+    config_store.save(_KEY, {name: asdict(p) for name, p in data.items()})
 
 
 def get(name: str) -> ControlPreset | None:

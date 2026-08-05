@@ -28,9 +28,17 @@ import threading
 from dataclasses import asdict, dataclass
 
 import config
+import config_store
 
 _LEGACY_PATH = os.path.join(config.LOCAL_DB_DIR, "live_risk_limits.json")
 _DIR = os.path.join(config.LOCAL_DB_DIR, "live_risk_limits")
+#: All users' limits in ONE durable document, {user_id: {...fields}}. Storage
+#: moved here (config_store: MongoDB when reachable, local JSON otherwise)
+#: because the per-user files below live on an ephemeral filesystem — on a
+#: container host a redeploy silently reset everyone's guardrails back to
+#: "no extra restriction". Both older layouts are still read on the way in
+#: (see `load`), so no existing account loses its settings.
+_KEY = "live_risk_limits_by_user"
 _lock = threading.Lock()
 
 
@@ -83,7 +91,26 @@ def _load_json(path: str) -> LiveRiskLimits:
                              if k in LiveRiskLimits.__dataclass_fields__})
 
 
+def _coerce(data: dict) -> LiveRiskLimits:
+    return LiveRiskLimits(**{k: v for k, v in (data or {}).items()
+                             if k in LiveRiskLimits.__dataclass_fields__})
+
+
 def load(user_id: str = "admin") -> LiveRiskLimits:
+    """This user's limits, newest storage layout first.
+
+    Three layouts are read, in order, so nobody's settings are lost as
+    storage has moved: the durable combined document, then the per-user file
+    it replaced, then the single legacy file that predated per-user storage.
+    The first hit wins and is returned as-is; it gets written into the durable
+    document on the next set_limits().
+    """
+    try:
+        by_user = config_store.load(_KEY)
+        if isinstance(by_user, dict) and user_id in by_user:
+            return _coerce(by_user[user_id])
+    except Exception:
+        pass
     try:
         return _load_json(_path(user_id))
     except Exception:
@@ -121,9 +148,11 @@ def set_limits(user_id: str = "admin", **kwargs) -> LiveRiskLimits:
         updated = LiveRiskLimits(**current)
         _limits_cache[user_id] = updated
         try:
-            os.makedirs(_DIR, exist_ok=True)
-            with open(_path(user_id), "w", encoding="utf-8") as fh:
-                json.dump(asdict(updated), fh, indent=2)
+            by_user = config_store.load(_KEY)
+            if not isinstance(by_user, dict):
+                by_user = {}
+            by_user[user_id] = asdict(updated)
+            config_store.save(_KEY, by_user)
         except Exception as exc:
             print(f"[risk_manager] could not persist limits for {user_id}: {exc}")
         return LiveRiskLimits(**asdict(updated))

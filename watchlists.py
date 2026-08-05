@@ -4,10 +4,11 @@ Named instrument watchlists — save a bucket of symbols you trade often under a
 name, then load it in one click into the live bot's instrument picker AND the
 bulk backtest bucket, instead of re-selecting the same stocks every time.
 
-Pure persistence, nothing else: a watchlist is just {name: [symbol, ...]} stored
-as JSON under the local data dir (config.LOCAL_DB_DIR, already gitignored). This
-module imports NEITHER Streamlit NOR any strategy/broker/engine code, so it can't
-hamper anything else — the UI (app.py) is the only caller.
+Pure persistence, nothing else: a watchlist is just {name: [symbol, ...]}, kept
+durable by config_store (MongoDB when reachable, local JSON otherwise — so it
+survives a redeploy on an ephemeral filesystem). This module imports NEITHER
+Streamlit NOR any strategy/broker/engine code, so it can't hamper anything
+else — the UI is the only caller.
 
 Symbols are stored as plain strings. Validation against the live instrument
 universe is the caller's job (an instrument can be added/removed from config
@@ -16,27 +17,16 @@ to what currently exists before using it.
 """
 from __future__ import annotations
 
-import json
-import os
+import config_store
 
-import config
-
-
-def _path() -> str:
-    return os.path.join(config.LOCAL_DB_DIR, "watchlists.json")
+#: Storage key (was the filename watchlists.json).
+_KEY = "watchlists"
 
 
 def load_all() -> dict[str, list[str]]:
-    """Every saved watchlist as {name: [symbols]}. Never raises — a missing or
-    corrupt file just reads as 'no watchlists' so the UI always renders."""
-    path = _path()
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        return {}
+    """Every saved watchlist as {name: [symbols]}. Never raises — missing or
+    corrupt storage just reads as 'no watchlists' so the UI always renders."""
+    data = config_store.load(_KEY)
     if not isinstance(data, dict):
         return {}
     out: dict[str, list[str]] = {}
@@ -81,6 +71,4 @@ def delete(name: str) -> bool:
 
 
 def _write(data: dict[str, list[str]]) -> None:
-    os.makedirs(config.LOCAL_DB_DIR, exist_ok=True)
-    with open(_path(), "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
+    config_store.save(_KEY, data)
