@@ -35,6 +35,9 @@ class StartBotRequest(BaseModel):
     #: own. Decides how much pattern evidence an entry needs. A client's
     #: value is ignored — theirs comes from the admin's saved ModeConfig.
     min_score: float = 0.0
+    #: ADMIN-ONLY. End-of-session flat-out; "" = the segment default.
+    square_off_time: str = ""
+    square_off_enabled: bool = True
 
 
 class RiskLimitsRequest(BaseModel):
@@ -143,6 +146,29 @@ class AdminConfigRequest(BaseModel):
     #: Signal-score threshold for this mode. 0 = inherit the strategy's own.
     #: Range-checked in the route (config.is_valid_min_score).
     min_score: float = 0.0
+    #: End-of-session flat-out. "" = the segment default (15:09 equity).
+    square_off_time: str = ""
+    square_off_enabled: bool = True
+
+
+class RangeResetRequest(BaseModel):
+    """Delete trades in a date range — the surgical alternative to wiping a
+    whole environment.
+
+    `confirm` defaults to FALSE, which makes the request a PREVIEW: it reports
+    exactly what would be deleted and removes nothing. Nothing is destroyed
+    until the same request comes back with confirm=true, so a wipe can never
+    happen from a single mis-click or a half-filled form.
+    """
+    environment: str          # "Paper" | "Live"
+    start: str                # "YYYY-MM-DD", inclusive
+    end: str                  # "YYYY-MM-DD", inclusive
+    #: "" = every category. Lets you drop just the simulated commodity trades
+    #: while keeping equity history from the same days.
+    category: str = ""
+    #: "" = the admin's own book. A username scopes the delete to that client.
+    username: str = ""
+    confirm: bool = False
 
 
 class ClientModesRequest(BaseModel):
@@ -161,6 +187,9 @@ class SymbolConfigRequest(BaseModel):
     symbol: str
     #: Weekdays new entries may open on, 0=Mon .. 6=Sun. [] = every day.
     trade_days: list[int] = []
+    #: HOURS (0-23 IST) new entries may open in. Hour H covers H:00-H:59, so
+    #: gaps are expressible: [9,10,11,15] skips 12:00-14:59. [] = no filter.
+    trade_hours: list[int] = []
     #: "HH:MM" IST. "" = the segment's own session open/close.
     start_time: str = ""
     end_time: str = ""

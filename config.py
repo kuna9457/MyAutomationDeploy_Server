@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from enum import Enum
+from typing import Optional
 
 try:
     from dotenv import load_dotenv
@@ -45,6 +46,61 @@ class Broker(str, Enum):
 class Segment(str, Enum):
     EQUITY = "NSE_EQUITY"
     MCX = "MCX_COMMODITY"
+    #: Declared ahead of any instruments existing, so the category below is a
+    #: TOTAL mapping from day one. Adding real crypto instruments later is then
+    #: purely a config change — no reporting, storage or UI work follows it.
+    CRYPTO = "CRYPTO"
+
+
+class Category(str, Enum):
+    """The asset class a trade belongs to, for book-keeping and reporting.
+
+    Distinct from Segment on purpose: a segment is an EXCHANGE VENUE (NSE cash,
+    MCX futures) and there may be several per asset class, while a category is
+    what you actually want to see a P&L line for. Stored on every trade so the
+    split survives an instrument being reclassified or a venue being added.
+    """
+    EQUITY = "Equity"
+    COMMODITY = "Commodity"
+    CRYPTO = "Crypto"
+
+
+SEGMENT_CATEGORY: dict[Segment, Category] = {
+    Segment.EQUITY: Category.EQUITY,
+    Segment.MCX: Category.COMMODITY,
+    Segment.CRYPTO: Category.CRYPTO,
+}
+
+
+def category_for_segment(segment) -> str:
+    """Category name for a Segment or its raw string value.
+
+    Accepts a bare string because it is called with `trade["segment"]` from
+    stored documents, which are plain JSON. An unrecognised segment falls back
+    to Equity rather than raising: a trade that cannot be categorised must
+    still appear in the book, and being in the wrong bucket is recoverable
+    where vanishing from the totals is not.
+    """
+    if isinstance(segment, Segment):
+        return SEGMENT_CATEGORY[segment].value
+    try:
+        return SEGMENT_CATEGORY[Segment(str(segment))].value
+    except (ValueError, KeyError):
+        return Category.EQUITY.value
+
+
+def category_of_trade(trade: dict) -> str:
+    """A stored trade's category, derived from `segment` when the trade
+    predates the field. Every read path goes through this, so a document
+    written before categories existed is never left uncategorised even if the
+    one-off backfill has not run."""
+    stored = (trade or {}).get("category")
+    if stored:
+        return str(stored)
+    return category_for_segment((trade or {}).get("segment", ""))
+
+
+ALL_CATEGORIES: tuple[str, ...] = tuple(c.value for c in Category)
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +166,14 @@ class Instrument:
     # worth ₹100. Scalper sizing divides by this so cash risk stays constant
     # (scalping.md: Quantity = Risk_Amount / (ATR * Contract_Multiplier)).
     contract_multiplier: int = 1
+    # Contract expiry as "YYYY-MM-DD", for DERIVATIVES only — "" for equity,
+    # which never expires. Written by tools/refresh_mcx.py.
+    #
+    # This exists because an expired MCX key does not degrade, it DIES: Upstox
+    # answers UDAPI100011 "Invalid Instrument key" and the symbol silently
+    # stops producing data. Carrying the date lets the bot warn while the
+    # contract is still tradable instead of leaving you to notice the gap.
+    expiry: str = ""
 
 
 # NSE equities (cash) — the Nifty 100 universe ------------------------------- #
@@ -160,19 +224,26 @@ except Exception:  # generated module absent — keep the bot runnable
 try:
     from mcx_instruments import MCX_INSTRUMENTS
 except Exception:  # generated module absent — keep the bot runnable
+    # LAST-RESORT SNAPSHOT, refreshed 2026-08-05. These keys EXPIRE, so this
+    # list rots: it is only reached when mcx_instruments.py is missing or
+    # fails to import, and by then the dates below are probably stale too.
+    # Every entry carries its expiry so the engine's startup check reports
+    # exactly which of them have died rather than trading a silent void.
+    #
+    # If you find yourself here, the fix is `python tools/refresh_mcx.py`.
     MCX_INSTRUMENTS = [
-        #          symbol         segment      instrument_key    lot  tick  ref price   multiplier
+        #          symbol         segment      instrument_key    lot  tick  ref price   mult  expiry
         # --- Full-size contracts ---
-        Instrument("GOLD",        Segment.MCX, "MCX_FO|466583", 1,    1.0,  142419.0,  100),   # 1 kg, quoted ₹/10g
-        Instrument("CRUDEOIL",    Segment.MCX, "MCX_FO|520702", 100,  1.0,  7580.0,    100),   # 100 barrels, quoted ₹/barrel
-        Instrument("NATURALGAS",  Segment.MCX, "MCX_FO|538685", 1250, 0.10, 279.7,     1250),  # 1250 mmBtu, quoted ₹/mmBtu
-        Instrument("SILVER",      Segment.MCX, "MCX_FO|471725", 30,   1.0,  223320.0,  30),    # 30 kg, quoted ₹/kg
+        Instrument("GOLD",        Segment.MCX, "MCX_FO|483079", 1,    1.0,  142419.0,  100,  expiry="2026-10-05"),   # 1 kg, quoted ₹/10g
+        Instrument("CRUDEOIL",    Segment.MCX, "MCX_FO|560977", 100,  1.0,  7580.0,    100,  expiry="2026-08-19"),   # 100 barrels, quoted ₹/barrel
+        Instrument("NATURALGAS",  Segment.MCX, "MCX_FO|561496", 1250, 0.10, 279.7,     1250, expiry="2026-08-26"),   # 1250 mmBtu, quoted ₹/mmBtu
+        Instrument("SILVER",      Segment.MCX, "MCX_FO|471725", 30,   1.0,  223320.0,  30,   expiry="2026-09-04"),   # 30 kg, quoted ₹/kg
         # --- Mini / micro contracts (fractional size => fractional margin) ---
-        Instrument("GOLDM",       Segment.MCX, "MCX_FO|555922", 100,  1.0,  142419.0,  10),    # 100 g, quoted ₹/10g
-        Instrument("CRUDEOILM",   Segment.MCX, "MCX_FO|520703", 10,   1.0,  7580.0,    10),    # 10 barrels, quoted ₹/barrel
-        Instrument("NATGASMINI",  Segment.MCX, "MCX_FO|538686", 250,  0.10, 279.7,     250),   # 250 mmBtu, quoted ₹/mmBtu
-        Instrument("SILVERM",     Segment.MCX, "MCX_FO|471726", 5,    1.0,  223320.0,  5),     # 5 kg, quoted ₹/kg
-        Instrument("SILVERMIC",   Segment.MCX, "MCX_FO|488788", 1,    1.0,  223320.0,  1),     # 1 kg, quoted ₹/kg
+        Instrument("GOLDM",       Segment.MCX, "MCX_FO|563946", 100,  1.0,  142419.0,  10,   expiry="2026-09-04"),   # 100 g, quoted ₹/10g
+        Instrument("CRUDEOILM",   Segment.MCX, "MCX_FO|560978", 10,   1.0,  7580.0,    10,   expiry="2026-08-19"),   # 10 barrels, quoted ₹/barrel
+        Instrument("NATGASMINI",  Segment.MCX, "MCX_FO|561497", 250,  0.10, 279.7,     250,  expiry="2026-08-26"),   # 250 mmBtu, quoted ₹/mmBtu
+        Instrument("SILVERM",     Segment.MCX, "MCX_FO|471726", 5,    1.0,  223320.0,  5,    expiry="2026-08-31"),   # 5 kg, quoted ₹/kg
+        Instrument("SILVERMIC",   Segment.MCX, "MCX_FO|488788", 1,    1.0,  223320.0,  1,    expiry="2026-08-31"),   # 1 kg, quoted ₹/kg
     ]
 
 ALL_INSTRUMENTS = EQUITY_INSTRUMENTS + MCX_INSTRUMENTS
@@ -182,13 +253,19 @@ INSTRUMENTS_BY_SYMBOL = {i.symbol: i for i in ALL_INSTRUMENTS}
 # --------------------------------------------------------------------------- #
 #  MCX margin — hardcoded per-lot figures (user-provided).
 #
+#  BACKTEST ONLY. The live and paper engines no longer read this table at all —
+#  engine._mcx_margin asks the BROKER for the real figure in both environments
+#  and refuses the trade if it can't get one, rather than sizing a real position
+#  off a number typed in months ago.
+#
+#  It survives here for the one job it is still honest at: backtesting. A
+#  historical run cannot ask for today's margin — margin in August tells you
+#  nothing about what the exchange demanded in March — so an approximate,
+#  stable per-lot figure is the best available input and its inaccuracy is
+#  bounded and obvious.
+#
 #  Commodity margin is NOT a formula (notional ÷ leverage is nowhere near right):
-#  it is the exchange's SPAN + Exposure margin plus SEBI peak-margin. For the
-#  PAPER trading bot we deliberately use these FIXED per-lot figures rather than a
-#  live broker call — they are the user's real broker-side reference values, they
-#  are stable enough for paper simulation, and they avoid depending on a live
-#  token being present. LIVE trading still prefers the broker's own margin API and
-#  only falls back to this table (see engine._mcx_margin / broker.required_margin).
+#  it is the exchange's SPAN + Exposure margin plus SEBI peak-margin.
 #
 #  Values are rupees of margin for ONE lot (1 contract), taken as the mid-point of
 #  the user-supplied broker ranges (e.g. CRUDEOIL ₹2.40–2.55L => ₹2.475L).
@@ -218,6 +295,38 @@ def mcx_margin_per_lot(symbol: str) -> float:
 
 def instruments_for_segment(segment: Segment) -> list[Instrument]:
     return [i for i in ALL_INSTRUMENTS if i.segment == segment]
+
+
+#: Warn this many days before a derivative contract expires. Crude oil and
+#: natural gas roll MONTHLY, metals every two months, so a week is enough
+#: notice to refresh without nagging for most of the contract's life.
+EXPIRY_WARN_DAYS = 7
+
+
+def days_to_expiry(inst: Instrument) -> Optional[int]:
+    """Whole days until this contract expires, or None if it never does
+    (equity) or the date is unparseable."""
+    if not inst.expiry:
+        return None
+    try:
+        exp = datetime.strptime(inst.expiry, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (exp - now_ist().date()).days
+
+
+def expiring_soon(instruments: list[Instrument],
+                  within_days: int = EXPIRY_WARN_DAYS
+                  ) -> list[tuple[Instrument, int]]:
+    """(instrument, days_left) for every contract at or past `within_days`,
+    soonest first. A NEGATIVE days_left means it has already expired — its key
+    is dead and that symbol cannot produce data at all."""
+    out = []
+    for inst in instruments:
+        left = days_to_expiry(inst)
+        if left is not None and left <= within_days:
+            out.append((inst, left))
+    return sorted(out, key=lambda pair: pair[1])
 
 
 # --------------------------------------------------------------------------- #
@@ -264,6 +373,63 @@ MCX_HOURS = MarketHours(time(9, 0), time(23, 30))
 
 def market_hours_for_segment(segment: Segment) -> MarketHours:
     return MCX_HOURS if segment == Segment.MCX else EQUITY_HOURS
+
+
+# --------------------------------------------------------------------------- #
+#  Intraday square-off
+#
+#  An INTRADAY position must not survive the session. Left alone it either gets
+#  auto-squared by the broker at whatever price the close happens to print, or
+#  — worse in the cash segment — turns into a delivery the account never
+#  intended to fund. So the bot closes everything itself, at a time it picks,
+#  while there is still liquidity to get out on.
+#
+#  15:09 for equity: ~20 minutes before the 15:30 close, comfortably ahead of
+#  the closing auction and the last-minute spread widening, and ahead of most
+#  brokers' own auto-square-off (typically 15:15-15:20) so the exit happens on
+#  OUR terms rather than theirs.
+#
+#  MCX runs to 23:30, so it gets its own, later cutoff — using 15:09 there
+#  would cut the commodity session off in the middle of its most active hours.
+#
+#  This fires REGARDLESS of profit or loss: it is a time stop, not a decision.
+#  SWING is deliberately absent — it holds overnight by design, and applying an
+#  end-of-day exit to it would silently convert it into an intraday strategy.
+# --------------------------------------------------------------------------- #
+DEFAULT_SQUARE_OFF = {
+    Segment.EQUITY: time(15, 9),
+    Segment.MCX: time(23, 15),
+}
+
+#: Modes whose positions must be flat by the end of the session. Swing is NOT
+#: here, and must never be added — see above.
+SQUARE_OFF_MODES = (Mode.INTRADAY, Mode.SCALPER)
+
+
+def default_square_off(segment: Segment) -> time:
+    return DEFAULT_SQUARE_OFF.get(segment, time(15, 9))
+
+
+def parse_clock(value: str) -> Optional[time]:
+    """"HH:MM" -> time, or None for empty/invalid. Shared by the admin
+    square-off setting and anything else taking a wall-clock string."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        hh, mm = text.split(":")
+        return time(int(hh), int(mm))
+    except Exception:
+        return None
+
+
+def square_off_time_for(segment: Segment, mode: Mode,
+                        override: str = "") -> Optional[time]:
+    """When positions in this instrument must be flat, or None if the mode
+    holds overnight (Swing) — in which case no square-off applies at all."""
+    if mode not in SQUARE_OFF_MODES:
+        return None
+    return parse_clock(override) or default_square_off(segment)
 
 
 # Notional leverage a segment realistically supports, i.e. 1 / margin_rate.

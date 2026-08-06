@@ -15,13 +15,13 @@ trading use actual market data, so it need not be exact.
 from config import Instrument, Segment
 
 MCX_INSTRUMENTS = [
-    Instrument("GOLD", Segment.MCX, "MCX_FO|466583", 1, 1.0, 142419.0, 100),   # GRMS, expiry 05-Aug-2026
-    Instrument("CRUDEOIL", Segment.MCX, "MCX_FO|520702", 100, 1.0, 7580.0, 100),   # BBL, expiry 20-Jul-2026
-    Instrument("NATURALGAS", Segment.MCX, "MCX_FO|538685", 1250, 0.1, 279.7, 1250),   # mmBtu, expiry 28-Jul-2026
-    Instrument("SILVER", Segment.MCX, "MCX_FO|471725", 30, 1.0, 223320.0, 30),   # KGS, expiry 04-Sep-2026
-    Instrument("GOLDM", Segment.MCX, "MCX_FO|555922", 100, 1.0, 142419.0, 10),   # GRMS, expiry 05-Aug-2026
-    Instrument("CRUDEOILM", Segment.MCX, "MCX_FO|520703", 10, 1.0, 7580.0, 10),   # BBL, expiry 20-Jul-2026
-    Instrument("NATGASMINI", Segment.MCX, "MCX_FO|538686", 250, 0.1, 279.7, 250),   # mmBtu, expiry 28-Jul-2026
-    Instrument("SILVERM", Segment.MCX, "MCX_FO|471726", 5, 1.0, 223320.0, 5),   # KGS, expiry 31-Aug-2026
-    Instrument("SILVERMIC", Segment.MCX, "MCX_FO|488788", 1, 1.0, 223320.0, 1),   # KGS, expiry 31-Aug-2026
+    Instrument("GOLD", Segment.MCX, "MCX_FO|483079", 1, 1.0, 142419.0, 100, expiry="2026-10-05"),   # GRMS, expires 05-Oct-2026
+    Instrument("CRUDEOIL", Segment.MCX, "MCX_FO|560977", 100, 1.0, 7580.0, 100, expiry="2026-08-19"),   # BBL, expires 19-Aug-2026
+    Instrument("NATURALGAS", Segment.MCX, "MCX_FO|561496", 1250, 0.1, 279.7, 1250, expiry="2026-08-26"),   # mmBtu, expires 26-Aug-2026
+    Instrument("SILVER", Segment.MCX, "MCX_FO|471725", 30, 1.0, 223320.0, 30, expiry="2026-09-04"),   # KGS, expires 04-Sep-2026
+    Instrument("GOLDM", Segment.MCX, "MCX_FO|563946", 100, 1.0, 142419.0, 10, expiry="2026-09-04"),   # GRMS, expires 04-Sep-2026
+    Instrument("CRUDEOILM", Segment.MCX, "MCX_FO|560978", 10, 1.0, 7580.0, 10, expiry="2026-08-19"),   # BBL, expires 19-Aug-2026
+    Instrument("NATGASMINI", Segment.MCX, "MCX_FO|561497", 250, 0.1, 279.7, 250, expiry="2026-08-26"),   # mmBtu, expires 26-Aug-2026
+    Instrument("SILVERM", Segment.MCX, "MCX_FO|471726", 5, 1.0, 223320.0, 5, expiry="2026-08-31"),   # KGS, expires 31-Aug-2026
+    Instrument("SILVERMIC", Segment.MCX, "MCX_FO|488788", 1, 1.0, 223320.0, 1, expiry="2026-08-31"),   # KGS, expires 31-Aug-2026
 ]

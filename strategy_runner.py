@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Protocol
 
+import config
 from config import Instrument, Mode, market_hours_for_segment, now_ist
 from data_feed import LiveQuote, MarketDataFeed, SimulatedFeed, make_feed
 from strategy import BoundStrategy, Signal, run_strategy
@@ -125,6 +126,8 @@ class StrategyRunner:
         feed_token: str,
         poll_seconds: float,
         symbol_rules: Optional[dict] = None,
+        square_off_time: str = "",
+        square_off_enabled: bool = True,
     ):
         self.key = key
         self.mode = mode
@@ -137,6 +140,16 @@ class StrategyRunner:
         self.feed_token = feed_token
         self.poll_seconds = poll_seconds
         self.symbol_rules = dict(symbol_rules or {})
+        # End-of-session flat-out. "" = the segment's own default (15:09 for
+        # equity, 23:15 for MCX — see config.DEFAULT_SQUARE_OFF). Resolved per
+        # instrument because the two segments close hours apart.
+        self.square_off_time = square_off_time
+        self.square_off_enabled = square_off_enabled
+        # Symbols already squared off today, so the exit is broadcast ONCE
+        # rather than on every poll for the rest of the session. Cleared when
+        # the trading date rolls.
+        self._squared_off: set[str] = set()
+        self._squared_off_day = ""
 
         self.feed: Optional[MarketDataFeed] = None
         self._accounts: list[Account] = []
@@ -321,7 +334,14 @@ class StrategyRunner:
             if any(closed) and bar_ts is not None:
                 self._last_action_bar[inst.symbol] = bar_ts
 
-            # 2) The runner's own exit trigger: the unifier that gets every
+            # 2) END-OF-SESSION FLAT-OUT. Runs BEFORE the strategy's own exit
+            # logic and before any entry: past the cutoff nothing may be held
+            # and nothing new may be opened, whatever the position is worth.
+            if self._square_off_due(inst, now_dt):
+                self._do_square_off(inst, live_price, now_dt, accounts)
+                continue
+
+            # 3) The runner's own exit trigger: the unifier that gets every
             # account out at the SAME moment, whatever price each of them
             # happened to fill at. Accounts already out are a no-op.
             if self._reference_exit(inst, live_price, now_dt, accounts) and bar_ts:
@@ -352,13 +372,79 @@ class StrategyRunner:
             self._record_signal(inst, sig, now_dt)
             sev = SignalEvent(inst, sig, quote, bar_ts)
             entered = self._broadcast(lambda a, e=sev: a.on_signal(e), accounts)
-            if any(entered):
+
+            # Mark the bar as DECIDED, whether or not anyone could act on it.
+            #
+            # This used to be inside `if any(entered)`, which conflated
+            # "decided" with "executed": when every account skipped — most
+            # often because the margin for one lot exceeds the account — the
+            # cooldown never armed, so the identical bar was re-evaluated on
+            # the very next poll and produced the identical signal again. At
+            # the Scalper's 0.5s tick that is two duplicate rows a second,
+            # forever, for a trade nobody can take.
+            #
+            # The cooldown's job is "never act twice on the same candle"; a
+            # candle we have already judged is judged, and an unaffordable
+            # trade does not become affordable within the same bar.
+            if bar_ts is not None:
                 self._last_action_bar[inst.symbol] = bar_ts
+            if any(entered):
                 self._refs[inst.symbol] = _Reference(
                     side=sig.side, entry=sig.entry_price,
                     stop=sig.stop_loss,
                     target=self._effective_target(inst.symbol, sig),
                     opened_at=now_dt)
+
+    # -- end-of-session square-off -------------------------------------------- #
+    def _square_off_due(self, inst: Instrument, now_dt: datetime) -> bool:
+        """Is this instrument past its flat-by time?
+
+        Resolved PER INSTRUMENT because equity closes at 15:30 and MCX runs to
+        23:30 — one cutoff for both would either strand equity positions into
+        the auction or amputate the commodity session mid-afternoon. Returns
+        False for Swing, which holds overnight by design.
+        """
+        if not self.square_off_enabled:
+            return False
+        cutoff = config.square_off_time_for(inst.segment, self.mode,
+                                            self.square_off_time)
+        if cutoff is None:
+            return False
+        return now_dt.time() >= cutoff
+
+    def _do_square_off(self, inst: Instrument, live_price: float,
+                       now_dt: datetime, accounts: list[Account]) -> None:
+        """Flatten this instrument across every account, once per day.
+
+        Deliberately unconditional on P&L: this is a time stop. A losing
+        position held past the close does not become a better one, and in the
+        cash segment it becomes a delivery the account never planned to fund.
+
+        Broadcast once — the guard below stops it re-firing on every poll for
+        the remaining twenty minutes of the session, which would otherwise
+        bury the log and hammer the broker with square-off attempts for
+        positions that are already flat.
+        """
+        today = now_dt.strftime("%Y-%m-%d")
+        if self._squared_off_day != today:
+            self._squared_off_day = today
+            self._squared_off.clear()
+        if inst.symbol in self._squared_off:
+            return
+        self._squared_off.add(inst.symbol)
+        # Drop the reference too, so the exit trigger doesn't chase a position
+        # nobody holds any more.
+        self._refs.pop(inst.symbol, None)
+
+        cutoff = config.square_off_time_for(inst.segment, self.mode,
+                                            self.square_off_time)
+        reason = f"SQUARE-OFF ({cutoff.strftime('%H:%M')})"
+        closed = self._broadcast(
+            lambda a: a.on_exit(inst, live_price, reason), accounts)
+        if any(closed):
+            self._log(f"🔔 {inst.symbol}: end-of-session square-off at "
+                      f"{cutoff.strftime('%H:%M')} — position closed at "
+                      f"{live_price:.2f} regardless of P&L.")
 
     # -- the platform signal log --------------------------------------------- #
     def _record_signal(self, inst: Instrument, sig: Signal,
@@ -515,18 +601,20 @@ _runners: dict[str, StrategyRunner] = {}
 
 def runner_key(mode: Mode, strategy_key: str, instruments: list[Instrument],
                risk_reward: float, feed_token: str,
-               min_score: float = 0.0) -> str:
+               min_score: float = 0.0, square_off: str = "") -> str:
     """Everything that must match for two accounts to share a decision.
 
     risk_reward is in the key because it moves the TARGET, and the runner's
     exit trigger quotes that target. min_score is in it because it decides
     WHETHER a signal fires at all — two accounts on different thresholds are
     not running the same decision and must never share one runner, or the
-    stricter account would silently receive the looser one's entries.
+    stricter account would silently receive the looser one's entries. The
+    square-off cutoff is in it for the same reason — it decides when every
+    position is force-closed.
     """
     syms = ",".join(sorted(i.symbol for i in instruments))
     return (f"{mode.value}|{strategy_key}|{risk_reward:g}|{min_score:g}"
-            f"|{syms}|{hash(feed_token)}")
+            f"|{square_off}|{syms}|{hash(feed_token)}")
 
 
 def acquire(key: str, factory) -> StrategyRunner:

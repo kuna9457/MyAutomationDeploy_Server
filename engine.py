@@ -48,6 +48,12 @@ BROKER_FUNDS_TTL_SECONDS = 20.0
 # open symbol's position on every single tick.
 BROKER_POSITION_TTL_SECONDS = 5.0
 
+# How long a fetched MCX margin is reused before re-asking the broker. Margin
+# genuinely drifts intraday with volatility and SEBI peak-margin rules, so it
+# cannot be cached for the whole session — but it does not move fast enough to
+# justify a call per tick.
+MCX_MARGIN_TTL_SECONDS = 900.0
+
 # A tick older than this during market hours means the stream has stalled; we
 # stop calling it "live" in the UI rather than pricing PnL off stale data.
 STALE_QUOTE_SECONDS = 30.0
@@ -139,6 +145,8 @@ class TradingEngine:
         broker_api_key: str = "",
         risk_reward: float = 0.0,
         min_score: float = 0.0,
+        square_off_time: str = "",
+        square_off_enabled: bool = True,
         symbol_rules: Optional[dict[str, "symbol_config.SymbolRules"]] = None,
     ):
         self.environment = environment
@@ -210,6 +218,11 @@ class TradingEngine:
         # sizing, or the management of an already-open position — the one
         # exception being the explicitly opt-in square_off_at_end.
         self.symbol_rules = dict(symbol_rules or {})
+        # End-of-session flat-out, enforced by the shared runner so every
+        # account leaves at the same moment. Part of the runner key below, so
+        # accounts on different cutoffs never share a decision.
+        self.square_off_time = square_off_time
+        self.square_off_enabled = square_off_enabled
         # The Scalper trades 1-minute bars with a 7-minute time exit, so a 3s loop
         # would be a meaningful share of the whole trade. Poll sub-second there.
         self.poll_seconds = poll_seconds or (
@@ -220,11 +233,11 @@ class TradingEngine:
         self.broker: Optional[BaseBroker] = None
         # NOTE: `feed` is a property backed by the runner (see below) — the
         # market-data stream is shared, so this account does not own one.
-        # Cache of real MCX margins keyed by (symbol, quantity, side), so we hit the
-        # broker's margin API at most once per distinct size per session instead of
-        # on every tick. Margin drifts intraday but not enough to matter for a
-        # funding check; the cache is dropped on restart, which re-fetches fresh.
-        self._mcx_margin_cache: dict[tuple, float] = {}
+        # Cache of real MCX margins keyed by (symbol, quantity, side) ->
+        # (fetched_at, margin). TTL'd (MCX_MARGIN_TTL_SECONDS) rather than held
+        # for the session: margin moves with volatility, so a figure fetched at
+        # 09:15 should not still be sizing a trade at 15:00.
+        self._mcx_margin_cache: dict[tuple, tuple[float, float]] = {}
         # Cache of broker.available_funds() (account-wide, real ₹ free balance),
         # refreshed at most every BROKER_FUNDS_TTL_SECONDS — see that constant.
         self._funds_cache: tuple[float, Optional[float]] = (0.0, None)
@@ -241,6 +254,9 @@ class TradingEngine:
         self._trades_today = 0
         self._live_halt_logged = False
 
+        # symbol -> the bar whose skip was last logged, so an unaffordable
+        # symbol reports once per candle rather than once per poll.
+        self._skip_logged: dict[str, object] = {}
         # LIVE risk state for the tick in progress, refreshed by begin_tick and
         # read by on_signal within that same tick.
         self._live_limits = None
@@ -253,7 +269,8 @@ class TradingEngine:
         self._runner_key = (
             strategy_runner.runner_key(mode, self.strategy.key, instruments,
                                        self.params.risk_reward, self._feed_token,
-                                       self.params.cs_min_score)
+                                       self.params.cs_min_score,
+                                       f"{self.square_off_time}|{self.square_off_enabled}")
             if strategy_runner.replication_enabled()
             else f"solo:{user_id}:{id(self)}")
         self._runner = strategy_runner.acquire(
@@ -262,7 +279,52 @@ class TradingEngine:
                 key=self._runner_key, mode=mode, strategy=self.strategy,
                 params=self.params, instruments=instruments,
                 feed_token=self._feed_token, poll_seconds=self.poll_seconds,
-                symbol_rules=self.symbol_rules))
+                symbol_rules=self.symbol_rules,
+                square_off_time=self.square_off_time,
+                square_off_enabled=self.square_off_enabled))
+
+    # -- instrument health --------------------------------------------------- #
+    def _log_instrument_health(self) -> None:
+        """Report, at startup, anything wrong with the instruments we're about
+        to trade — while it can still be acted on.
+
+        Two failure modes, both previously invisible:
+
+          * A contract that returned NO DATA. An expired MCX key answers
+            "Invalid Instrument key"; the REST layer swallows it, the symbol
+            silently never produces a price, and the engine skips it on every
+            tick. The bot looks healthy while part of the book never trades.
+          * A contract about to EXPIRE. MCX futures roll — crude and natural
+            gas monthly, metals every two months — and the day after expiry
+            the key is dead. Warning ahead of time turns an outage into a
+            calendar item.
+
+        Purely informational: nothing here blocks the start or changes a
+        single trading decision.
+        """
+        feed = self._runner.feed if self._runner else None
+        problems = feed.data_problems() if feed is not None else []
+        if problems:
+            names = ", ".join(sym for sym, _ in problems)
+            self.state.push_log(
+                f"⚠️ {len(problems)} instrument(s) returned NO market data and "
+                f"will not trade: {names}")
+            for sym, reason in problems:
+                self.state.push_log(f"   • {sym}: {reason}")
+
+        for inst, days in config.expiring_soon(self.instruments):
+            if days < 0:
+                self.state.push_log(
+                    f"⛔ {inst.symbol} expired on {inst.expiry} — its key is "
+                    f"dead. Run tools/refresh_mcx.py to roll it.")
+            elif days == 0:
+                self.state.push_log(
+                    f"⚠️ {inst.symbol} expires TODAY ({inst.expiry}). Roll it "
+                    f"before the next session — run tools/refresh_mcx.py.")
+            else:
+                self.state.push_log(
+                    f"⏳ {inst.symbol} expires in {days} day(s) on "
+                    f"{inst.expiry} — run tools/refresh_mcx.py to roll it.")
 
     # -- the shared decider -------------------------------------------------- #
     @property
@@ -394,6 +456,7 @@ class TradingEngine:
         # a custom window/RR visible instead of it silently changing behaviour.
         for rules in self.symbol_rules.values():
             self.state.push_log(f"⚙️ Custom settings — {rules.describe()}")
+        self._log_instrument_health()
         if self._runner.account_count():
             self.state.push_log(
                 f"🔗 Sharing one market-data feed and one signal calculation "
@@ -625,8 +688,9 @@ class TradingEngine:
         #                       account cap. Sized against AVAILABLE capital so an
         #                       unfundable trade floors to qty=0 and is skipped.
         mcx_skip: Optional[str] = None
+        mcx_margin = 0.0
         if inst.segment == Segment.MCX:
-            qty, risk_amt, mcx_skip = self._mcx_fixed_size(
+            qty, risk_amt, mcx_margin, mcx_skip = self._mcx_fixed_size(
                 inst, sig, available, lev)
         else:
             qty, risk_amt = position_size(
@@ -643,13 +707,23 @@ class TradingEngine:
                              f"trade cap of {live_limits.max_qty_per_trade})")
             qty = live_limits.max_qty_per_trade
 
-        # Capital this trade would deploy = notional ÷ effective leverage —
-        # the SAME margin figure booked as `_margin` on entry (see _enter).
-        # Shown so the dashboard's signal row states what the trade ties up;
-        # qty=0 (skipped) correctly reads ₹0 deployed.
+        # Capital this trade would deploy — the SAME figure booked as `_margin`
+        # on entry (see _enter), so the funds check below and the dashboard's
+        # signal row both state what the trade actually ties up. qty=0
+        # (skipped) correctly reads ₹0 deployed.
+        #
+        # The two segments fund completely differently, so they are computed
+        # differently. EQUITY is notional ÷ effective leverage. MCX is the
+        # broker's REAL futures margin: notional ÷ leverage is nowhere near
+        # right for a commodity — for one CRUDEOILM lot it reads ~₹4.7k
+        # against a true requirement near ₹22k, which made this gate
+        # effectively blind for commodities.
         mult = max(inst.contract_multiplier, 1)
         notional = sig.entry_price * qty * mult
-        deployed = notional / lev if lev > 0 else notional
+        if inst.segment == Segment.MCX:
+            deployed = mcx_margin
+        else:
+            deployed = notional / lev if lev > 0 else notional
 
         # LIVE-only: independent real-broker-funds gate. Every ₹ ceiling
         # above (capital_allocated, risk sizing, notional cap) is OUR
@@ -679,6 +753,48 @@ class TradingEngine:
         risk_dist = abs(sig.entry_price - sig.stop_loss)
         eff_target = (sig.entry_price + eff_rr * risk_dist if sig.side == "BUY"
                       else sig.entry_price - eff_rr * risk_dist)
+        # Work out WHY this is being skipped (if it is) BEFORE recording the
+        # row, so the dashboard row carries its own verdict instead of a bare
+        # qty=0 that reads like a trade.
+        skip_reason = ""
+        if qty <= 0:
+            # The live broker-funds gate has its own precise reason —
+            # report that verbatim rather than the generic maths below,
+            # which would otherwise describe a trade that funds check
+            # already rejected for an unrelated reason.
+            if live_funds_block:
+                skip_reason = live_funds_block
+            # MCX fixed-lot sizing carries its OWN skip reason (zero lots
+            # configured, no broker margin, or the account can't fund the
+            # lots chosen). Report that verbatim instead of the equity maths.
+            elif mcx_skip:
+                skip_reason = mcx_skip
+            else:
+                # Report BOTH bounds — qty=0 can mean "stop too wide for the
+                # risk budget" or "position too expensive to fund from
+                # available cash", and the fix differs.
+                mult = max(inst.contract_multiplier, 1)
+                pct_budget = available * self.params.risk_per_trade
+                cash_cap = self.params.risk_per_trade_cash
+                risk_budget = (min(cash_cap, pct_budget)
+                               if cash_cap and cash_cap > 0 else pct_budget)
+                by_risk = risk_budget / max(
+                    abs(sig.entry_price - sig.stop_loss) * mult, 1e-9)
+                by_notional = ((available * lev)
+                               / max(sig.entry_price * mult, 1e-9))
+                cap_pct = getattr(self.params, "max_capital_per_trade_pct", 0.0)
+                cap_msg = ""
+                if cap_pct and cap_pct > 0:
+                    by_capital = ((self.total_capital * cap_pct)
+                                  / max(sig.entry_price * mult, 1e-9))
+                    cap_msg = (f" {cap_pct:.0%}-of-account capital cap allows "
+                               f"{by_capital:.2f};")
+                skip_reason = (
+                    f"{inst.symbol}: signal skipped (qty=0). Available capital "
+                    f"₹{available:,.0f}; risk budget ₹{risk_budget:,.0f} allows "
+                    f"{by_risk:.2f} units; {lev:g}x notional cap allows "
+                    f"{by_notional:.2f};{cap_msg} lot size is {inst.lot_size}.")
+
         sig_row = {
             "time": now_ist().strftime("%H:%M:%S"),
             "symbol": inst.symbol, "segment": inst.segment.value,
@@ -686,52 +802,34 @@ class TradingEngine:
             "stop": round(sig.stop_loss, 2), "target": round(eff_target, 2),
             "rr": round(eff_rr, 2), "qty": qty,
             "deployed": round(deployed, 2), "reason": sig.reason,
+            # The row's own verdict. Without it a qty=0 row is visually
+            # indistinguishable from a filled trade, and a symbol nobody can
+            # afford reads as a burst of activity.
+            "status": "SKIPPED" if skip_reason else "TAKEN",
+            "skip_reason": skip_reason,
         }
         with self.state.lock:
             self.state.last_signals.insert(0, sig_row)
             self.state.last_signals = self.state.last_signals[:50]
 
-        if qty <= 0:
-            # The live broker-funds gate has its own precise reason —
-            # report that verbatim rather than the generic maths below,
-            # which would otherwise describe a trade that funds check
-            # already rejected for an unrelated reason.
-            if live_funds_block:
-                self.state.push_log(live_funds_block)
-                return False
-            # MCX fixed-lot sizing carries its OWN skip reason (zero lots
-            # configured, or the account can't fund the margin for the lots
-            # chosen). Report that verbatim instead of the equity risk maths.
-            if mcx_skip:
-                self.state.push_log(mcx_skip)
-                return False
-            # Report BOTH bounds — qty=0 can mean "stop too wide for the risk
-            # budget" or "position too expensive to fund from available cash",
-            # and the fix differs.
-            mult = max(inst.contract_multiplier, 1)
-            pct_budget = available * self.params.risk_per_trade
-            cash_cap = self.params.risk_per_trade_cash
-            risk_budget = (min(cash_cap, pct_budget)
-                           if cash_cap and cash_cap > 0 else pct_budget)
-            by_risk = risk_budget / max(
-                abs(sig.entry_price - sig.stop_loss) * mult, 1e-9)
-            by_notional = ((available * lev)
-                           / max(sig.entry_price * mult, 1e-9))
-            cap_pct = getattr(self.params, "max_capital_per_trade_pct", 0.0)
-            cap_msg = ""
-            if cap_pct and cap_pct > 0:
-                by_capital = ((self.total_capital * cap_pct)
-                              / max(sig.entry_price * mult, 1e-9))
-                cap_msg = (f" {cap_pct:.0%}-of-account capital cap allows "
-                           f"{by_capital:.2f};")
-            self.state.push_log(
-                f"{inst.symbol}: signal skipped (qty=0). Available capital "
-                f"₹{available:,.0f}; risk budget ₹{risk_budget:,.0f} allows "
-                f"{by_risk:.2f} units; {lev:g}x notional cap allows "
-                f"{by_notional:.2f};{cap_msg} lot size is {inst.lot_size}.")
+        if skip_reason:
+            self._log_skip(inst.symbol, ev.bar_ts, skip_reason)
             return False
 
         return self._enter(inst, sig, qty, risk_amt, quote, live_qty_clip, lev)
+
+    def _log_skip(self, symbol: str, bar_ts, reason: str) -> None:
+        """Log a skipped signal at most ONCE PER CANDLE per symbol.
+
+        Keyed on the bar rather than the message because the message carries
+        live figures ("only ₹95,234 is available") that shift between polls —
+        deduplicating on the text alone would still let it repeat. One entry
+        per bar is also the right granularity: the decision was made once for
+        that candle, so it should be reported once."""
+        if bar_ts is not None and self._skip_logged.get(symbol) == bar_ts:
+            return
+        self._skip_logged[symbol] = bar_ts
+        self.state.push_log(reason)
 
     # -- per-symbol settings (symbol_config.py) ----------------------------- #
     def _rr_for(self, symbol: str) -> float:
@@ -759,99 +857,123 @@ class TradingEngine:
             trade = self.state.open_positions.pop(inst.symbol, None)
         if trade is None:
             return False
-        window = (f"{rules.start_t.strftime('%H:%M') if rules.start_t else 'open'}"
-                  f"–{rules.end_t.strftime('%H:%M') if rules.end_t else 'close'}")
-        self._finalize_close(inst, trade, live_price, f"WINDOW-END ({window})")
+        self._finalize_close(inst, trade, live_price,
+                             f"WINDOW-END ({rules.window_label()})")
         return True
 
     # -- commodity (MCX) fixed-lot sizing ----------------------------------- #
     def _mcx_fixed_size(
         self, inst: Instrument, sig, available: float, lev: float
-    ) -> tuple[int, float, Optional[str]]:
-        """Size a commodity trade at the FIXED number of lots the user configured,
+    ) -> tuple[int, float, float, Optional[str]]:
+        """Size a commodity trade at the FIXED number of lots admin configured,
         completely bypassing the risk-% / leverage / 20%-of-account maths equity
-        uses. Returns (quantity, risk_amount, skip_reason).
+        uses. Returns (quantity, risk_amount, margin, skip_reason).
 
         Contract: on a valid trade skip_reason is None; when the trade cannot be
         taken it is a human-readable string and quantity is 0 (the caller logs it
-        and moves on). The two ways it is skipped:
-          * lots configured as 0 for this symbol, or
+        and moves on). The three ways it is skipped:
+          * lots configured as 0 for this symbol,
+          * the broker can't tell us the margin right now — the trade is
+            REFUSED rather than sized off an estimate, or
           * the account's AVAILABLE capital can't post the margin the chosen lots
             require. There is deliberately NO percentage cap here (commodities may
             deploy the whole account per the user's instruction) — the margin the
             account can actually fund is the only ceiling.
 
-        Quantity is the LOT COUNT (not lots × lot_size). The broker's margin/order
-        APIs treat MCX quantity as lots (quantity=1 => one contract), and every
-        downstream consumer — margin, notional, PnL — multiplies by
-        contract_multiplier, which is the per-lot point value. So one lot of
-        CRUDEOILM is quantity=1 needing ~₹24.75k, never ₹247k. risk_amount is
-        lots × price-distance × contract_multiplier. SL/TP price levels are the
-        strategy's — this method only decides HOW MANY, never WHERE."""
+        Quantity is the LOT COUNT (not lots × lot_size) — verified against the
+        live Upstox margin API, where quantity=1 returns one contract's margin.
+        Every downstream consumer — margin, notional, PnL — multiplies by
+        contract_multiplier, the per-lot point value. So one lot of CRUDEOILM is
+        quantity=1, never 10.
+
+        RISK is unchanged from before and identical in shape to equity's:
+        lots × price-distance × contract_multiplier. Only the QUANTITY is fixed
+        rather than solved for; the stop distance still comes from the strategy,
+        and this method never decides WHERE the stop sits.
+        """
         lots = self.mcx_lots.get(inst.symbol, 1)
         if lots <= 0:
-            return 0, 0.0, (f"{inst.symbol}: signal skipped — 0 lots configured "
-                            f"for this commodity (set lots in MCX settings).")
+            return 0, 0.0, 0.0, (
+                f"{inst.symbol}: signal skipped — 0 lots configured for this "
+                f"commodity (set lots next to the symbol in the sidebar).")
         qty = lots                           # quantity is a lot count
         mult = max(inst.contract_multiplier, 1)
         per_unit = abs(sig.entry_price - sig.stop_loss)
         risk_amt = lots * per_unit * mult
+
         # REAL margin the broker blocks for these lots (SPAN + exposure + peak),
-        # fetched live and cached — the same figure booked as `_margin` on entry, so
-        # the fund check and later bookkeeping agree exactly.
-        margin, _src = self._mcx_margin(inst, qty, sig.side)
+        # fetched live in BOTH environments — the same figure booked as `_margin`
+        # on entry, so the funding check and later bookkeeping agree exactly.
+        margin, src = self._mcx_margin(inst, qty, sig.side)
+        if margin <= 0:
+            return 0, 0.0, 0.0, (
+                f"{inst.symbol}: signal skipped — the broker did not return a "
+                f"margin for {lots} lot(s), so the trade was refused rather "
+                f"than sized off an estimate. Check the broker connection / "
+                f"market-data token and try again.")
         if margin > available:
-            return 0, 0.0, (
+            return 0, 0.0, margin, (
                 f"{inst.symbol}: signal skipped — {lots} lot(s) need "
-                f"₹{margin:,.0f} margin but only ₹{available:,.0f} is available. "
-                f"Lower the lots or free capital.")
-        return qty, risk_amt, None
+                f"₹{margin:,.0f} margin ({src}) but only ₹{available:,.0f} is "
+                f"available. Lower the lots or free capital.")
+        return qty, risk_amt, margin, None
 
     def _mcx_margin(
         self, inst: Instrument, qty: int, side: str = "BUY"
     ) -> tuple[float, str]:
-        """Real (₹) margin to hold `qty` of an MCX instrument, with its source.
+        """The broker's REAL margin (₹) to hold `qty` lots, with its source.
 
-        PAPER mode uses the hardcoded per-lot table (config.MCX_MARGIN_PER_LOT) as
-        the source of truth — the paper bot should not depend on a live token, and
-        the table holds the user's real broker-side per-lot figures. LIVE mode
-        prefers the broker's own margin API and only falls back to the table.
+        Always live, in BOTH environments. Commodity margin is SPAN + exposure
+        + SEBI peak margin — it moves with volatility and with the exchange's
+        own risk parameters, so a number typed into config months ago is a
+        guess dressed up as a fact. Paper is included deliberately: a paper
+        run whose margin checks use stale figures is not simulating the
+        account you actually have.
 
-        Order of preference:
-          PAPER:  "hardcoded" table  ->  "notional" (last resort)
-          LIVE:   "broker" API  ->  "upstox" direct call  ->  "hardcoded"  ->  "notional"
+        Order of preference — every one of them asks the broker:
+          1. `broker.required_margin()`  — the connected broker's own API
+          2. `fetch_upstox_margin()`     — the market-data token's margin
+                                           endpoint, which is read-only and
+                                           works even in Paper (where the
+                                           broker is the simulator and has no
+                                           margin API of its own)
 
-        `qty` is the LOT COUNT, so margin = per_lot × qty directly (and the live
-        Upstox API, which also counts lots, gets the right quantity).
-        Cached per (symbol, qty, side) so the API is hit at most once per size."""
+        Returns (0.0, "unavailable") when neither answers. There is NO
+        estimated fallback: the caller refuses the trade instead. Sizing a
+        real commodity position off a number nobody verified is precisely the
+        failure this is meant to prevent — and refusing is recoverable, while
+        an under-margined position is not.
+
+        `qty` is the LOT COUNT. Verified against the live API: quantity=1
+        returns one contract's margin (CRUDEOILM ≈ ₹22k), quantity=lot_size
+        returns lot_size CONTRACTS. Cached per (symbol, qty, side) with a TTL,
+        since margin genuinely drifts during a session.
+        """
         key = (inst.symbol, int(qty), side)
-        if key in self._mcx_margin_cache:
-            return self._mcx_margin_cache[key], "cache"
+        cached = self._mcx_margin_cache.get(key)
+        if cached is not None:
+            ts, value = cached
+            if _time.time() - ts < MCX_MARGIN_TTL_SECONDS:
+                return value, "cache"
 
-        margin, src = 0.0, ""
-        # LIVE-only: consult the broker's real margin API first. In PAPER we skip
-        # straight to the hardcoded table below.
-        if self.environment == Environment.LIVE:
-            if self.broker is not None:
+        margin, src = 0.0, "unavailable"
+        if self.broker is not None:
+            try:
                 m = self.broker.required_margin(inst, qty, side)
-                if m and m > 0:
-                    margin, src = float(m), "broker"
-            if margin <= 0:
-                token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
-                m = fetch_upstox_margin(token, inst.instrument_key, qty, side, "D")
-                if m and m > 0:
-                    margin, src = float(m), "upstox"
+            except Exception:
+                m = None
+            if m and m > 0:
+                margin, src = float(m), "broker"
         if margin <= 0:
-            per_lot = config.mcx_margin_per_lot(inst.symbol)
-            if per_lot > 0:
-                margin, src = per_lot * qty, "hardcoded"   # qty is the lot count
-        if margin <= 0:                      # nothing else worked — rough estimate
-            lev = config.max_leverage_for(inst.segment, self.params)
-            notional = inst.reference_price * qty * max(inst.contract_multiplier, 1)
-            margin = notional / lev if lev > 0 else notional
-            src = "notional"
+            # The market-data token's margin endpoint. Read-only, and the live
+            # token stays valid, so this is what makes Paper margin real too.
+            token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
+            m = fetch_upstox_margin(token, inst.instrument_key, qty, side, "D")
+            if m and m > 0:
+                margin, src = float(m), "upstox"
 
-        self._mcx_margin_cache[key] = margin
+        if margin > 0:
+            self._mcx_margin_cache[key] = (_time.time(), margin)
         return margin, src
 
     # -- capital tracking --------------------------------------------------- #
@@ -1079,6 +1201,8 @@ class TradingEngine:
         # peak) fetched live — not notional ÷ leverage, which is nowhere near right.
         notional = fill * qty * max(inst.contract_multiplier, 1)
         if inst.segment == Segment.MCX:
+            # Reuse the figure the funding check already used, so what was
+            # checked and what is booked can never disagree.
             trade["_margin"], _msrc = self._mcx_margin(inst, qty, sig.side)
         else:
             eff_lev = lev if lev is not None else config.max_leverage_for(

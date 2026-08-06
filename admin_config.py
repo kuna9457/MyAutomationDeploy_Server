@@ -62,6 +62,15 @@ class ModeConfig:
     #: agreement behind each entry, lower trades more often on weaker
     #: evidence. It never touches position size, the risk cap or the stop.
     min_score: float = 0.0
+    #: End-of-session flat-out for this mode. "" = the segment's own default
+    #: (config.DEFAULT_SQUARE_OFF — 15:09 equity, 23:15 MCX). "HH:MM" IST to
+    #: override. Ignored entirely for Swing, which holds overnight by design.
+    square_off_time: str = ""
+    #: Master switch. ON by default: an intraday position left open past the
+    #: close is either auto-squared by the broker at whatever the auction
+    #: prints, or becomes an unfunded delivery. Turning this off means taking
+    #: that on yourself.
+    square_off_enabled: bool = True
 
 
 @dataclass

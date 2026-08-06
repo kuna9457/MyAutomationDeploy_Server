@@ -47,26 +47,58 @@ REF_PRICE = {
     "SILVER": 223320.0, "SILVERM": 223320.0, "SILVERMIC": 223320.0,
 }
 
+# Skip contracts expiring within this many days and take the NEXT one instead.
+#
+# Picking the bare nearest-active future is a trap on a roll date: run this on
+# the morning a contract expires and it re-selects that same contract, which is
+# dead by the next session — the exact failure this tool exists to prevent.
+# Rolling a few days early costs a little liquidity and buys a working feed.
+# Override with:  python tools/refresh_mcx.py --min-days 3
+MIN_DAYS_TO_EXPIRY = 5
+
 URL = "https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz"
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "mcx_instruments.py")
 
 
 def main() -> int:
+    min_days = MIN_DAYS_TO_EXPIRY
+    if "--min-days" in sys.argv:
+        try:
+            min_days = int(sys.argv[sys.argv.index("--min-days") + 1])
+        except (IndexError, ValueError):
+            print("--min-days needs a whole number of days", file=sys.stderr)
+            return 2
+
     print(f"Downloading {URL} ...", file=sys.stderr)
     rows = json.loads(gzip.decompress(urllib.request.urlopen(URL, timeout=60).read()))
-    now_ms = dt.datetime.now().timestamp() * 1000
+    now = dt.datetime.now()
+    # The cutoff, not "now": a contract must still be alive in `min_days` time,
+    # otherwise we would happily write a key that dies before the next run.
+    cutoff_ms = (now + dt.timedelta(days=min_days)).timestamp() * 1000
 
-    # All still-active futures, grouped by root, nearest expiry first.
+    # All futures still active BEYOND the cutoff, grouped by root, nearest first.
     futs: dict[str, list[dict]] = {}
+    skipped: list[str] = []
     for r in rows:
         if r.get("instrument_type") != "FUT":
             continue
-        if r.get("expiry", 0) <= now_ms:
+        exp = r.get("expiry", 0)
+        if exp <= cutoff_ms:
+            # Report the ones we deliberately rolled past, so the operator can
+            # see WHY a root moved to a later month than they expected.
+            if exp > now.timestamp() * 1000 and r.get("asset_symbol") in MCX_ROOTS:
+                skipped.append(
+                    f"{r['asset_symbol']} "
+                    f"{dt.datetime.fromtimestamp(exp / 1000):%d-%b}")
             continue
         futs.setdefault(r.get("asset_symbol"), []).append(r)
     for lst in futs.values():
         lst.sort(key=lambda r: r["expiry"])
+
+    if skipped:
+        print(f"rolled past (expiring within {min_days}d): {', '.join(sorted(set(skipped)))}",
+              file=sys.stderr)
 
     found, missing = [], []
     for root in MCX_ROOTS:
@@ -74,7 +106,7 @@ def main() -> int:
         if not cand:
             missing.append(root)
             continue
-        r = cand[0]  # front month
+        r = cand[0]  # nearest contract that survives the cutoff
         exp = dt.datetime.fromtimestamp(r["expiry"] / 1000).strftime("%d-%b-%Y")
         found.append({
             "symbol": root,
@@ -87,6 +119,8 @@ def main() -> int:
             "multiplier": int(float(r.get("qty_multiplier", 1) or 1)),
             "unit": r.get("price_quote_unit", ""),
             "expiry": exp,
+            "expiry_iso": dt.datetime.fromtimestamp(
+                r["expiry"] / 1000).strftime("%Y-%m-%d"),
         })
 
     print(f"matched {len(found)} / {len(MCX_ROOTS)}  missing={missing}",
@@ -98,8 +132,9 @@ def main() -> int:
 
     body = "\n".join(
         f'    Instrument("{x["symbol"]}", Segment.MCX, "{x["instrument_key"]}", '
-        f'{x["lot_size"]}, {x["tick_size"]}, {x["ref_price"]}, {x["multiplier"]}),'
-        f'   # {x["unit"]}, expiry {x["expiry"]}'
+        f'{x["lot_size"]}, {x["tick_size"]}, {x["ref_price"]}, {x["multiplier"]}, '
+        f'expiry="{x["expiry_iso"]}"),'
+        f'   # {x["unit"]}, expires {x["expiry"]}'
         for x in found)
     header = (
         '"""\n'

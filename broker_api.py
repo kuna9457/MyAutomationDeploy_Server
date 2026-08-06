@@ -7,14 +7,14 @@ place/track orders without knowing which broker is behind it.
       ├── SimulatedBroker   -> paper fills, no network, always available
       ├── UpstoxBroker      -> sandbox (paper) OR live, via upstox-python-sdk
       ├── DhanBroker        -> live, via dhanhq
-      ├── ZerodhaBroker     -> live, via kiteconnect (equity only, see class doc)
+      ├── ZerodhaBroker     -> live, via kiteconnect (equity + MCX futures)
       └── KotakNeoBroker    -> live, via neo-api-client
 
 Every broker returns the same OrderResult shape, so strategy/engine code is
 broker-agnostic (Immutable Rule #3). Real SDK calls are wrapped in try/except
 and degrade to a clear error rather than crashing the bot.
 
-LIMIT ORDERS: implemented for Simulated, Upstox and Zerodha (equity). Dhan and
+LIMIT ORDERS: implemented for Simulated, Upstox and Zerodha. Dhan and
 Kotak inherit the BaseBroker default, which degrades a limit request to a
 MARKET order — correct but subject to slippage, which matters for the
 Scalper's 1:1 RR. They are left un-implemented rather than written blind: an
@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Optional
 
 import config
+import kite_symbols
 from config import Broker, Environment, Instrument, Segment
 
 # Upstox's real order-margin endpoint. Returns SPAN + Exposure + peak margin for a
@@ -473,14 +474,24 @@ class DhanBroker(BaseBroker):
 # --------------------------------------------------------------------------- #
 #  Zerodha (Kite Connect) — live, via kiteconnect.
 #
-#  EQUITY ONLY. Kite's tradingsymbol for NSE cash equity is the plain symbol
-#  (RELIANCE, TCS, ...), which matches Instrument.symbol here — so equity maps
-#  cleanly. MCX futures tradingsymbols carry an expiry suffix Kite assigns
-#  itself (e.g. CRUDEOIL26JUNFUT) that this codebase's Instrument.symbol
-#  (CRUDEOIL) does NOT match, and guessing the expiry format risks sending a
-#  malformed real order. So MCX orders are explicitly rejected with a clear
-#  message rather than attempted — same principle as the un-implemented Dhan/
-#  Kotak limit orders above: an untested path is worse than a clean refusal.
+#  EQUITY + MCX FUTURES.
+#
+#  Equity maps for free: Kite's tradingsymbol for NSE cash is the plain symbol
+#  (RELIANCE), which is exactly Instrument.symbol. MCX futures do NOT — Kite
+#  names them with an exchange-assigned expiry suffix (CRUDEOILM26AUGFUT).
+#
+#  Commodity orders used to be refused outright for that reason, because
+#  guessing the suffix risks a malformed REAL order. They are no longer
+#  guessed OR refused: kite_symbols.py reads Kite's own published instrument
+#  list and resolves the exact contract by (root, expiry). A symbol that does
+#  not resolve is still refused with an actionable message — the original
+#  principle holds, it just almost never fires now.
+#
+#  Two consequences worth knowing:
+#    * Commodity orders use PRODUCT_NRML, matching the full SPAN+exposure
+#      margin the engine sizes against. Equity keeps PRODUCT_MIS.
+#    * Kite reports lot_size=1 on every MCX future, i.e. it counts quantity in
+#      LOTS — the same convention Upstox and the engine already use.
 # --------------------------------------------------------------------------- #
 class ZerodhaBroker(BaseBroker):
     name = "Zerodha"
@@ -521,32 +532,60 @@ class ZerodhaBroker(BaseBroker):
             return False
 
     @staticmethod
-    def _reject_mcx(instrument: Instrument) -> Optional[OrderResult]:
-        if instrument.segment == Segment.MCX:
-            return OrderResult(
-                False, "", "Zerodha", message=(
-                    f"{instrument.symbol}: Zerodha execution is equity-only in "
-                    "this bot — the MCX Kite tradingsymbol (with its exchange-"
-                    "assigned expiry suffix) isn't mapped, so the order was "
-                    "refused rather than guessed."))
+    def _kite_symbol(instrument: Instrument) -> Optional[str]:
+        """Kite's tradingsymbol for this instrument, or None if unresolvable.
+
+        Equity is its own symbol. MCX futures carry Kite's exchange-assigned
+        expiry suffix (CRUDEOILM26AUGFUT) and are looked up EXACTLY, by
+        (root, expiry), against Kite's own published instrument list — never
+        guessed from the format. See kite_symbols.py."""
+        if instrument.segment != Segment.MCX:
+            return instrument.symbol
+        return kite_symbols.resolve(instrument)
+
+    def _exchange(self, instrument: Instrument):
+        return ("MCX" if instrument.segment == Segment.MCX
+                else self._kite.EXCHANGE_NSE)
+
+    def _product(self, instrument: Instrument):
+        """NRML for commodities, MIS for equity.
+
+        This is not cosmetic: the engine sizes commodity trades against the
+        FULL SPAN+exposure margin (Upstox product "D"), which is the NRML
+        requirement. Sending MIS would have the broker block a different
+        (smaller, intraday) margin than the one the position was sized
+        against, so the bot's funding maths and the broker's would disagree."""
+        return (self._kite.PRODUCT_NRML if instrument.segment == Segment.MCX
+                else self._kite.PRODUCT_MIS)
+
+    def _unresolved(self, instrument: Instrument) -> Optional[OrderResult]:
+        """A refusal OrderResult when the tradingsymbol can't be resolved.
+        Refusing beats guessing: a wrong suffix is a real order on the wrong
+        contract."""
+        if self._kite_symbol(instrument) is None:
+            return OrderResult(False, "", "Zerodha",
+                               message=kite_symbols.describe_failure(instrument))
         return None
 
     def _place(self, instrument, side, quantity, order_type, price,
               ref_price) -> OrderResult:
-        rejected = self._reject_mcx(instrument)
-        if rejected is not None:
-            return rejected
         if self._kite is None:
             return OrderResult(False, "", self.name, message="Not connected")
+        rejected = self._unresolved(instrument)
+        if rejected is not None:
+            return rejected
         try:
             oid = self._kite.place_order(
                 variety=self._kite.VARIETY_REGULAR,
-                exchange=self._kite.EXCHANGE_NSE,
-                tradingsymbol=instrument.symbol,
+                exchange=self._exchange(instrument),
+                tradingsymbol=self._kite_symbol(instrument),
                 transaction_type=(self._kite.TRANSACTION_TYPE_BUY if side == "BUY"
                                   else self._kite.TRANSACTION_TYPE_SELL),
+                # Quantity is a LOT COUNT for MCX. Kite reports lot_size=1 on
+                # every MCX future, i.e. it counts contracts — the same
+                # convention Upstox and the engine use, so no conversion.
                 quantity=int(quantity),
-                product=self._kite.PRODUCT_MIS,
+                product=self._product(instrument),
                 order_type=(self._kite.ORDER_TYPE_LIMIT if order_type == "LIMIT"
                            else self._kite.ORDER_TYPE_MARKET),
                 price=round(float(price), 2) if order_type == "LIMIT" else None,
@@ -580,15 +619,21 @@ class ZerodhaBroker(BaseBroker):
                            ref_price)
 
     def required_margin(self, instrument, quantity, side="BUY", ref_price=0.0):
-        if self._kite is None or instrument.segment == Segment.MCX:
+        if self._kite is None:
             return None
+        tradingsymbol = self._kite_symbol(instrument)
+        if tradingsymbol is None:
+            return None
+        is_mcx = instrument.segment == Segment.MCX
         try:
             orders = [{
-                "exchange": "NSE",
-                "tradingsymbol": instrument.symbol,
+                "exchange": "MCX" if is_mcx else "NSE",
+                "tradingsymbol": tradingsymbol,
                 "transaction_type": side,
                 "variety": "regular",
-                "product": "MIS",
+                # Must match what _place actually sends, or the margin quoted
+                # is for a product the order won't use.
+                "product": "NRML" if is_mcx else "MIS",
                 "order_type": "MARKET",
                 "quantity": int(quantity),
                 "price": 0,
@@ -625,12 +670,11 @@ class ZerodhaBroker(BaseBroker):
         to certain once triggered, at the cost of a few ticks of extra
         slippage versus a true stop-market.
         """
-        if instrument.segment == Segment.MCX:
-            return False, "", ("MCX not supported for Zerodha GTT protection "
-                              "in this bot (see place_market_order's MCX "
-                              "refusal for why).")
         if self._kite is None:
             return False, "", "Not connected"
+        tradingsymbol = self._kite_symbol(instrument)
+        if tradingsymbol is None:
+            return False, "", kite_symbols.describe_failure(instrument)
         try:
             exit_side = "SELL" if side == "BUY" else "BUY"
             tick = instrument.tick_size or 0.05
@@ -638,11 +682,12 @@ class ZerodhaBroker(BaseBroker):
             sl_limit = (round(stop_loss - buf, 2) if side == "BUY"
                        else round(stop_loss + buf, 2))
             tp_limit = round(target, 2)
+            product = self._product(instrument)
             sl_leg = {"transaction_type": exit_side, "quantity": int(quantity),
-                      "order_type": "LIMIT", "product": self._kite.PRODUCT_MIS,
+                      "order_type": "LIMIT", "product": product,
                       "price": sl_limit}
             tp_leg = {"transaction_type": exit_side, "quantity": int(quantity),
-                      "order_type": "LIMIT", "product": self._kite.PRODUCT_MIS,
+                      "order_type": "LIMIT", "product": product,
                       "price": tp_limit}
             # Kite's OCO pairs trigger_values[i] with orders[i] BY INDEX — it
             # does not infer which leg is the stop and which is the target, so
@@ -656,8 +701,8 @@ class ZerodhaBroker(BaseBroker):
             orders = [legs[0][1], legs[1][1]]
             resp = self._kite.place_gtt(
                 trigger_type=self._kite.GTT_TYPE_OCO,
-                tradingsymbol=instrument.symbol,
-                exchange=self._kite.EXCHANGE_NSE,
+                tradingsymbol=tradingsymbol,
+                exchange=self._exchange(instrument),
                 trigger_values=trigger_values,
                 last_price=round(float(ref_price), 2),
                 orders=orders,
@@ -683,16 +728,22 @@ class ZerodhaBroker(BaseBroker):
             return False
 
     def get_position(self, instrument: Instrument) -> Optional[dict]:
-        if self._kite is None or instrument.segment == Segment.MCX:
+        if self._kite is None:
             return None
+        # MCX positions come back under Kite's expiry-suffixed tradingsymbol,
+        # so match on the resolved name, not ours.
+        want_symbol = self._kite_symbol(instrument)
+        if want_symbol is None:
+            return None
+        want_product = self._product(instrument)
         try:
             positions = self._kite.positions()
-            # "day" positions cover intraday (MIS) — a position opened and
-            # closed today lives here even after it's flat, which is exactly
-            # what the race-condition check in engine.py needs to see.
+            # "day" positions cover intraday — a position opened and closed
+            # today lives here even after it's flat, which is exactly what the
+            # race-condition check in engine.py needs to see.
             for p in positions.get("day", []) or []:
-                if (p.get("tradingsymbol") == instrument.symbol
-                        and p.get("product") == self._kite.PRODUCT_MIS):
+                if (p.get("tradingsymbol") == want_symbol
+                        and p.get("product") == want_product):
                     return {
                         "quantity": int(p.get("quantity", 0) or 0),
                         "average_price": float(p.get("average_price", 0) or 0),
@@ -709,9 +760,13 @@ class ZerodhaBroker(BaseBroker):
         try:
             positions = self._kite.positions()
             out: list[dict] = []
+            # Both products: equity trades MIS, commodity trades NRML, and
+            # this is the broker-truth panel — filtering to one would hide
+            # half the real book.
+            wanted = {self._kite.PRODUCT_MIS, self._kite.PRODUCT_NRML}
             for p in positions.get("day", []) or []:
                 qty = int(p.get("quantity", 0) or 0)
-                if qty == 0 or p.get("product") != self._kite.PRODUCT_MIS:
+                if qty == 0 or p.get("product") not in wanted:
                     continue
                 out.append({
                     "symbol": p.get("tradingsymbol", ""),

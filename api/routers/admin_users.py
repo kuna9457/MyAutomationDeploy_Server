@@ -21,8 +21,9 @@ from api import engine_registry
 from api.auth import CurrentUser, require_admin
 from api.schemas import (AdminConfigRequest, ClientModesRequest,
                          CreateClientRequest, PresetSaveRequest,
-                         SetEmailRequest, SetPasswordRequest,
-                         SetStatusRequest, SymbolConfigRequest)
+                         RangeResetRequest, SetEmailRequest,
+                         SetPasswordRequest, SetStatusRequest,
+                         SymbolConfigRequest)
 from config import Environment, Mode
 from db_manager import DBManager
 from fastapi import APIRouter, Depends, HTTPException
@@ -224,6 +225,11 @@ def set_bot_config(req: AdminConfigRequest) -> BotConfig:
             400, f"min_score {score:g} is out of range. Use "
                  f"{config.MIN_SCORE_MIN:g}-{config.MIN_SCORE_MAX:g}, or 0 to "
                  f"use the strategy's own.")
+    cutoff = str(payload.get("square_off_time") or "")
+    if cutoff and config.parse_clock(cutoff) is None:
+        raise HTTPException(
+            400, f"square_off_time {cutoff!r} is not a valid time — use HH:MM "
+                 f"(24-hour), or leave blank for the segment default.")
     return admin_config.set_mode_config(mode, **payload)
 
 
@@ -261,8 +267,9 @@ def set_symbol_config(req: SymbolConfigRequest):
         raise HTTPException(400, f"Unknown instrument: {req.symbol}.")
     try:
         cfg = symbol_config.validate(symbol_config.SymbolConfig(
-            trade_days=req.trade_days, start_time=req.start_time,
-            end_time=req.end_time, risk_reward=req.risk_reward,
+            trade_days=req.trade_days, trade_hours=req.trade_hours,
+            start_time=req.start_time, end_time=req.end_time,
+            risk_reward=req.risk_reward,
             square_off_at_end=req.square_off_at_end))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
@@ -277,6 +284,49 @@ def delete_symbol_config(mode: str, symbol: str):
     mode = _valid_mode(mode)
     symbol_config.delete_symbol(mode, symbol)
     return get_symbol_configs(mode)
+
+
+# -- targeted trade deletion ---------------------------------------------------- #
+@router.get("/trades/by-category")
+def admin_by_category(environment: str = "Paper", username: str = ""):
+    """Category-wise P&L for one account (blank = admin's own book)."""
+    return _db.category_summary(_environment(environment),
+                                user_id=_client_username(username) if username
+                                else "admin")
+
+
+@router.post("/trades/reset-range")
+def reset_trade_range(req: RangeResetRequest):
+    """Delete trades whose trading day falls in [start, end].
+
+    Two-step by construction: with `confirm=false` (the default) this is a
+    PREVIEW that counts what would go, broken down by day, and deletes
+    nothing. Only a second call with confirm=true actually removes anything.
+
+    Built for cleaning out trades punched against simulated or bad data
+    without losing the real history around them — `/bot/reset` is
+    all-or-nothing, this is scoped to a date range and optionally one
+    category.
+
+    Admin-only (the whole router is), and IRREVERSIBLE once confirmed.
+    """
+    env = _environment(req.environment)
+    category = (req.category or "").strip()
+    if category and category not in config.ALL_CATEGORIES:
+        raise HTTPException(
+            400, f"Unknown category {category!r}. Use one of "
+                 f"{', '.join(config.ALL_CATEGORIES)}, or leave blank for all.")
+    owner = _client_username(req.username) if req.username else "admin"
+    try:
+        result = _db.reset_range(
+            env, req.start, req.end, user_id=owner,
+            category=category or None, dry_run=not req.confirm)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    result["environment"] = env.value
+    result["category"] = category or "All"
+    result["username"] = owner
+    return result
 
 
 # -- saved Controls presets (presets.py) --------------------------------------- #

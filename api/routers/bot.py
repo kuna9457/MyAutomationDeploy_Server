@@ -103,6 +103,8 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         # from the request body — same rule as strategy/instruments.
         risk_reward = mode_cfg.risk_reward
         min_score = mode_cfg.min_score
+        square_off_time = mode_cfg.square_off_time
+        square_off_enabled = mode_cfg.square_off_enabled
         if environment == Environment.LIVE:
             if req.broker not in _CLIENT_LIVE_BROKERS:
                 raise HTTPException(
@@ -136,6 +138,13 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         mcx_lots = req.mcx_lots
         risk_reward = req.risk_reward
         min_score = req.min_score
+        square_off_time = req.square_off_time
+        square_off_enabled = req.square_off_enabled
+        if square_off_time and config.parse_clock(square_off_time) is None:
+            raise HTTPException(
+                400, f"square_off_time {square_off_time!r} is not a valid "
+                     f"time — use HH:MM (24-hour), or leave blank for the "
+                     f"segment default.")
         if not config.is_valid_min_score(min_score):
             raise HTTPException(
                 400, f"min_score {min_score:g} is out of range. Use "
@@ -173,7 +182,9 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
                         strategy_key=strategy_key, mcx_lots=mcx_lots,
                         user_id=user.username, broker_access_token=access_token,
                         broker_api_key=broker_api_key, risk_reward=risk_reward,
-                        min_score=min_score, symbol_rules=rules)
+                        min_score=min_score, square_off_time=square_off_time,
+                        square_off_enabled=square_off_enabled,
+                        symbol_rules=rules)
     try:
         eng.start()
     except RuntimeError as exc:
@@ -238,8 +249,9 @@ def _client_runner_key() -> str:
     if not instruments:
         return ""
     token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
-    return strategy_runner.runner_key(mode, bound.key, instruments, rr, token,
-                                      score)
+    return strategy_runner.runner_key(
+        mode, bound.key, instruments, rr, token, score,
+        f"{mode_cfg.square_off_time}|{mode_cfg.square_off_enabled}")
 
 
 @router.get("/platform-signals")

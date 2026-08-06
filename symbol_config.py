@@ -59,6 +59,17 @@ class SymbolConfig:
     #: Weekdays new entries are allowed on, 0=Mon .. 6=Sun. EMPTY = no filter
     #: (every day the market is open), which is the pre-existing behaviour.
     trade_days: list[int] = field(default_factory=list)
+    #: HOURS (0-23 IST) new entries are allowed in. An hour H covers H:00:00
+    #: to H:59:59, so [9, 10, 11, 15] means "trade 09:00-11:59 and 15:00-15:59,
+    #: skip everything between". EMPTY = no hour filter.
+    #:
+    #: This replaced a contiguous start/end window, which could not express a
+    #: GAP — "trade all day but sit out 2pm" is a normal thing to want and a
+    #: range simply cannot say it.
+    trade_hours: list[int] = field(default_factory=list)
+    #: LEGACY contiguous window, kept so configs saved before `trade_hours`
+    #: existed keep behaving exactly as they did. Ignored entirely once
+    #: `trade_hours` is set; the UI writes hours and clears these.
     #: "HH:MM" IST. Empty = the segment's own open (config.market_hours_for_segment).
     start_time: str = ""
     #: "HH:MM" IST. Empty = the segment's own close.
@@ -74,7 +85,8 @@ class SymbolConfig:
     def is_noop(self) -> bool:
         """True when this entry would change nothing — used to DELETE rather
         than store it, so 'reset to default' leaves no residue on disk."""
-        return (not self.trade_days and not self.start_time and not self.end_time
+        return (not self.trade_days and not self.trade_hours
+                and not self.start_time and not self.end_time
                 and not self.risk_reward and not self.square_off_at_end)
 
 
@@ -94,6 +106,35 @@ def parse_hhmm(value: str) -> Optional[time]:
     return parsed
 
 
+def hour_label(hour: int) -> str:
+    """12-hour label for one slot: 9 -> '9am', 14 -> '2pm', 0 -> '12am'."""
+    suffix = "am" if hour < 12 else "pm"
+    display = hour % 12 or 12
+    return f"{display}{suffix}"
+
+
+def format_hours(hours: list[int]) -> str:
+    """Compact, readable hour set: [9,10,11,15] -> '9am-12pm, 3pm-4pm'.
+
+    Consecutive slots are collapsed into ranges, and each range is shown as
+    start..end+1 because selecting hour H means trading THROUGH H:59 — writing
+    '9am-11am' for [9,10] would read as stopping at 11:00 when it actually
+    runs to 10:59."""
+    if not hours:
+        return ""
+    runs: list[tuple[int, int]] = []
+    start = prev = hours[0]
+    for h in hours[1:]:
+        if h == prev + 1:
+            prev = h
+            continue
+        runs.append((start, prev))
+        start = prev = h
+    runs.append((start, prev))
+    return ", ".join(
+        f"{hour_label(a)}-{hour_label((b + 1) % 24)}" for a, b in runs)
+
+
 def validate(cfg: SymbolConfig) -> SymbolConfig:
     """Return a cleaned copy, or raise ValueError. Called by the API route
     BEFORE anything is written, so the stored file is always well-formed and
@@ -103,6 +144,15 @@ def validate(cfg: SymbolConfig) -> SymbolConfig:
     if bad:
         raise ValueError(
             f"Invalid weekday(s) {bad} — use 0 (Mon) through 6 (Sun).")
+
+    try:
+        hours = sorted({int(h) for h in cfg.trade_hours})
+    except (TypeError, ValueError):
+        raise ValueError("Trading hours must be whole numbers 0-23.")
+    bad_hours = [h for h in hours if h < 0 or h > 23]
+    if bad_hours:
+        raise ValueError(
+            f"Invalid hour(s) {bad_hours} — use 0 through 23.")
 
     start = parse_hhmm(cfg.start_time)
     end = parse_hhmm(cfg.end_time)
@@ -122,8 +172,12 @@ def validate(cfg: SymbolConfig) -> SymbolConfig:
 
     return SymbolConfig(
         trade_days=days,
-        start_time=start.strftime("%H:%M") if start else "",
-        end_time=end.strftime("%H:%M") if end else "",
+        trade_hours=hours,
+        # Hours supersede the legacy window: keeping both would leave two
+        # rules fighting over the same decision, and the stored config would
+        # no longer describe what actually happens.
+        start_time="" if hours else (start.strftime("%H:%M") if start else ""),
+        end_time="" if hours else (end.strftime("%H:%M") if end else ""),
         risk_reward=rr,
         square_off_at_end=bool(cfg.square_off_at_end),
     )
@@ -139,6 +193,7 @@ class SymbolRules:
     loop never re-parses strings or touches the filesystem per tick."""
     symbol: str
     trade_days: frozenset[int]
+    trade_hours: frozenset[int]
     start_t: Optional[time]
     end_t: Optional[time]
     risk_reward: float
@@ -149,14 +204,32 @@ class SymbolRules:
         return not self.trade_days or when.weekday() in self.trade_days
 
     def window_open(self, now_t: time) -> bool:
-        """Inside the configured intraday window. An unset bound means 'no
-        limit on that side', so a start-only config runs to the session close
-        and an end-only config runs from the session open."""
+        """Inside a configured trading hour.
+
+        HOUR SLOTS take precedence when set: the hour is allowed iff it was
+        selected, which is what makes gaps possible — deselect 14 and the bot
+        sits out 14:00-14:59 and resumes at 15:00.
+
+        Otherwise the LEGACY contiguous window applies, unchanged, so a config
+        saved before hour slots existed behaves exactly as it always did. An
+        unset bound means 'no limit on that side'.
+        """
+        if self.trade_hours:
+            return now_t.hour in self.trade_hours
         if self.start_t is not None and now_t < self.start_t:
             return False
         if self.end_t is not None and now_t > self.end_t:
             return False
         return True
+
+    def window_label(self) -> str:
+        """Human summary of when this symbol may open trades."""
+        if self.trade_hours:
+            return format_hours(sorted(self.trade_hours))
+        if self.start_t or self.end_t:
+            return (f"{self.start_t.strftime('%H:%M') if self.start_t else 'open'}"
+                    f"–{self.end_t.strftime('%H:%M') if self.end_t else 'close'}")
+        return ""
 
     def entry_block_reason(self, when: datetime) -> str:
         """Why a NEW entry is not allowed right now, or "" when it is. The
@@ -166,9 +239,7 @@ class SymbolRules:
             return (f"{WEEKDAY_LABELS[when.weekday()]} is not a configured "
                     f"trading day (allowed: {allowed})")
         if not self.window_open(when.time()):
-            return (f"outside its trading window "
-                    f"{self.start_t.strftime('%H:%M') if self.start_t else 'open'}"
-                    f"–{self.end_t.strftime('%H:%M') if self.end_t else 'close'}")
+            return f"outside its trading hours ({self.window_label()})"
         return ""
 
     def describe(self) -> str:
@@ -178,11 +249,10 @@ class SymbolRules:
         if self.trade_days:
             bits.append("days " + "/".join(WEEKDAY_LABELS[d]
                                            for d in sorted(self.trade_days)))
-        if self.start_t or self.end_t:
-            bits.append(
-                f"{self.start_t.strftime('%H:%M') if self.start_t else 'open'}"
-                f"–{self.end_t.strftime('%H:%M') if self.end_t else 'close'}"
-                + (" (square off at end)" if self.square_off_at_end else ""))
+        window = self.window_label()
+        if window:
+            bits.append(window + (" (square off outside)"
+                                  if self.square_off_at_end else ""))
         if self.risk_reward > 0:
             bits.append(f"RR {config.rr_label(self.risk_reward)}")
         return f"{self.symbol}: " + ", ".join(bits)
@@ -201,6 +271,7 @@ def to_rules(symbol: str, cfg: SymbolConfig) -> Optional[SymbolRules]:
     return SymbolRules(
         symbol=symbol,
         trade_days=frozenset(int(d) for d in cfg.trade_days),
+        trade_hours=frozenset(int(h) for h in cfg.trade_hours),
         start_t=parse_hhmm(cfg.start_time),
         end_t=parse_hhmm(cfg.end_time),
         risk_reward=float(cfg.risk_reward or 0.0),

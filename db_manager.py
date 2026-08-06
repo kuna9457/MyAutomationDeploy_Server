@@ -166,6 +166,11 @@ class DBManager:
             "environment": environment,
             "broker": broker,
             "segment": segment,
+            # Asset class (Equity / Commodity / Crypto). Derived from segment
+            # but STORED, not computed on the fly, so a trade's bucket is fixed
+            # at the moment it was taken — reclassifying an instrument later
+            # must not silently rewrite history.
+            "category": config.category_for_segment(segment),
             "ticker": ticker,
             "side": side,
             "entry_price": round(float(entry_price), 4),
@@ -271,7 +276,8 @@ class DBManager:
         with open(path, "r", encoding="utf-8") as fh:
             return [json.loads(line) for line in fh if line.strip()]
 
-    def get_trades(self, env: Environment, user_id: Optional[str] = None) -> pd.DataFrame:
+    def get_trades(self, env: Environment, user_id: Optional[str] = None,
+                   category: Optional[str] = None) -> pd.DataFrame:
         """`user_id=None` (the default every pre-multi-tenant caller uses)
         returns every trade in the environment, unfiltered — identical to
         Phase 1. Pass a user_id to scope to one account's own trades; trades
@@ -306,6 +312,30 @@ class DBManager:
             owner = df["user_id"] if "user_id" in df.columns else pd.Series("admin", index=df.index)
             owner = owner.fillna("admin")
             df = df[owner == user_id].reset_index(drop=True)
+
+        # Categorise EVERY row, including trades written before the field
+        # existed. Derived here rather than only at write time so the split is
+        # complete whether or not the one-off backfill has been run — an
+        # uncategorised trade would silently drop out of every per-category
+        # total, which is worse than the cost of computing it.
+        if not df.empty:
+            # Both columns may be absent entirely (a collection where no trade
+            # has been categorised yet — a fresh deployment, or the moment
+            # before the first backfill) or present-but-null for individual
+            # rows. `str` is the ONLY value worth keeping: pandas represents a
+            # missing cell as float NaN, and NaN is TRUTHY, so a plain
+            # `c if c else derive` silently keeps the NaN and derives nothing —
+            # which is how every category total came back zero.
+            missing = [None] * len(df)
+            existing = list(df["category"]) if "category" in df.columns else missing
+            seg = list(df["segment"]) if "segment" in df.columns else missing
+            df["category"] = [
+                c if isinstance(c, str) and c
+                else config.category_for_segment(s if isinstance(s, str) else "")
+                for c, s in zip(existing, seg)
+            ]
+            if category:
+                df = df[df["category"] == category].reset_index(drop=True)
         return df
 
     def get_open_trades(self, env: Environment, user_id: Optional[str] = None) -> list[dict]:
@@ -315,6 +345,137 @@ class DBManager:
         return df[df["status"] == "OPEN"].to_dict("records")
 
     # -- destructive: wipe an environment ---------------------------------- #
+    # -- categories ---------------------------------------------------------- #
+    def backfill_categories(self, env: Environment) -> dict[str, Any]:
+        """Write `category` onto every stored trade that lacks one.
+
+        Reads are already safe without this (get_trades derives the category
+        for old rows), so this is about the STORED record: once backfilled,
+        the raw collection and the Excel export carry the split too, and a
+        category query can be pushed down to Mongo instead of filtered in
+        pandas. Idempotent — running it twice touches nothing the second time.
+        """
+        updated = 0
+        if self.db is not None:
+            try:
+                coll = self.db[_collection_name(env)]
+                for doc in coll.find(
+                        {"$or": [{"category": {"$exists": False}},
+                                 {"category": None}, {"category": ""}]},
+                        {"_id": 1, "segment": 1}):
+                    coll.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"category": config.category_for_segment(
+                            doc.get("segment", ""))}})
+                    updated += 1
+                return {"backend": "MongoDB", "updated": updated}
+            except Exception as exc:
+                self._demote_to_local(exc, "category backfill")
+
+        path = self._local_path(env)
+        if not os.path.exists(path):
+            return {"backend": "Local JSON", "updated": 0}
+        rows = self._read_local(env)
+        for row in rows:
+            if not row.get("category"):
+                row["category"] = config.category_for_segment(row.get("segment", ""))
+                updated += 1
+        if updated:
+            with open(path, "w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+        return {"backend": "Local JSON", "updated": updated}
+
+    def category_summary(self, env: Environment, user_id: Optional[str] = None
+                         ) -> list[dict[str, Any]]:
+        """One analytics row PER CATEGORY, every category always present.
+
+        Categories with no trades are returned as zeroes rather than omitted:
+        a missing Crypto row reads as "something is broken", whereas an
+        explicit zero reads as "nothing traded yet", which is the truth.
+        """
+        out = []
+        for name in config.ALL_CATEGORIES:
+            summary = self.analytics_summary(env, user_id=user_id, category=name)
+            out.append({"category": name, **summary})
+        return out
+
+    # -- targeted deletion --------------------------------------------------- #
+    def reset_range(self, env: Environment, start: str, end: str,
+                    user_id: Optional[str] = None,
+                    category: Optional[str] = None,
+                    dry_run: bool = True) -> dict[str, Any]:
+        """Delete trades whose TRADING DAY falls in [start, end] inclusive.
+
+        Built for one specific job: removing trades that were punched against
+        simulated or bad data, without discarding the real history around
+        them. `reset_environment` is all-or-nothing; this is the scalpel.
+
+        `dry_run=True` (the DEFAULT, deliberately) counts what WOULD go and
+        deletes nothing. A destructive operation whose scope can only be
+        discovered by performing it is not one anyone should be offered — the
+        API exposes the preview first and requires an explicit confirm.
+
+        Dates are `YYYY-MM-DD` trading-day keys, matching how trades are
+        stamped (see `_trade_day`). Scoping is AND-ed: environment, then
+        optionally user, optionally category, then the date range.
+        """
+        start, end = str(start or "")[:10], str(end or "")[:10]
+        if not start or not end:
+            raise ValueError("Both a start and an end date are required.")
+        if start > end:
+            raise ValueError(f"Start date {start} is after end date {end}.")
+
+        df = self.get_trades(env, user_id=user_id, category=category)
+        if df.empty:
+            return {"matched": 0, "removed": 0, "dry_run": dry_run,
+                    "start": start, "end": end, "by_day": {}, "open_matched": 0}
+
+        days = df["timestamp"].map(self._trade_day)
+        hit = df[(days >= start) & (days <= end)]
+        if hit.empty:
+            return {"matched": 0, "removed": 0, "dry_run": dry_run,
+                    "start": start, "end": end, "by_day": {}, "open_matched": 0}
+
+        ids = set(hit["trade_id"].tolist())
+        by_day: dict[str, int] = {}
+        for day in hit["timestamp"].map(self._trade_day):
+            by_day[day] = by_day.get(day, 0) + 1
+        # Surfaced separately: deleting a trade the bot still holds OPEN leaves
+        # a real position with nothing tracking it. The caller decides, but it
+        # must not be a surprise.
+        open_matched = int((hit["status"] == "OPEN").sum())
+
+        result = {"matched": len(ids), "removed": 0, "dry_run": dry_run,
+                  "start": start, "end": end,
+                  "by_day": dict(sorted(by_day.items())),
+                  "open_matched": open_matched}
+        if dry_run:
+            return result
+
+        removed = 0
+        if self.db is not None:
+            try:
+                res = self.db[_collection_name(env)].delete_many(
+                    {"trade_id": {"$in": list(ids)}})
+                removed = int(getattr(res, "deleted_count", 0) or 0)
+            except Exception as exc:
+                self._demote_to_local(exc, "range reset")
+        if self.db is None:
+            path = self._local_path(env)
+            if os.path.exists(path):
+                kept = [r for r in self._read_local(env)
+                        if r.get("trade_id") not in ids]
+                removed = len(self._read_local(env)) - len(kept)
+                with open(path, "w", encoding="utf-8") as fh:
+                    for row in kept:
+                        fh.write(json.dumps(row) + "\n")
+        result["removed"] = removed
+        # The running workbook is derived from the trades, so it has to be
+        # rebuilt or it keeps showing rows that no longer exist.
+        self.sync_excel_log(env)
+        return result
+
     def reset_environment(self, env: Environment, user_id: Optional[str] = None) -> dict[str, Any]:
         """Permanently delete ALL trades for ONE environment and its running Excel
         log, returning the bot to a blank slate. IRREVERSIBLE.
@@ -376,8 +537,9 @@ class DBManager:
         return {"trades_removed": removed, "files_removed": files}
 
     # -- analytics + Excel export ------------------------------------------ #
-    def analytics_summary(self, env: Environment, user_id: Optional[str] = None) -> dict[str, Any]:
-        df = self.get_trades(env, user_id=user_id)
+    def analytics_summary(self, env: Environment, user_id: Optional[str] = None,
+                          category: Optional[str] = None) -> dict[str, Any]:
+        df = self.get_trades(env, user_id=user_id, category=category)
         closed = df[df["status"] == "CLOSED"] if not df.empty else pd.DataFrame()
         if closed.empty:
             return {"total_trades": len(df), "closed_trades": 0, "win_rate": 0.0,
@@ -444,11 +606,12 @@ class DBManager:
         day = day or self.today_key()
         return int((df["timestamp"].map(self._trade_day) == day).sum())
 
-    def daily_pnl(self, env: Environment, user_id: Optional[str] = None) -> pd.DataFrame:
+    def daily_pnl(self, env: Environment, user_id: Optional[str] = None,
+                  category: Optional[str] = None) -> pd.DataFrame:
         """Day-wise history: one row per trading day, newest first. This is the
         permanent record the dashboard reads so past days are never lost on a
         restart — every day the bot has ever traded stays here, on disk."""
-        df = self.get_trades(env, user_id=user_id)
+        df = self.get_trades(env, user_id=user_id, category=category)
         if df.empty:
             return pd.DataFrame(columns=[
                 "Date", "Trades", "Closed", "Open", "Wins", "Win Rate %",

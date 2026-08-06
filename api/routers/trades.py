@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
 from api.auth import CurrentUser, get_current_user
+import config
 from config import Environment
 from db_manager import DBManager
 
@@ -34,20 +35,56 @@ def _env(environment: str) -> Environment:
         raise HTTPException(400, "environment must be 'Paper' or 'Live'.")
 
 
+def _category(category: str = "") -> str:
+    """Validate an optional category filter. "" / "All" means no filter —
+    rejecting an unknown name rather than silently returning everything, since
+    a typo that quietly widens the scope is the dangerous direction."""
+    name = (category or "").strip()
+    if not name or name.lower() == "all":
+        return ""
+    if name not in config.ALL_CATEGORIES:
+        raise HTTPException(
+            400, f"Unknown category {name!r}. Use one of "
+                 f"{', '.join(config.ALL_CATEGORIES)}, or leave blank for all.")
+    return name
+
+
+@router.get("/categories")
+def categories():
+    """The asset classes trades are bucketed into. Crypto is listed before any
+    crypto instrument exists, so the UI has a stable set to render."""
+    return {"categories": list(config.ALL_CATEGORIES)}
+
+
 @router.get("")
-def list_trades(environment: str = "Paper", user: CurrentUser = Depends(get_current_user)):
-    df = _db.get_trades(_env(environment), user_id=user.username)
+def list_trades(environment: str = "Paper", category: str = "",
+                user: CurrentUser = Depends(get_current_user)):
+    df = _db.get_trades(_env(environment), user_id=user.username,
+                        category=_category(category) or None)
     return df.to_dict("records") if not df.empty else []
 
 
 @router.get("/analytics")
-def analytics(environment: str = "Paper", user: CurrentUser = Depends(get_current_user)):
-    return _db.analytics_summary(_env(environment), user_id=user.username)
+def analytics(environment: str = "Paper", category: str = "",
+              user: CurrentUser = Depends(get_current_user)):
+    return _db.analytics_summary(_env(environment), user_id=user.username,
+                                 category=_category(category) or None)
+
+
+@router.get("/by-category")
+def by_category(environment: str = "Paper",
+                user: CurrentUser = Depends(get_current_user)):
+    """One P&L row per asset class — the category-wise view. Every category
+    appears, including ones with no trades yet (as zeroes), so an empty bucket
+    reads as "nothing traded" rather than "something is missing"."""
+    return _db.category_summary(_env(environment), user_id=user.username)
 
 
 @router.get("/daily-pnl")
-def daily_pnl(environment: str = "Paper", user: CurrentUser = Depends(get_current_user)):
-    df = _db.daily_pnl(_env(environment), user_id=user.username)
+def daily_pnl(environment: str = "Paper", category: str = "",
+              user: CurrentUser = Depends(get_current_user)):
+    df = _db.daily_pnl(_env(environment), user_id=user.username,
+                       category=_category(category) or None)
     return df.to_dict("records") if not df.empty else []
 
 

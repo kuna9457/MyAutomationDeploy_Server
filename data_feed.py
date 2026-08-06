@@ -27,6 +27,7 @@ is market hours (config).
 """
 from __future__ import annotations
 
+import json
 import random
 import threading
 import time as _time
@@ -100,6 +101,19 @@ class MarketDataFeed:
         prices open positions from this — never from a candle close — so live PnL
         is WebSocket-driven end to end."""
         return None
+
+    def data_problems(self) -> list[tuple[str, str]]:
+        """(symbol, reason) for instruments that returned NO data when the feed
+        started. Empty for a healthy feed.
+
+        This exists because a dead instrument used to fail completely
+        silently: an expired MCX key answers "Invalid Instrument key", the
+        REST helper swallows it and returns an empty frame, seeding counts it
+        as neither success nor error, and the engine then skips that symbol
+        on every tick forever. The bot looked healthy while a third of the
+        commodity book was never traded. Reporting it here lets the engine put
+        it in front of whoever is watching."""
+        return []
 
 
 # --------------------------------------------------------------------------- #
@@ -201,6 +215,56 @@ class SimulatedFeed(MarketDataFeed):
 #  Shared REST candle fetch — used to SEED history for both the REST feed and the
 #  WebSocket feed (so 200 EMA / MACD are valid the instant the bot starts).
 # --------------------------------------------------------------------------- #
+def _describe_api_error(exc: Exception) -> str:
+    """A human reason out of an Upstox ApiException.
+
+    The SDK's str() is a wall of HTTP headers with the actual cause buried in
+    a JSON body, so the one line that matters — "Invalid Instrument key" —
+    never reaches a log anyone reads. This digs it out."""
+    body = getattr(exc, "body", None)
+    if body:
+        try:
+            if isinstance(body, bytes):
+                body = body.decode("utf-8", "replace")
+            payload = json.loads(body)
+            err = (payload.get("errors") or [{}])[0]
+            code = err.get("errorCode") or err.get("error_code") or ""
+            msg = err.get("message") or ""
+            if code == "UDAPI100011":
+                return ("invalid/expired instrument key — the contract has "
+                        "rolled off; run tools/refresh_mcx.py")
+            if msg:
+                return f"{msg}{f' ({code})' if code else ''}"
+        except Exception:
+            pass
+    return f"{type(exc).__name__}: {str(exc).splitlines()[0][:120]}"
+
+
+def _diagnose(hist_api, inst: Instrument) -> str:
+    """Why did this instrument seed nothing? Called ONLY at startup and ONLY
+    for instruments that already came back empty, so it costs one extra API
+    call per broken symbol and never touches the trading loop.
+
+    Distinguishes the two cases that look identical from an empty frame: a key
+    the exchange no longer knows (expired contract) versus a valid key that
+    simply has no candles in the window (a fresh listing, or a holiday)."""
+    try:
+        resp = hist_api.get_intra_day_candle_data(
+            inst.instrument_key, "1minute", api_version="v2")
+        count = len(resp.data.candles or [])
+    except Exception as exc:
+        return _describe_api_error(exc)
+    expiry_note = f" (contract expires {inst.expiry})" if inst.expiry else ""
+    if count:
+        # The key is fine and data exists NOW — so the seeding window itself
+        # came back empty. Usually a holiday or a symbol that hasn't traded in
+        # the look-back; naming the difference stops it being read as a dead
+        # contract.
+        return (f"seed window empty but the key is live ({count} recent "
+                f"candles) — likely no trades in the look-back{expiry_note}")
+    return f"no candles returned for {inst.instrument_key}{expiry_note}"
+
+
 def _fetch_rest_candles(hist_api, inst: Instrument, mode: Mode,
                         history_days: int) -> pd.DataFrame:
     """Pull real candles for one instrument and return an ascending OHLCV df
@@ -302,18 +366,38 @@ class UpstoxWebSocketFeed(MarketDataFeed):
             return pd.Timestamp(now_ist())
 
     def _seed_history(self, instruments: list[Instrument]) -> int:
+        """Seed each instrument, and RECORD every one that produced nothing.
+
+        An empty frame is not an exception — the REST helper deliberately
+        swallows per-call errors so one bad symbol can't abort the others — so
+        without collecting them here a dead instrument leaves no trace at all.
+        `_diagnose` is called only for the failures, once, at startup.
+        """
         ok = 0
+        problems: list[tuple[str, str]] = []
         for inst in instruments:
             try:
                 df = _fetch_rest_candles(self._hist_api, inst, self.mode,
                                          self.history_days)
-                if not df.empty:
-                    with self._lock:
-                        self._seed[inst.symbol] = df
-                    ok += 1
             except Exception as exc:
+                problems.append((inst.symbol, _describe_api_error(exc)))
                 print(f"[UpstoxWebSocketFeed] seed {inst.symbol} failed: {exc}")
+                continue
+            if df.empty:
+                reason = _diagnose(self._hist_api, inst)
+                problems.append((inst.symbol, reason))
+                print(f"[UpstoxWebSocketFeed] seed {inst.symbol}: {reason}")
+                continue
+            with self._lock:
+                self._seed[inst.symbol] = df
+            ok += 1
+        with self._lock:
+            self._problems = problems
         return ok
+
+    def data_problems(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return list(getattr(self, "_problems", []))
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self, instruments: list[Instrument]) -> None:
