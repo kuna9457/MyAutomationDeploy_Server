@@ -21,6 +21,15 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+# FIRST, before anything can open a socket. Prefers IPv4 for outbound
+# connections so the address a broker's static-IP allowlist sees is the one it
+# was written for — an IPv6 source can never match an IPv4 allowlist entry
+# (Upstox UDAPI1154). Must precede the imports below: api.auth pulls in
+# user_manager, which connects to Mongo at import time, and a pool built
+# before this point would keep its own resolution.
+import net_config  # noqa: E402
+net_config.apply()
+
 from fastapi import Depends, FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.security import OAuth2PasswordRequestForm  # noqa: E402

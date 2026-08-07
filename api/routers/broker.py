@@ -84,6 +84,27 @@ def _resolve_credentials(user: CurrentUser, broker: str) -> tuple[str, str, str]
 
 
 # -- a client's own broker app credentials ------------------------------------- #
+@router.get("/egress-ip")
+def egress_ip(_: CurrentUser = Depends(get_current_user)):
+    """The public IP this server presents on outbound calls — i.e. exactly what
+    a broker's static-IP allowlist compares against.
+
+    Exists because that failure is otherwise invisible from the outside: the
+    broker rejects with UDAPI1154 naming an origin IP, and there is no way to
+    confirm what the server would send without asking it. If `ip` here is an
+    IPv6 address while the allowlist holds IPv4, that mismatch IS the failure —
+    see net_config.FORCE_IPV4."""
+    import net_config
+    ip = net_config.egress_ip()
+    return {
+        "ip": ip,
+        "family": ("IPv6" if ":" in ip else "IPv4" if ip else "unknown"),
+        "force_ipv4": net_config.status(),
+        "note": ("Add this exact address to your broker app's static-IP "
+                 "allowlist, or clear the restriction there."),
+    }
+
+
 @router.get("/onboarding-info")
 def onboarding_info(_: CurrentUser = Depends(get_current_user)):
     """Everything a client needs to create their own broker app. No secrets."""
