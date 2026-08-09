@@ -88,6 +88,26 @@ def daily_pnl(environment: str = "Paper", category: str = "",
     return df.to_dict("records") if not df.empty else []
 
 
+@router.get("/by-strategy")
+def by_strategy(environment: str = "Paper", category: str = "",
+                user: CurrentUser = Depends(get_current_user)):
+    """All-time P&L per strategy, best first — which edge actually earns."""
+    df = _db.strategy_summary(_env(environment), user_id=user.username,
+                              category=_category(category) or None)
+    return df.to_dict("records") if not df.empty else []
+
+
+@router.get("/daily-strategy-pnl")
+def daily_strategy_pnl(environment: str = "Paper", category: str = "",
+                       user: CurrentUser = Depends(get_current_user)):
+    """One row per trading day × strategy: on this day, this strategy traded
+    this many symbols and made this much. Each day's rows sum to that day's
+    /daily-pnl total."""
+    df = _db.daily_strategy_pnl(_env(environment), user_id=user.username,
+                                category=_category(category) or None)
+    return df.to_dict("records") if not df.empty else []
+
+
 @router.get("/export")
 def export_excel(environment: str = "Paper", user: CurrentUser = Depends(get_current_user)):
     path = _db.export_excel(_env(environment), user_id=user.username)

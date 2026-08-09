@@ -168,20 +168,28 @@ def _environment(environment: str) -> Environment:
 @router.get("/clients/{username}/stats")
 def client_stats(username: str, environment: str = "Paper"):
     """Everything the drill-down panel needs in one round trip: headline
-    summary, per-day PnL rows, and the trade list — all scoped to this one
-    client."""
+    summary, per-day PnL rows, the per-strategy breakdown of those same days,
+    and the trade list — all scoped to this one client."""
     uname = _client_username(username)
     env = _environment(environment)
     trades = _db.get_trades(env, user_id=uname)
     daily = _db.daily_pnl(env, user_id=uname)
+    by_strategy = _db.strategy_summary(env, user_id=uname)
+    daily_by_strategy = _db.daily_strategy_pnl(env, user_id=uname)
     eng = engine_registry.get_engine(uname)
+
+    def _rows(df):
+        return df.to_dict("records") if not df.empty else []
+
     return {
         "username": uname,
         "environment": env.value,
         "running": bool(eng and eng.state.running),
         "summary": _db.analytics_summary(env, user_id=uname),
-        "daily_pnl": daily.to_dict("records") if not daily.empty else [],
-        "trades": trades.to_dict("records") if not trades.empty else [],
+        "daily_pnl": _rows(daily),
+        "strategy_pnl": _rows(by_strategy),
+        "daily_strategy_pnl": _rows(daily_by_strategy),
+        "trades": _rows(trades),
     }
 
 

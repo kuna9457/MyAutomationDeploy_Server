@@ -33,6 +33,39 @@ LIVE_COLLECTION = "live_trades"
 _indexes_ready = False
 
 
+# Trades store the strategy's KEY ("vwap_macd"); reports want its display name
+# ("VWAP + MACD"). Rows written before trades recorded a strategy at all, and
+# keys belonging to a strategy that has since been renamed or removed, still
+# have to appear in the totals — they group under these labels rather than
+# being dropped, because a P&L breakdown that silently omits trades is worse
+# than one with an "Unspecified" bucket in it.
+_UNSPECIFIED_STRATEGY = "Unspecified"
+_STRATEGY_LABELS: dict[str, str] = {}
+
+
+def _strategy_label(key: Any) -> str:
+    """Display name for a stored strategy key. Cached, and imported lazily so
+    the storage layer never takes a hard dependency on strategy.py."""
+    raw = str(key or "").strip()
+    if not raw or raw.lower() in ("nan", "none"):
+        return _UNSPECIFIED_STRATEGY
+    cached = _STRATEGY_LABELS.get(raw)
+    if cached is not None:
+        return cached
+    label = raw
+    try:
+        import strategy as _strategy
+        found = _strategy.get_strategy(raw)
+        if found is not None and getattr(found, "name", ""):
+            label = found.name
+    except Exception:
+        # An unresolvable key still reports under its raw key — never blank,
+        # and never a reason to fail a report.
+        pass
+    _STRATEGY_LABELS[raw] = label
+    return label
+
+
 def _collection_name(env: Environment) -> str:
     return PAPER_COLLECTION if env == Environment.PAPER else LIVE_COLLECTION
 
@@ -211,6 +244,49 @@ class DBManager:
                 fh.write(json.dumps(trade) + "\n")
         self.sync_excel_log(env)
         return trade["trade_id"]
+
+    # -- update (patch an OPEN position in place) --------------------------- #
+    def update_trade_fields(self, trade_id: str, env: Environment,
+                            fields: dict) -> bool:
+        """Patch a few fields on an OPEN trade. Used when the broker-side
+        protective order is re-armed at a new stop (a trail): the stored
+        `stop_loss` and `broker_gtt_id` must follow, or a restart would
+        rehydrate the position against the OLD stop and lose track of the
+        order that is actually resting at the broker.
+
+        Deliberately narrow — only `_MUTABLE` keys can be written, so this can
+        never be used to rewrite entry price, quantity or PnL. Returns True if
+        a document was actually updated. NEVER raises."""
+        allowed = {k: v for k, v in fields.items() if k in self._MUTABLE}
+        if not trade_id or not allowed:
+            return False
+        if self.db is not None:
+            try:
+                res = self.db[_collection_name(env)].update_one(
+                    {"trade_id": trade_id, "status": "OPEN"}, {"$set": allowed})
+                return res.matched_count > 0
+            except Exception as exc:
+                self._demote_to_local(exc, "update")
+        # local fallback: rewrite the file
+        try:
+            rows = self._read_local(env)
+            hit = False
+            for r in rows:
+                if r.get("trade_id") == trade_id and r.get("status") == "OPEN":
+                    r.update(allowed)
+                    hit = True
+            if hit:
+                with open(self._local_path(env), "w", encoding="utf-8") as fh:
+                    for r in rows:
+                        fh.write(json.dumps(r) + "\n")
+            return hit
+        except Exception:
+            return False
+
+    # Fields update_trade_fields is permitted to touch. Anything that feeds
+    # PnL or sizing (entry_price, quantity, contract_multiplier, side) is
+    # deliberately absent.
+    _MUTABLE = frozenset({"stop_loss", "target", "broker_gtt_id"})
 
     # -- update (close a position) ----------------------------------------- #
     def close_trade(
@@ -606,35 +682,102 @@ class DBManager:
         day = day or self.today_key()
         return int((df["timestamp"].map(self._trade_day) == day).sum())
 
+    @staticmethod
+    def _perf_row(g: pd.DataFrame) -> dict:
+        """The performance aggregate for one group of trades. Shared by every
+        breakdown below (day, strategy, day×strategy) so they can never drift
+        into reporting the same day's PnL three slightly different ways.
+
+        `Symbols` counts DISTINCT instruments, not trades — "how many stocks
+        this covered", which is not the same as how many entries were taken.
+        """
+        closed = g[g["status"] == "CLOSED"]
+        pnl = (closed["realized_pnl"].astype(float) if not closed.empty
+               else pd.Series(dtype=float))
+        wins = int((pnl > 0).sum())
+        return {
+            "Symbols": int(g["ticker"].nunique()) if "ticker" in g else 0,
+            "Trades": int(len(g)),
+            "Closed": int(len(closed)),
+            "Open": int((g["status"] == "OPEN").sum()),
+            "Wins": wins,
+            "Win Rate %": (round(100 * wins / len(closed), 2) if len(closed)
+                           else 0.0),
+            "Realized PnL (₹)": round(float(pnl.sum()), 2),
+        }
+
+    @staticmethod
+    def _labelled(df: pd.DataFrame) -> pd.DataFrame:
+        """A copy carrying `_day` and `_strategy` grouping keys."""
+        df = df.copy()
+        df["_day"] = df["timestamp"].map(DBManager._trade_day)
+        # The column is absent entirely on stores written before trades
+        # recorded their strategy; those rows group under "Unspecified"
+        # rather than vanishing from the totals.
+        df["_strategy"] = (df["strategy"].map(_strategy_label)
+                           if "strategy" in df.columns
+                           else _UNSPECIFIED_STRATEGY)
+        return df
+
     def daily_pnl(self, env: Environment, user_id: Optional[str] = None,
                   category: Optional[str] = None) -> pd.DataFrame:
         """Day-wise history: one row per trading day, newest first. This is the
         permanent record the dashboard reads so past days are never lost on a
-        restart — every day the bot has ever traded stays here, on disk."""
+        restart — every day the bot has ever traded stays here, on disk.
+
+        `Strategies` names every strategy that ran that day; when more than one
+        did, `daily_strategy_pnl` splits the day's PnL between them."""
         df = self.get_trades(env, user_id=user_id, category=category)
         if df.empty:
             return pd.DataFrame(columns=[
-                "Date", "Trades", "Closed", "Open", "Wins", "Win Rate %",
-                "Realized PnL (₹)"])
-        df = df.copy()
-        df["_day"] = df["timestamp"].map(self._trade_day)
+                "Date", "Strategies", "Symbols", "Trades", "Closed", "Open",
+                "Wins", "Win Rate %", "Realized PnL (₹)"])
         rows = []
-        for day, g in df.groupby("_day"):
-            closed = g[g["status"] == "CLOSED"]
-            pnl = closed["realized_pnl"].astype(float) if not closed.empty \
-                else pd.Series(dtype=float)
-            wins = int((pnl > 0).sum())
+        for day, g in self._labelled(df).groupby("_day"):
             rows.append({
                 "Date": day,
-                "Trades": int(len(g)),
-                "Closed": int(len(closed)),
-                "Open": int((g["status"] == "OPEN").sum()),
-                "Wins": wins,
-                "Win Rate %": round(100 * wins / len(closed), 2) if len(closed)
-                else 0.0,
-                "Realized PnL (₹)": round(float(pnl.sum()), 2),
+                "Strategies": ", ".join(sorted(set(g["_strategy"]))),
+                **self._perf_row(g),
             })
         out = pd.DataFrame(rows).sort_values("Date", ascending=False)
+        return out.reset_index(drop=True)
+
+    def strategy_summary(self, env: Environment, user_id: Optional[str] = None,
+                         category: Optional[str] = None) -> pd.DataFrame:
+        """All-time P&L per STRATEGY — which edge actually earns its keep, best
+        first. Counts every trade the strategy took, so a strategy that trades
+        often for small money and one that trades rarely for large money are
+        directly comparable."""
+        df = self.get_trades(env, user_id=user_id, category=category)
+        cols = ["Strategy", "Symbols", "Trades", "Closed", "Open", "Wins",
+                "Win Rate %", "Realized PnL (₹)"]
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        rows = [{"Strategy": name, **self._perf_row(g)}
+                for name, g in self._labelled(df).groupby("_strategy")]
+        out = pd.DataFrame(rows).sort_values(
+            "Realized PnL (₹)", ascending=False)
+        return out.reset_index(drop=True)
+
+    def daily_strategy_pnl(self, env: Environment,
+                           user_id: Optional[str] = None,
+                           category: Optional[str] = None) -> pd.DataFrame:
+        """One row per (trading day × strategy), newest day first and, within a
+        day, most profitable strategy first: "on this day, this strategy traded
+        these many symbols and made this much".
+
+        Each day's rows sum exactly to that day's `daily_pnl` total — same
+        trades, same aggregate, only split finer."""
+        df = self.get_trades(env, user_id=user_id, category=category)
+        cols = ["Date", "Strategy", "Symbols", "Trades", "Closed", "Open",
+                "Wins", "Win Rate %", "Realized PnL (₹)"]
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        rows = [{"Date": day, "Strategy": name, **self._perf_row(g)}
+                for (day, name), g in
+                self._labelled(df).groupby(["_day", "_strategy"])]
+        out = pd.DataFrame(rows).sort_values(
+            ["Date", "Realized PnL (₹)"], ascending=[False, False])
         return out.reset_index(drop=True)
 
     def export_excel(self, env: Environment, path: Optional[str] = None,
@@ -647,6 +790,8 @@ class DBManager:
         trades = self.get_trades(env, user_id=user_id)
         summary = self.analytics_summary(env, user_id=user_id)
         daily = self.daily_pnl(env, user_id=user_id)
+        by_strategy = self.strategy_summary(env, user_id=user_id)
+        daily_by_strategy = self.daily_strategy_pnl(env, user_id=user_id)
 
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             (trades if not trades.empty else pd.DataFrame(
@@ -655,6 +800,11 @@ class DBManager:
             pd.DataFrame([summary]).T.rename(columns={0: "value"}).to_excel(
                 writer, sheet_name="Summary")
             daily.to_excel(writer, sheet_name="Daily PnL", index=False)
+            # The permanent per-strategy record: which edge earned what, and
+            # the same thing broken down day by day.
+            by_strategy.to_excel(writer, sheet_name="By Strategy", index=False)
+            daily_by_strategy.to_excel(
+                writer, sheet_name="Daily by Strategy", index=False)
             if not trades.empty and "mode" in trades:
                 by_mode = trades[trades["status"] == "CLOSED"].groupby("mode")[
                     "realized_pnl"].agg(["count", "sum", "mean"])

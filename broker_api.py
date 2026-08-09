@@ -102,6 +102,41 @@ class OrderResult:
     message: str = ""
 
 
+# --------------------------------------------------------------------------- #
+#  Protective-order handles.
+#
+#  A broker-side SL/TP is not one thing: a Kite GTT OCO and a plain resting
+#  SL-M order are cancelled and amended through completely different APIs. The
+#  engine stores exactly ONE string per trade (`broker_gtt_id`), so the KIND is
+#  namespaced into that string rather than added as a new schema field — which
+#  keeps the stored document exactly the Section-5 shape it already was.
+#
+#      "gtt:1234"    Kite GTT OCO   -> delete_gtt / modify_gtt
+#      "order:5678"  resting SL-M   -> cancel_order / modify_order
+#
+#  A BARE id with no prefix is a trade opened before this namespacing existed;
+#  those could only ever have been Kite GTTs, so that is what they decode to.
+# --------------------------------------------------------------------------- #
+PROT_GTT = "gtt"
+PROT_ORDER = "order"
+
+
+def _prot_encode(kind: str, raw_id: str) -> str:
+    return f"{kind}:{raw_id}"
+
+
+def _prot_decode(protection_id: str) -> tuple[str, str]:
+    """(kind, raw_id) from a stored handle. Unprefixed legacy ids decode as
+    Kite GTTs — see the note above."""
+    pid = (protection_id or "").strip()
+    if not pid:
+        return "", ""
+    kind, sep, raw = pid.partition(":")
+    if not sep:
+        return PROT_GTT, pid
+    return kind, raw
+
+
 class BaseBroker:
     name: str = "Base"
 
@@ -151,18 +186,40 @@ class BaseBroker:
         self, instrument: Instrument, side: str, quantity: int,
         stop_loss: float, target: float, ref_price: float,
     ) -> tuple[bool, str, str]:
-        """Place the SL+TP as a REAL protective order at the broker (e.g. Kite's
-        GTT OCO), so the position is protected even if this bot goes offline —
-        not just watched by our own polling loop. `side` is the position's own
-        side (BUY/SELL); the protective order is on the OPPOSITE side.
+        """Place the SL (and, where the broker supports it, the TP) as a REAL
+        resting order at the broker, so the position is protected even if this
+        bot goes offline — not just watched by our own polling loop. `side` is
+        the position's own side (BUY/SELL); the protective order is on the
+        OPPOSITE side.
 
-        Returns (ok, broker_order_id, message). Only Zerodha implements this
-        today; every other broker inherits this no-op, which is silent and
-        harmless — the position is still fully protected by the engine's own
-        SL/TP/time-exit polling exactly as before this existed."""
+        Returns (ok, protection_id, message), where `protection_id` is a
+        namespaced handle (see PROT_* below) that cancel/modify parse to know
+        which broker API the handle belongs to.
+
+        Zerodha and Upstox implement this; every other broker inherits this
+        no-op, which is silent and harmless — the position is still fully
+        protected by the engine's own SL/TP/time-exit polling exactly as
+        before this existed."""
         return False, "", "not supported by this broker"
 
-    def cancel_oco_exit(self, broker_order_id: str) -> bool:
+    def modify_oco_exit(
+        self, instrument: Instrument, side: str, quantity: int,
+        stop_loss: float, target: float, ref_price: float,
+        protection_id: str,
+    ) -> tuple[bool, str, str]:
+        """Re-arm an existing protective order at a NEW stop/target — what a
+        trailing stop needs so the broker-side order follows the software one
+        instead of staying pinned at the original stop.
+
+        Returns (ok, protection_id, message). The id is returned because a
+        broker that cannot amend in place is free to cancel-and-replace, which
+        yields a NEW id the engine must persist. On failure the caller keeps
+        the old id and the OLD broker-side stop stays armed — a stale-but-live
+        stop is strictly safer than no stop, so a failure here never cancels
+        what is already resting."""
+        return False, protection_id, "not supported by this broker"
+
+    def cancel_oco_exit(self, protection_id: str) -> bool:
         """Cancel a protective order placed by place_oco_exit — called right
         before the engine's own software exit fires, so the broker-side order
         doesn't linger and later fire on a position that's already closed.
@@ -281,24 +338,32 @@ class UpstoxBroker(BaseBroker):
             print(f"[UpstoxBroker] connect failed: {exc}")
             return False
 
+    def _product_code(self, instrument) -> str:
+        """"I" (intraday/MIS) for equity, "D" (delivery/NRML) for commodity —
+        the same split the margin call uses, kept in one place so an order and
+        the margin checked for it can never disagree."""
+        return "I" if instrument.segment == Segment.EQUITY else "D"
+
     def _place(self, instrument, side, quantity, order_type: str,
-               price: float, ref_price: float) -> OrderResult:
+               price: float, ref_price: float,
+               trigger_price: float = 0.0) -> OrderResult:
         """Shared order path. `price` is ignored by the API for MARKET orders and
-        is the limit price for LIMIT orders."""
+        is the limit price for LIMIT orders. `trigger_price` is the stop trigger
+        for SL/SL-M orders and is ignored otherwise."""
         if self._order_api is None:
             return OrderResult(False, "", self.name, message="Not connected")
         try:
             import upstox_client  # type: ignore
             body = upstox_client.PlaceOrderRequest(
                 quantity=quantity,
-                product="I" if instrument.segment == Segment.EQUITY else "D",
+                product=self._product_code(instrument),
                 validity="DAY",
-                price=round(float(price), 2) if order_type == "LIMIT" else 0,
+                price=round(float(price), 2) if order_type in ("LIMIT", "SL") else 0,
                 instrument_token=instrument.instrument_key,
                 order_type=order_type,
                 transaction_type=side,
                 disclosed_quantity=0,
-                trigger_price=0,
+                trigger_price=round(float(trigger_price), 2),
                 is_amo=False,
             )
             resp = self._order_api.place_order(body, api_version="v2")
@@ -331,9 +396,8 @@ class UpstoxBroker(BaseBroker):
         token = self.access_token or (
             config.UPSTOX_LIVE_ACCESS_TOKEN
             or (config.UPSTOX_SANDBOX_TOKEN if self.sandbox else ""))
-        product = "I" if instrument.segment == Segment.EQUITY else "D"
         return fetch_upstox_margin(token, instrument.instrument_key, quantity,
-                                   side, product)
+                                   side, self._product_code(instrument))
 
     def available_funds(self) -> Optional[float]:
         token = self.access_token or (
@@ -359,6 +423,69 @@ class UpstoxBroker(BaseBroker):
             return float(avail) if avail is not None else None
         except Exception:
             return None
+
+    # -- broker-side protection ---------------------------------------------- #
+    def place_oco_exit(self, instrument, side, quantity, stop_loss, target,
+                       ref_price) -> tuple[bool, str, str]:
+        """A real resting SL-M on the exit side, so the stop lives at UPSTOX
+        rather than only in this bot's polling loop.
+
+        The STOP only — the target stays with the engine, for both segments.
+        Upstox does have a multi-leg GTT that could hold both, but resting a
+        TP order next to the SL creates the orphan-leg hazard: if this bot is
+        down when one leg fills, the other is still live at the broker, and an
+        exit order with no position behind it OPENS a fresh naked one. A lone
+        SL-M cannot do that — the worst case is a missed take-profit, which
+        costs profit rather than principal.
+        """
+        if self._order_api is None:
+            return False, "", "Not connected"
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        res = self._place(instrument, exit_side, int(quantity), "SL-M",
+                          0.0, ref_price, trigger_price=stop_loss)
+        if not res.ok or not res.order_id:
+            return False, "", res.message or "SL-M rejected"
+        return True, _prot_encode(PROT_ORDER, res.order_id), ""
+
+    def modify_oco_exit(self, instrument, side, quantity, stop_loss, target,
+                        ref_price, protection_id) -> tuple[bool, str, str]:
+        """Amend the resting SL-M's trigger in place — the handle is unchanged,
+        so the position is never momentarily unprotected."""
+        if self._order_api is None:
+            return False, protection_id, "Not connected"
+        _kind, raw_id = _prot_decode(protection_id)
+        if not raw_id:
+            return False, protection_id, "no protective order to modify"
+        try:
+            import upstox_client  # type: ignore
+            body = upstox_client.ModifyOrderRequest(
+                order_id=raw_id,
+                order_type="SL-M",
+                quantity=int(quantity),
+                validity="DAY",
+                price=0,
+                trigger_price=round(float(stop_loss), 2),
+                disclosed_quantity=0,
+            )
+            self._order_api.modify_order(body, api_version="v2")
+            return True, protection_id, ""
+        except Exception as exc:
+            return False, protection_id, str(exc)
+
+    def cancel_oco_exit(self, protection_id: str) -> bool:
+        if self._order_api is None:
+            return False
+        _kind, raw_id = _prot_decode(protection_id)
+        if not raw_id:
+            return False
+        try:
+            self._order_api.cancel_order(raw_id, api_version="v2")
+            return True
+        except Exception:
+            # Already triggered/cancelled is the common, harmless case. The
+            # engine verifies against the broker's real position before it
+            # sends its own square-off, so this never blocks a close.
+            return False
 
 
 # --------------------------------------------------------------------------- #
@@ -657,11 +784,40 @@ class ZerodhaBroker(BaseBroker):
 
     def place_oco_exit(self, instrument, side, quantity, stop_loss, target,
                        ref_price) -> tuple[bool, str, str]:
-        """A Kite GTT OCO order: two LIMIT legs (SL and target), either of
-        which cancels the other once triggered. This is what protects the
-        position at ZERODHA'S OWN SERVERS if this bot goes offline — the
-        engine's own polling loop is the primary exit path (usually faster);
+        """Arm this position's protection at ZERODHA'S OWN SERVERS, so it
+        survives this bot going offline. The engine's polling loop remains the
+        PRIMARY exit path (usually faster, and it alone honours the time-exit);
         this is the safety net for when it isn't running.
+
+        Which mechanism gets used is forced by the product, not by preference:
+
+        * MCX / NRML -> GTT OCO. Both legs (SL and target) rest at Zerodha and
+          either one cancels the other.
+        * EQUITY / MIS -> a plain resting SL-M. Kite's GTT accepts CNC and
+          NRML only, so an MIS GTT is rejected outright; and Zerodha withdrew
+          bracket orders in 2020, so there is no OCO for intraday equity at
+          all. An SL-M is therefore the only real exchange-resting protection
+          available here, and it covers the STOP only — the target stays with
+          the engine's polling. That asymmetry is deliberate: if this bot dies
+          you are still stopped out by the exchange, and the worst case is a
+          missed take-profit rather than an unbounded loss. Resting a second
+          TP order alongside it would create the opposite hazard — one leg
+          filling while the bot is down leaves the other live, and a resting
+          exit order with no position behind it OPENS a fresh naked one.
+        """
+        if self._kite is None:
+            return False, "", "Not connected"
+        tradingsymbol = self._kite_symbol(instrument)
+        if tradingsymbol is None:
+            return False, "", kite_symbols.describe_failure(instrument)
+        if self._product(instrument) == self._kite.PRODUCT_MIS:
+            return self._place_stop_order(instrument, side, quantity, stop_loss)
+        return self._place_gtt_oco(instrument, side, quantity, stop_loss,
+                                   target, ref_price)
+
+    def _place_gtt_oco(self, instrument, side, quantity, stop_loss, target,
+                       ref_price) -> tuple[bool, str, str]:
+        """The GTT OCO path (NRML only — see place_oco_exit).
 
         The SL leg's LIMIT price sits a couple of ticks BEYOND its trigger (in
         the exit direction) rather than exactly at it — GTT legs are LIMIT
@@ -670,38 +826,12 @@ class ZerodhaBroker(BaseBroker):
         to certain once triggered, at the cost of a few ticks of extra
         slippage versus a true stop-market.
         """
-        if self._kite is None:
-            return False, "", "Not connected"
-        tradingsymbol = self._kite_symbol(instrument)
-        if tradingsymbol is None:
-            return False, "", kite_symbols.describe_failure(instrument)
         try:
-            exit_side = "SELL" if side == "BUY" else "BUY"
-            tick = instrument.tick_size or 0.05
-            buf = 2 * tick
-            sl_limit = (round(stop_loss - buf, 2) if side == "BUY"
-                       else round(stop_loss + buf, 2))
-            tp_limit = round(target, 2)
-            product = self._product(instrument)
-            sl_leg = {"transaction_type": exit_side, "quantity": int(quantity),
-                      "order_type": "LIMIT", "product": product,
-                      "price": sl_limit}
-            tp_leg = {"transaction_type": exit_side, "quantity": int(quantity),
-                      "order_type": "LIMIT", "product": product,
-                      "price": tp_limit}
-            # Kite's OCO pairs trigger_values[i] with orders[i] BY INDEX — it
-            # does not infer which leg is the stop and which is the target, so
-            # the two must be sorted together (ascending trigger) regardless
-            # of whether this is a long or a short. Sorting anything else here
-            # (e.g. assuming stop-then-target) would silently swap the legs
-            # for shorts, arming the SL at the target price and vice versa.
-            legs = sorted([(stop_loss, sl_leg), (target, tp_leg)],
-                         key=lambda pair: pair[0])
-            trigger_values = [legs[0][0], legs[1][0]]
-            orders = [legs[0][1], legs[1][1]]
+            trigger_values, orders = self._gtt_legs(
+                instrument, side, quantity, stop_loss, target)
             resp = self._kite.place_gtt(
                 trigger_type=self._kite.GTT_TYPE_OCO,
-                tradingsymbol=tradingsymbol,
+                tradingsymbol=self._kite_symbol(instrument),
                 exchange=self._exchange(instrument),
                 trigger_values=trigger_values,
                 last_price=round(float(ref_price), 2),
@@ -710,21 +840,114 @@ class ZerodhaBroker(BaseBroker):
             gtt_id = str(resp.get("trigger_id", ""))
             if not gtt_id:
                 return False, "", f"place_gtt returned no trigger_id: {resp}"
-            return True, gtt_id, ""
+            return True, _prot_encode(PROT_GTT, gtt_id), ""
         except Exception as exc:
             return False, "", str(exc)
 
-    def cancel_oco_exit(self, broker_order_id: str) -> bool:
-        if self._kite is None or not broker_order_id:
+    def _gtt_legs(self, instrument, side, quantity, stop_loss, target):
+        """(trigger_values, orders) for a GTT OCO. Shared by place and modify
+        so a trailed GTT is rebuilt exactly the way it was first armed."""
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        tick = instrument.tick_size or 0.05
+        buf = 2 * tick
+        sl_limit = (round(stop_loss - buf, 2) if side == "BUY"
+                   else round(stop_loss + buf, 2))
+        product = self._product(instrument)
+        sl_leg = {"transaction_type": exit_side, "quantity": int(quantity),
+                  "order_type": "LIMIT", "product": product,
+                  "price": sl_limit}
+        tp_leg = {"transaction_type": exit_side, "quantity": int(quantity),
+                  "order_type": "LIMIT", "product": product,
+                  "price": round(target, 2)}
+        # Kite's OCO pairs trigger_values[i] with orders[i] BY INDEX — it
+        # does not infer which leg is the stop and which is the target, so
+        # the two must be sorted together (ascending trigger) regardless
+        # of whether this is a long or a short. Sorting anything else here
+        # (e.g. assuming stop-then-target) would silently swap the legs
+        # for shorts, arming the SL at the target price and vice versa.
+        legs = sorted([(stop_loss, sl_leg), (target, tp_leg)],
+                     key=lambda pair: pair[0])
+        return [legs[0][0], legs[1][0]], [legs[0][1], legs[1][1]]
+
+    def _place_stop_order(self, instrument, side, quantity,
+                          stop_loss) -> tuple[bool, str, str]:
+        """A real resting SL-M on the exit side (MIS equity — see
+        place_oco_exit). SL-M rather than SL: once the trigger is hit this
+        must actually get out, and a stop-LIMIT can be jumped in a fast market
+        and leave the position running past its stop.
+
+        (SL-M is rejected by Zerodha on F&O, but this path is only ever taken
+        for equity — MCX goes through the GTT above.)"""
+        try:
+            order_id = self._kite.place_order(
+                variety=self._kite.VARIETY_REGULAR,
+                exchange=self._exchange(instrument),
+                tradingsymbol=self._kite_symbol(instrument),
+                transaction_type=("SELL" if side == "BUY" else "BUY"),
+                quantity=int(quantity),
+                product=self._product(instrument),
+                order_type=self._kite.ORDER_TYPE_SLM,
+                trigger_price=round(float(stop_loss), 2),
+                validity=self._kite.VALIDITY_DAY,
+            )
+            if not order_id:
+                return False, "", "place_order returned no order_id"
+            return True, _prot_encode(PROT_ORDER, str(order_id)), ""
+        except Exception as exc:
+            return False, "", str(exc)
+
+    def modify_oco_exit(self, instrument, side, quantity, stop_loss, target,
+                        ref_price, protection_id) -> tuple[bool, str, str]:
+        """Re-arm at a new stop/target. Both mechanisms amend IN PLACE, so the
+        handle is unchanged and there is never a window where the position
+        sits unprotected (which a cancel-then-replace would open)."""
+        if self._kite is None:
+            return False, protection_id, "Not connected"
+        kind, raw_id = _prot_decode(protection_id)
+        if not raw_id:
+            return False, protection_id, "no protective order to modify"
+        try:
+            if kind == PROT_ORDER:
+                self._kite.modify_order(
+                    variety=self._kite.VARIETY_REGULAR,
+                    order_id=raw_id,
+                    trigger_price=round(float(stop_loss), 2),
+                )
+            else:
+                trigger_values, orders = self._gtt_legs(
+                    instrument, side, quantity, stop_loss, target)
+                self._kite.modify_gtt(
+                    trigger_id=int(raw_id),
+                    trigger_type=self._kite.GTT_TYPE_OCO,
+                    tradingsymbol=self._kite_symbol(instrument),
+                    exchange=self._exchange(instrument),
+                    trigger_values=trigger_values,
+                    last_price=round(float(ref_price), 2),
+                    orders=orders,
+                )
+            return True, protection_id, ""
+        except Exception as exc:
+            return False, protection_id, str(exc)
+
+    def cancel_oco_exit(self, protection_id: str) -> bool:
+        if self._kite is None:
+            return False
+        kind, raw_id = _prot_decode(protection_id)
+        if not raw_id:
             return False
         try:
-            self._kite.delete_gtt(int(broker_order_id))
+            if kind == PROT_ORDER:
+                self._kite.cancel_order(variety=self._kite.VARIETY_REGULAR,
+                                        order_id=raw_id)
+            else:
+                self._kite.delete_gtt(int(raw_id))
             return True
         except Exception:
-            # Already triggered/deleted/expired is the common, harmless case
-            # (Kite errors on deleting a GTT that no longer exists) — treat any
-            # failure here as "nothing left to cancel", never a reason to
-            # block the close.
+            # Already triggered/cancelled/expired is the common, harmless case
+            # (Kite errors on removing something that no longer exists) — treat
+            # any failure here as "nothing left to cancel", never a reason to
+            # block the close. The engine verifies the outcome against the
+            # broker's real position before it sends its own square-off.
             return False
 
     def get_position(self, instrument: Instrument) -> Optional[dict]:

@@ -98,6 +98,12 @@ class BotState:
         # Day-wise history rebuilt from storage (list of dict rows). Survives
         # restarts: it's read back from the persisted trades, never held only here.
         self.daily_pnl: list[dict] = []
+        # Attribution of that same PnL to the strategy that earned it, on the
+        # same refresh and from the same trades — so the breakdowns can never
+        # disagree with the day totals above. `strategy_pnl` is all-time, one
+        # row per strategy; `daily_strategy_pnl` is one row per day×strategy.
+        self.strategy_pnl: list[dict] = []
+        self.daily_strategy_pnl: list[dict] = []
         self.log: list[str] = []
         # LIVE-only risk-guardrail status (risk_manager.LiveRiskLimits applied),
         # refreshed every tick so the dashboard can show it. Empty dict in Paper.
@@ -124,6 +130,8 @@ class BotState:
                 "unrealized_pnl": self.unrealized_pnl,
                 "trading_day": self.trading_day,
                 "daily_pnl": list(self.daily_pnl),
+                "strategy_pnl": list(self.strategy_pnl),
+                "daily_strategy_pnl": list(self.daily_strategy_pnl),
                 "log": list(self.log),
                 "risk_status": dict(self.risk_status),
             }
@@ -502,6 +510,13 @@ class TradingEngine:
                 # one. _live_price seeds from entry until the first tick updates it.
                 trade["_live_price"] = trade["entry_price"]
                 trade["_entry_dt"] = self._reconstruct_entry_dt(trade)
+                # The broker-side protective order was armed at whatever stop
+                # is stored (update_trade_fields keeps the two in step through
+                # any trail), so a restart must start out believing they AGREE.
+                # Seeding this any other way would make the first tick fire a
+                # pointless modify against every reloaded position.
+                trade["_protected_stop"] = (
+                    trade["stop_loss"] if trade.get("broker_gtt_id") else None)
                 notional = trade["entry_price"] * trade["quantity"] * max(mult, 1)
                 if inst is not None and inst.segment == Segment.MCX:
                     # Restore the broker's REAL margin (same source as entry) so
@@ -554,15 +569,28 @@ class TradingEngine:
             return now_ist()
 
     def _refresh_daily(self) -> None:
-        """Reload the day-wise history snapshot from storage into state."""
-        try:
-            df = self.db.daily_pnl(self.environment, user_id=self.user_id)
-            rows = df.to_dict("records") if not df.empty else []
-        except Exception as exc:
-            self.state.push_log(f"⚠️ Daily PnL refresh failed ({exc}).")
-            rows = []
+        """Reload the day-wise history snapshot from storage into state, plus
+        the per-strategy attribution of the same trades.
+
+        All three are read together, from one storage pass each, at every
+        point the day total is refreshed — so the dashboard can never show a
+        day total that its strategy breakdown doesn't add up to."""
+        def _rows(fetch, what: str) -> list[dict]:
+            try:
+                df = fetch(self.environment, user_id=self.user_id)
+                return df.to_dict("records") if not df.empty else []
+            except Exception as exc:
+                self.state.push_log(f"⚠️ {what} refresh failed ({exc}).")
+                return []
+
+        daily = _rows(self.db.daily_pnl, "Daily PnL")
+        by_strategy = _rows(self.db.strategy_summary, "Strategy PnL")
+        daily_by_strategy = _rows(self.db.daily_strategy_pnl,
+                                  "Day-wise strategy PnL")
         with self.state.lock:
-            self.state.daily_pnl = rows
+            self.state.daily_pnl = daily
+            self.state.strategy_pnl = by_strategy
+            self.state.daily_strategy_pnl = daily_by_strategy
 
     def _rollover_if_new_day(self) -> None:
         """At the first tick of a new trading day (00:00 UTC / 05:30 IST, before the
@@ -1160,22 +1188,28 @@ class TradingEngine:
         else:
             target = round(fill - rr * risk_dist, 2)
 
-        # LIVE-only: mirror this trade's SL/TP as a REAL protective order at
-        # the broker (e.g. a Kite GTT OCO), so it's still protected if this
-        # bot goes offline — not just watched by our own polling loop. A
-        # failure here does NOT unwind the entry: the position is already
+        # LIVE-only: mirror this trade's stop (and, where the broker can hold
+        # both, its target) as a REAL resting order at the broker, so it's
+        # still protected if this bot goes offline — not just watched by our
+        # own polling loop. Which mechanism that is — a Kite GTT OCO, or a
+        # plain SL-M — is the broker's call; see broker_api.place_oco_exit.
+        #
+        # A failure here does NOT unwind the entry: the position is already
         # correctly opened and the engine's own SL/TP/time-exit still manages
         # it exactly as before this existed; it just won't have the extra
         # broker-side safety net for this one trade.
         gtt_id = ""
+        armed_stop = None
         if self.environment == Environment.LIVE:
             ok, gtt_id, gtt_msg = self.broker.place_oco_exit(
                 inst, sig.side, qty, stop, target, fill)
             if ok:
+                armed_stop = stop
                 self.state.push_log(
-                    f"{inst.symbol}: broker-side SL/TP protection placed "
-                    f"(GTT {gtt_id}).")
+                    f"{inst.symbol}: broker-side SL protection armed @ "
+                    f"{stop:.2f} ({gtt_id}).")
             elif gtt_msg and gtt_msg != "not supported by this broker":
+                gtt_id = ""
                 self.state.push_log(
                     f"⚠️ {inst.symbol}: broker-side SL/TP protection failed "
                     f"({gtt_msg}) — still protected by the bot's own polling.")
@@ -1195,6 +1229,11 @@ class TradingEngine:
         # insert so the stored document stays exactly the Section-5 schema.
         trade["_live_price"] = fill
         trade["_entry_dt"] = now_ist()
+        # The stop the BROKER is currently holding, as opposed to the one this
+        # engine manages to. They start equal; _resync_protection re-arms the
+        # broker whenever a trail moves the software stop away from this.
+        # None = nothing resting at the broker for this trade.
+        trade["_protected_stop"] = armed_stop
         # Capital this position ties up, deducted from available capital until it
         # closes (see _available_capital). EQUITY is 1×, so it commits its full
         # notional. MCX posts the broker's REAL futures margin (SPAN + exposure +
@@ -1220,6 +1259,58 @@ class TradingEngine:
             f"{qty_clip_note} | {sig.reason}")
         return True
 
+    def _resync_protection(self, inst: Instrument, trade: dict) -> None:
+        """Keep the broker's resting stop equal to the one this engine manages
+        to. Called every tick for every open position, and a NO-OP on all of
+        them unless something has actually moved `stop_loss` since the order
+        was armed — which nothing does today. This is the hook a trailing stop
+        plugs into: move `trade["stop_loss"]`, and the broker-side order
+        follows on the next tick with no further wiring.
+
+        Never raises and never blocks the exit checks that follow it. If the
+        re-arm fails, the OLD broker-side stop stays exactly where it was —
+        stale, but live, and therefore still protective. The engine's own
+        polling continues to manage the position to the NEW stop regardless,
+        so a failure here costs the safety net's precision, never the stop
+        itself.
+        """
+        if self.environment != Environment.LIVE:
+            return
+        armed = trade.get("_protected_stop")
+        if armed is None:                    # nothing resting at the broker
+            return
+        stop = float(trade["stop_loss"])
+        # Float equality is the wrong test for prices; a stop that has moved
+        # by less than a tick would not change the order anyway.
+        if abs(stop - float(armed)) < (inst.tick_size or 0.05) / 2:
+            return
+        try:
+            ok, new_id, msg = self.broker.modify_oco_exit(
+                inst, trade["side"], trade["quantity"], stop,
+                float(trade["target"]), float(trade.get("_live_price", stop)),
+                trade.get("broker_gtt_id", ""))
+        except Exception as exc:                  # a broker SDK blowing up
+            ok, new_id, msg = False, trade.get("broker_gtt_id", ""), str(exc)
+        if not ok:
+            # Log once per failed stop level, not once per tick.
+            trade["_protected_stop"] = stop
+            self.state.push_log(
+                f"⚠️ {inst.symbol}: could not move broker-side stop to "
+                f"{stop:.2f} ({msg}) — the previous broker stop stays armed; "
+                f"the bot still manages this position to {stop:.2f}.")
+            return
+        trade["_protected_stop"] = stop
+        # Persist BOTH: the id (a broker that replaces rather than amends
+        # hands back a new one) and the stop, so a restart rehydrates against
+        # what is actually resting at the broker rather than the entry stop.
+        fields = {"stop_loss": round(stop, 2)}
+        if new_id and new_id != trade.get("broker_gtt_id"):
+            trade["broker_gtt_id"] = new_id
+            fields["broker_gtt_id"] = new_id
+        self.db.update_trade_fields(trade["trade_id"], self.environment, fields)
+        self.state.push_log(
+            f"{inst.symbol}: broker-side stop moved to {stop:.2f}.")
+
     def _manage_open(self, inst: Instrument, live_price: float) -> bool:
         """Returns True if the position was closed on this tick."""
         # .get() not [] — a manual close on the UI thread may have removed this
@@ -1228,6 +1319,7 @@ class TradingEngine:
         if trade is None:
             return False
         trade["_live_price"] = live_price
+        self._resync_protection(inst, trade)
         exit_price, reason = None, ""
 
         # Direction-aware by necessity: a SHORT's stop sits ABOVE its entry and its
@@ -1375,10 +1467,24 @@ class TradingEngine:
         """
         if self.environment == Environment.LIVE:
             gtt_id = trade.get("broker_gtt_id")
-            if gtt_id and self.broker.cancel_oco_exit(gtt_id):
-                self.state.push_log(
-                    f"{inst.symbol}: cancelled broker-side SL/TP protection "
-                    f"(GTT {gtt_id}).")
+            if gtt_id:
+                if self.broker.cancel_oco_exit(gtt_id):
+                    self.state.push_log(
+                        f"{inst.symbol}: cancelled broker-side SL protection "
+                        f"({gtt_id}).")
+                else:
+                    # Usually harmless — the order is gone because it already
+                    # triggered, which is precisely why we are closing. But it
+                    # can also mean a live order is still resting, and a
+                    # resting exit order with no position behind it opens a
+                    # fresh naked one. Say so loudly; the already-flat check
+                    # below is what actually keeps us from double-exiting.
+                    self.state.push_log(
+                        f"⚠️ {inst.symbol}: broker-side SL protection "
+                        f"({gtt_id}) could not be cancelled — it has most "
+                        f"likely already triggered. Verify no stray exit "
+                        f"order is left resting at the broker.")
+            trade["_protected_stop"] = None
 
         already_flat = False
         if self.environment == Environment.LIVE:
@@ -1432,6 +1538,8 @@ class TradingEngine:
             self.state.unrealized_pnl = 0.0
             self.state.day_pnl = 0.0
             self.state.daily_pnl = []
+            self.state.strategy_pnl = []
+            self.state.daily_strategy_pnl = []
             self.state.trading_day = self.db.today_key()
             self.state.risk_status = {}
         self.state.push_log(
