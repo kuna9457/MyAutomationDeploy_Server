@@ -278,7 +278,9 @@ def set_symbol_config(req: SymbolConfigRequest):
             trade_days=req.trade_days, trade_hours=req.trade_hours,
             start_time=req.start_time, end_time=req.end_time,
             risk_reward=req.risk_reward,
-            square_off_at_end=req.square_off_at_end))
+            square_off_at_end=req.square_off_at_end,
+            trail_enabled=req.trail_enabled,
+            trail_atr_mult=req.trail_atr_mult))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     symbol_config.set_symbol(mode, req.symbol, cfg)

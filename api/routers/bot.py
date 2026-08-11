@@ -221,8 +221,19 @@ def bot_status(user: CurrentUser = Depends(get_current_user)):
     }
     # A client is told which phase is running, never which strategy runs it
     # (same reasoning as /config/client-modes). Admin still gets both.
+    run_config = dict(eng.run_config)
     if user.role != "client":
         out["strategy"] = {"key": eng.strategy.key, "name": eng.strategy.name}
+    elif run_config:
+        # Same withholding applied to the snapshot, or the panel would leak
+        # via run_config exactly what `strategy` is being kept back above.
+        # The tuning knobs go too: they describe HOW the strategy decides,
+        # which is the same secret by another name. What a client keeps is
+        # what governs their own money and their own session.
+        for secret in ("strategy", "atr_sl_mult", "atr_period", "min_score",
+                       "entry_skip_minutes", "use_limit_entry"):
+            run_config.pop(secret, None)
+    out["run_config"] = run_config
     return out
 
 
@@ -292,6 +303,17 @@ def broker_positions(user: CurrentUser = Depends(get_current_user)):
     if eng is None:
         return []
     return eng.broker_positions()
+
+
+@router.get("/broker-protection")
+def broker_protection(user: CurrentUser = Depends(get_current_user)):
+    """The SL/TP orders actually resting at the broker right now. Read-only,
+    scoped to the caller's own engine (hence their own broker token), so this
+    can never surface another account's orders."""
+    eng = engine_registry.get_engine(user.username)
+    if eng is None:
+        return []
+    return eng.broker_protection()
 
 
 @router.post("/positions/{symbol}/close")

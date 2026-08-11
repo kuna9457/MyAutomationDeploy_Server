@@ -9,16 +9,24 @@ touching the strategy that trades it:
      "limit losses by not trading the chop" control — plus an optional
      square-off when that window ends.
   3. ITS OWN RISK:REWARD, chosen from config.RR_CHOICES.
+  4. WHETHER ITS STOP TRAILS behind the best price reached (ATR chandelier).
 
 Design contract, and the whole reason this module is separate from strategy.py:
 
   * OPT-IN. A symbol with no saved entry, or one saved at every default, is a
     NO-OP — `rules_for()` never even returns an entry for it, so the engine's
     hot path is a dict miss and behaves exactly as it did before this existed.
-  * ENTRY-SIDE ONLY. Nothing here can suppress the management of a position
-    that is already open: stop-loss, target and time-exit are untouched. The
-    window gates whether a NEW position may be opened (plus the explicit,
-    default-off square_off_at_end).
+  * ENTRY-SIDE BY DEFAULT. The day/hour rules gate whether a NEW position may
+    be opened and can never suppress the management of one already open.
+    There are exactly TWO management-side settings, and both are explicit and
+    default-off, so neither can act on a symbol that has not asked for it:
+    `square_off_at_end` (closes at the window's end) and `trail_enabled`
+    (moves the stop). Anything added here later must clear the same bar.
+  * A TRAIL CAN ONLY REDUCE RISK. engine._apply_trail ratchets in one
+    direction only, never widens the stop, and never moves it past the live
+    price. Quantity is fixed at entry and is never revisited, so a trail
+    cannot breach Immutable Rule #1's risk cap — it can only shrink the
+    distance the position is still exposed over.
   * RISK IS UNTOUCHABLE. risk_reward moves the TARGET only. Position size is
     risk_budget / stop_distance and never reads RR (Immutable Rule #1), so a
     per-symbol RR can never widen risk per trade. The value is validated
@@ -47,6 +55,9 @@ _lock = threading.Lock()
 #: Weekday numbers as Python's datetime.weekday() reports them.
 MONDAY, SUNDAY = 0, 6
 WEEKDAY_LABELS: tuple[str, ...] = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+#: Upper sanity bound for SymbolConfig.trail_atr_mult — see validate().
+TRAIL_MULT_MAX = 20.0
 
 
 # --------------------------------------------------------------------------- #
@@ -81,13 +92,32 @@ class SymbolConfig:
     #: False: without it this module only ever gates new entries, which is the
     #: conservative reading of "don't change how the bot behaves".
     square_off_at_end: bool = False
+    #: Trail this symbol's stop behind the best price reached (ATR chandelier —
+    #: see engine._apply_trail). Default False, so an unconfigured symbol keeps
+    #: the fixed stop it was entered with.
+    #:
+    #: This is the SECOND management-side exception to this module's
+    #: entry-side-only rule, and it is deliberately shaped like the first
+    #: (square_off_at_end): explicit, opt-in, default-off, and incapable of
+    #: doing anything unless switched on. It can only ever move a stop in the
+    #: risk-REDUCING direction — never wider, never past the live price — so it
+    #: cannot breach Immutable Rule #1's risk cap.
+    trail_enabled: bool = False
+    #: ATR multiple the trailing stop sits behind the peak. 0.0 = inherit the
+    #: strategy's own `atr_sl_mult`, which is the same multiple its entry stop
+    #: was built from, so the trail starts out consistent with that stop.
+    trail_atr_mult: float = 0.0
 
     def is_noop(self) -> bool:
         """True when this entry would change nothing — used to DELETE rather
         than store it, so 'reset to default' leaves no residue on disk."""
+        # NOTE: trail_atr_mult alone is NOT enough to make an entry live — it
+        # is inert unless trail_enabled is set, so a stray multiple left behind
+        # by a toggled-off trail must still count as a no-op and be deleted.
         return (not self.trade_days and not self.trade_hours
                 and not self.start_time and not self.end_time
-                and not self.risk_reward and not self.square_off_at_end)
+                and not self.risk_reward and not self.square_off_at_end
+                and not self.trail_enabled)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +200,20 @@ def validate(cfg: SymbolConfig) -> SymbolConfig:
             f"{', '.join(config.rr_label(c) for c in config.RR_CHOICES)}, "
             f"or 0 to inherit.")
 
+    try:
+        trail_mult = float(cfg.trail_atr_mult or 0.0)
+    except (TypeError, ValueError):
+        raise ValueError("Trail ATR multiple must be a number.")
+    # A NEGATIVE multiple would put a long's trailing stop ABOVE the peak —
+    # i.e. above the live price — which is an instant, fictitious stop-out at
+    # a price the market never traded. Rejected outright rather than clamped,
+    # so a typo is visible instead of silently reinterpreted. The upper bound
+    # is a sanity rail: beyond ~20 ATR the trail can never bind anyway.
+    if trail_mult < 0 or trail_mult > TRAIL_MULT_MAX:
+        raise ValueError(
+            f"Trail ATR multiple {trail_mult:g} is out of range — use 0 "
+            f"(inherit the strategy's own) up to {TRAIL_MULT_MAX:g}.")
+
     return SymbolConfig(
         trade_days=days,
         trade_hours=hours,
@@ -180,6 +224,11 @@ def validate(cfg: SymbolConfig) -> SymbolConfig:
         end_time="" if hours else (end.strftime("%H:%M") if end else ""),
         risk_reward=rr,
         square_off_at_end=bool(cfg.square_off_at_end),
+        trail_enabled=bool(cfg.trail_enabled),
+        # Dropped when the trail is off, for the same reason hours supersede
+        # the legacy window: storage should describe what actually happens, and
+        # a multiple with no trail behind it describes nothing.
+        trail_atr_mult=trail_mult if cfg.trail_enabled else 0.0,
     )
 
 
@@ -198,6 +247,19 @@ class SymbolRules:
     end_t: Optional[time]
     risk_reward: float
     square_off_at_end: bool
+    trail_enabled: bool = False
+    trail_atr_mult: float = 0.0
+
+    def trail_mult(self, strategy_atr_sl_mult: float) -> float:
+        """The ATR multiple to trail behind the peak, or 0.0 when this symbol
+        does not trail at all. Falls back to the strategy's own `atr_sl_mult`
+        so an enabled-but-unconfigured trail sits exactly as far behind the
+        peak as the entry stop sat behind the entry."""
+        if not self.trail_enabled:
+            return 0.0
+        if self.trail_atr_mult > 0:
+            return self.trail_atr_mult
+        return max(float(strategy_atr_sl_mult or 0.0), 0.0)
 
     def day_allowed(self, when: datetime) -> bool:
         """No configured days = every day allowed (the unfiltered default)."""
@@ -255,6 +317,10 @@ class SymbolRules:
                                   if self.square_off_at_end else ""))
         if self.risk_reward > 0:
             bits.append(f"RR {config.rr_label(self.risk_reward)}")
+        if self.trail_enabled:
+            bits.append("trailing SL"
+                        + (f" {self.trail_atr_mult:g}×ATR"
+                           if self.trail_atr_mult > 0 else " (strategy ATR×)"))
         return f"{self.symbol}: " + ", ".join(bits)
 
 
@@ -276,6 +342,8 @@ def to_rules(symbol: str, cfg: SymbolConfig) -> Optional[SymbolRules]:
         end_t=parse_hhmm(cfg.end_time),
         risk_reward=float(cfg.risk_reward or 0.0),
         square_off_at_end=bool(cfg.square_off_at_end),
+        trail_enabled=bool(cfg.trail_enabled),
+        trail_atr_mult=float(cfg.trail_atr_mult or 0.0),
     )
 
 

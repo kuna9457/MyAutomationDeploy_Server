@@ -197,6 +197,11 @@ class SymbolConfigRequest(BaseModel):
     risk_reward: float = 0.0
     #: Close an open position when the window ends. Default off.
     square_off_at_end: bool = False
+    #: Trail this symbol's stop behind the best price reached. Default off.
+    trail_enabled: bool = False
+    #: ATR multiple the trail sits behind the peak. 0 = inherit the strategy's
+    #: own atr_sl_mult. Ignored entirely unless trail_enabled.
+    trail_atr_mult: float = 0.0
 
 
 class PresetSaveRequest(BaseModel):

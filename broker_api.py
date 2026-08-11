@@ -250,6 +250,37 @@ class BaseBroker:
         nothing open. Only Zerodha implements this today."""
         return []
 
+    def get_protective_orders(self) -> list[dict]:
+        """EVERY protective SL/TP the broker is currently HOLDING — read back
+        from the broker itself, not from what this bot believes it armed. The
+        companion to get_all_positions: that answers "what do I hold", this
+        answers "what is actually guarding it".
+
+        Deliberately a fresh read rather than a mirror of `broker_gtt_id`,
+        because the two can disagree in exactly the cases that matter — a GTT
+        cancelled by hand in Kite, one that fired while this bot was offline,
+        or a stray leg left resting after the "could not be cancelled" warning
+        in engine._close_position. Reading the broker is the only way to see
+        those.
+
+        Shape per entry:
+          {"symbol": str,     # the BROKER's own tradingsymbol, so this joins
+                              # to get_all_positions()["symbol"] directly
+           "side": str,       # the PROTECTIVE order's side (the exit side —
+                              # opposite the position it guards)
+           "quantity": int,
+           "kind": "GTT"|"SLM",
+           "stop": float,     # 0.0 when this mechanism carries no stop leg
+           "target": float,   # 0.0 when it carries no target leg (SL-M never
+                              # does — see place_oco_exit)
+           "status": str,     # broker's own word ("active", "TRIGGER PENDING")
+           "id": str}         # namespaced handle, matches trade.broker_gtt_id
+
+        Empty list if unavailable. Only Zerodha implements this today; every
+        other broker inherits this no-op, and the UI simply shows no
+        broker-side protection for them."""
+        return []
+
     def square_off(
         self, instrument: Instrument, side: str, quantity: int,
         ref_price: float = 0.0,
@@ -1002,6 +1033,109 @@ class ZerodhaBroker(BaseBroker):
             return out
         except Exception:
             return []
+
+    @staticmethod
+    def _classify_leg(trigger: float, ref: float, exit_side: str) -> str:
+        """"stop" or "target" for one GTT leg.
+
+        Decided by which SIDE of the reference price the trigger sits on, not
+        by leg order — that way a GTT created by hand in Kite (whose legs we
+        never sorted) reads correctly too. For a long the exit is a SELL, so a
+        trigger BELOW the reference is the stop and one above is the target;
+        for a short both tests invert.
+        """
+        below = trigger < ref
+        if exit_side == "SELL":               # guarding a LONG
+            return "stop" if below else "target"
+        return "target" if below else "stop"  # guarding a SHORT
+
+    def _gtt_to_row(self, g: dict) -> Optional[dict]:
+        """One get_gtts() entry -> one get_protective_orders() row, or None if
+        it isn't a live protective trigger we can make sense of."""
+        cond = g.get("condition") or {}
+        legs = g.get("orders") or []
+        triggers = [float(t) for t in (cond.get("trigger_values") or [])]
+        if not legs or not triggers:
+            return None
+        exit_side = str(legs[0].get("transaction_type", "") or "").upper()
+        # The price the trigger was set against — the only neutral reference
+        # for telling a stop from a target (see _classify_leg).
+        ref = float(cond.get("last_price", 0) or 0)
+        stop = target = 0.0
+        if ref > 0:
+            for trig in triggers:
+                if self._classify_leg(trig, ref, exit_side) == "stop":
+                    stop = trig
+                else:
+                    target = trig
+        # No usable reference, or both legs classified the same way (possible
+        # if the market gapped clean through one side before we read it): fall
+        # back to the ordering _gtt_legs guarantees — ascending trigger, so the
+        # lower one is the stop for a long and the target for a short.
+        if len(triggers) == 2 and (stop == 0.0 or target == 0.0):
+            lo, hi = min(triggers), max(triggers)
+            stop, target = (lo, hi) if exit_side == "SELL" else (hi, lo)
+        return {
+            "symbol": cond.get("tradingsymbol", ""),
+            "side": exit_side,
+            "quantity": int(legs[0].get("quantity", 0) or 0),
+            "kind": "GTT",
+            "stop": stop,
+            "target": target,
+            "status": str(g.get("status", "") or ""),
+            "id": _prot_encode(PROT_GTT, str(g.get("id", ""))),
+        }
+
+    def get_protective_orders(self) -> list[dict]:
+        """Both mechanisms in one list — GTT OCOs (commodity/NRML) and resting
+        SL-M orders (equity/MIS). See place_oco_exit for why the two differ.
+
+        Each source is fetched in its own try/except so one failing API (or an
+        older kiteconnect without get_gtts) still returns the other rather
+        than an empty panel that would wrongly read as "nothing is guarded".
+        """
+        if self._kite is None:
+            return []
+        out: list[dict] = []
+
+        try:
+            for g in self._kite.get_gtts() or []:
+                # Only triggers still capable of firing. A "triggered" or
+                # "cancelled" GTT is history and would be alarming noise in a
+                # panel whose whole job is "what is guarding me RIGHT NOW".
+                if str(g.get("status", "")).lower() != "active":
+                    continue
+                row = self._gtt_to_row(g)
+                if row is not None and row["symbol"]:
+                    out.append(row)
+        except Exception:
+            pass
+
+        try:
+            # A resting SL/SL-M sits at "TRIGGER PENDING" until its trigger is
+            # hit; anything else is filled, cancelled or rejected and is no
+            # longer protection.
+            for o in self._kite.orders() or []:
+                if str(o.get("status", "")).upper() != "TRIGGER PENDING":
+                    continue
+                if str(o.get("order_type", "")).upper() not in ("SL", "SL-M"):
+                    continue
+                out.append({
+                    "symbol": o.get("tradingsymbol", ""),
+                    "side": str(o.get("transaction_type", "") or "").upper(),
+                    "quantity": int(o.get("quantity", 0) or 0),
+                    "kind": "SLM",
+                    "stop": float(o.get("trigger_price", 0) or 0),
+                    # An SL-M carries no target leg at all — the engine's
+                    # polling loop owns the take-profit for equity.
+                    "target": 0.0,
+                    "status": str(o.get("status", "") or ""),
+                    "id": _prot_encode(PROT_ORDER, str(o.get("order_id", ""))),
+                })
+        except Exception:
+            pass
+
+        return out
 
 
 # --------------------------------------------------------------------------- #

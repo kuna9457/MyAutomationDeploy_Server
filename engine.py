@@ -231,6 +231,10 @@ class TradingEngine:
         # accounts on different cutoffs never share a decision.
         self.square_off_time = square_off_time
         self.square_off_enabled = square_off_enabled
+        # Frozen at start() — see _snapshot_run_config. Empty until then, so a
+        # status read on a constructed-but-unstarted engine is simply blank
+        # rather than describing a run that has not begun.
+        self.run_config: dict = {}
         # The Scalper trades 1-minute bars with a 7-minute time exit, so a 3s loop
         # would be a meaningful share of the whole trade. Poll sub-second there.
         self.poll_seconds = poll_seconds or (
@@ -255,6 +259,9 @@ class TradingEngine:
         # Cache of broker.get_all_positions() (the full broker-truth position
         # book, for the dashboard's Broker Positions panel) — same TTL.
         self._all_positions_cache: tuple[float, list] = (0.0, [])
+        # Cache of broker.get_protective_orders() (the SL/TP actually resting
+        # at the broker, for the same panel's SL/TP columns) — same TTL.
+        self._protection_cache: tuple[float, list] = (0.0, [])
 
         # LIVE-only risk-guardrail bookkeeping (risk_manager.py). Trades-today is
         # rebuilt from storage on start (see _rehydrate), not just counted
@@ -469,10 +476,61 @@ class TradingEngine:
             self.state.push_log(
                 f"🔗 Sharing one market-data feed and one signal calculation "
                 f"with {self._runner.account_count()} other account(s).")
+        self.run_config = self._snapshot_run_config()
 
         # LAST: now that positions, PnL and limits are all restored, start
         # receiving events.
         self._runner.subscribe(self)
+
+    def _snapshot_run_config(self) -> dict:
+        """FREEZE the settings this run actually started with, for the
+        dashboard's "what is running right now" panel.
+
+        The point is that it is a SNAPSHOT, not a live read. Admin's saved
+        config, a symbol's per-stock settings and a loaded preset can all
+        change while a bot is running, and none of those changes reach a
+        running engine — it keeps the params, instruments and SymbolRules it
+        was constructed with. Rendering the CURRENT saved config would
+        therefore quietly show settings the bot is not using, which is the
+        exact confusion this panel exists to remove.
+
+        Taken at the end of start(), so every override (admin's RR, the score
+        threshold, per-symbol rules) is already resolved and this records what
+        was really applied rather than what was requested.
+        """
+        p = self.params
+        return {
+            "started_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+            "environment": self.environment.value,
+            "mode": self.mode.value,
+            "broker": self.broker.name,
+            "strategy": {"key": self.strategy.key, "name": self.strategy.name},
+            "timeframe": p.timeframe,
+            "capital": float(self.total_capital),
+            "risk_per_trade_pct": round(p.risk_per_trade * 100, 3),
+            "risk_reward": float(p.risk_reward),
+            "atr_sl_mult": float(p.atr_sl_mult),
+            "atr_period": int(p.atr_period),
+            "min_score": float(p.cs_min_score),
+            "max_hold_minutes": int(p.max_hold_minutes),
+            "entry_skip_minutes": int(p.entry_skip_minutes),
+            "allow_short": bool(p.allow_short),
+            "use_limit_entry": bool(p.use_limit_entry),
+            "square_off_enabled": bool(self.square_off_enabled),
+            "square_off_time": self.square_off_time or "",
+            "instruments": [i.symbol for i in self.instruments],
+            # Only the lots that actually apply to THIS run's instruments — the
+            # stored map can carry symbols this run never selected.
+            "mcx_lots": {i.symbol: self.mcx_lots.get(i.symbol, 1)
+                         for i in self.instruments
+                         if i.segment == Segment.MCX},
+            # One line per symbol that deviates from the row above, in the same
+            # words the start-up log uses (SymbolRules.describe), so the panel
+            # and the log can never tell different stories.
+            "symbol_overrides": sorted(r.describe()
+                                       for r in self.symbol_rules.values()),
+            "shared_with": self._runner.account_count(),
+        }
 
     def stop(self) -> None:
         # Leave the shared decider. It keeps running for whoever else is on
@@ -659,7 +717,7 @@ class TradingEngine:
                 and not (rules.day_allowed(ev.now_dt)
                          and rules.window_open(ev.now_dt.time()))):
             return self._close_for_window(inst, ev.live_price, rules)
-        return self._manage_open(inst, ev.live_price)
+        return self._manage_open(inst, ev.live_price, ev.atr)
 
     def on_exit(self, inst: Instrument, price: float, reason: str) -> bool:
         """Platform-wide exit fired by the runner, so every account leaves the
@@ -1263,9 +1321,9 @@ class TradingEngine:
         """Keep the broker's resting stop equal to the one this engine manages
         to. Called every tick for every open position, and a NO-OP on all of
         them unless something has actually moved `stop_loss` since the order
-        was armed — which nothing does today. This is the hook a trailing stop
-        plugs into: move `trade["stop_loss"]`, and the broker-side order
-        follows on the next tick with no further wiring.
+        was armed. Today that something is `_apply_trail`, which runs
+        immediately before this on the same tick; anything else that moves
+        `trade["stop_loss"]` gets the broker-side follow-up for free.
 
         Never raises and never blocks the exit checks that follow it. If the
         re-arm fails, the OLD broker-side stop stays exactly where it was —
@@ -1311,7 +1369,89 @@ class TradingEngine:
         self.state.push_log(
             f"{inst.symbol}: broker-side stop moved to {stop:.2f}.")
 
-    def _manage_open(self, inst: Instrument, live_price: float) -> bool:
+    def _apply_trail(self, inst: Instrument, trade: dict, live_price: float,
+                     atr: float) -> None:
+        """ATR chandelier trailing stop — OPT-IN PER SYMBOL, default off.
+
+            LONG : stop = max(stop, peak   - mult × ATR)
+            SHORT: stop = min(stop, trough + mult × ATR)
+
+        `peak`/`trough` is the best price this position has SEEN, tracked from
+        the live price (the same price the stop is actually fired against —
+        see _manage_open), not from candle highs, so the trail cannot lag the
+        exit check that follows it.
+
+        Four invariants, each one load-bearing:
+
+        1. RATCHET ONLY. The stop moves toward the price and never away, so a
+           trail can only ever shrink the distance still at risk. Quantity was
+           fixed at entry and is never revisited, so this cannot widen risk
+           per trade — Immutable Rule #1 holds by construction, not by check.
+        2. NEVER *MOVED* PAST THE LIVE PRICE. A stop dragged above the current
+           price (for a long) would be "hit" instantly by the check below and
+           book an exit at a price the market never traded — a fictitious
+           profit — so a move is clamped one tick to the safe side. Reachable
+           mainly when ATR CONTRACTS, which lifts the chandelier faster than
+           price. Note this bounds where the trail may MOVE a stop to, not
+           where a stop may end up: if price GAPS through an
+           already-ratcheted stop, that stop is correctly left where it is and
+           the ordinary stop-out fires. Lowering it to chase the gap would
+           loosen a stop the position had already earned, which is worse.
+        3. NEVER PAST THE TARGET. Beyond it the target closes the trade first,
+           so moving the stop there only risks the two crossing.
+        4. TICK-SNAPPED THE SAFE WAY — floor for a long, ceil for a short, the
+           same direction _enter rounds its entry stop. Rounding always lands
+           on the looser side of the computed level, never a hair tighter.
+
+        A no-op unless the symbol opted in AND the runner supplied a usable
+        ATR, so an unconfigured symbol keeps its fixed entry stop exactly as
+        before this existed.
+        """
+        rules = self.symbol_rules.get(inst.symbol)
+        if rules is None or atr <= 0:
+            return
+        mult = rules.trail_mult(self.params.atr_sl_mult)
+        if mult <= 0:
+            return
+
+        side = trade["side"]
+        tick = inst.tick_size or 0.05
+        stop = float(trade["stop_loss"])
+        target = float(trade["target"])
+        # Seeded from the entry, so a position that has only ever gone against
+        # us trails from where it started rather than from a worse price.
+        peak = float(trade.get("_trail_peak", trade["entry_price"]))
+
+        if side == "BUY":
+            peak = max(peak, live_price)
+            trade["_trail_peak"] = peak
+            new_stop = math.floor((peak - mult * atr) / tick) * tick
+            new_stop = min(new_stop, live_price - tick, target - tick)
+            if new_stop <= stop + tick / 2:          # not a real improvement
+                return
+        else:
+            peak = min(peak, live_price)
+            trade["_trail_peak"] = peak
+            new_stop = math.ceil((peak + mult * atr) / tick) * tick
+            new_stop = max(new_stop, live_price + tick, target + tick)
+            if new_stop >= stop - tick / 2:
+                return
+
+        new_stop = round(new_stop, 2)
+        trade["stop_loss"] = new_stop
+        # Persist immediately, and independently of whether the broker-side
+        # re-arm below succeeds: this is the stop the bot now manages to, and a
+        # restart must rehydrate against it rather than the original entry stop.
+        self.db.update_trade_fields(
+            trade["trade_id"], self.environment, {"stop_loss": new_stop})
+        locked = (new_stop - float(trade["entry_price"])) * (1 if side == "BUY" else -1)
+        self.state.push_log(
+            f"🔒 {inst.symbol}: trailing stop → {new_stop:.2f} "
+            f"({mult:g}×ATR behind {peak:.2f}"
+            f"{', now risk-free' if locked >= 0 else ''}).")
+
+    def _manage_open(self, inst: Instrument, live_price: float,
+                     atr: float = 0.0) -> bool:
         """Returns True if the position was closed on this tick."""
         # .get() not [] — a manual close on the UI thread may have removed this
         # position between the caller's membership check and here.
@@ -1319,6 +1459,11 @@ class TradingEngine:
         if trade is None:
             return False
         trade["_live_price"] = live_price
+        # Order matters: move the stop FIRST, then let _resync_protection push
+        # it to the broker on this same tick, then check the exits against the
+        # stop we just set. Trailing after the exit check would leave the
+        # broker armed one tick behind the engine for no reason.
+        self._apply_trail(inst, trade, live_price, atr)
         self._resync_protection(inst, trade)
         exit_price, reason = None, ""
 
@@ -1404,6 +1549,26 @@ class TradingEngine:
         self._all_positions_cache = (now, val)
         return val
 
+    def broker_protection(self) -> list[dict]:
+        """The SL/TP orders the BROKER is actually holding right now — read
+        back from the broker, not from our own `broker_gtt_id` bookkeeping, so
+        the panel can reveal drift between the two (a GTT cancelled by hand, a
+        leg that fired while this bot was offline, a stray order left resting).
+        Empty in Paper, or if the broker can't report it. Cached like
+        broker_positions()."""
+        if self.environment != Environment.LIVE or self.broker is None:
+            return []
+        now = _time.time()
+        ts, val = self._protection_cache
+        if now - ts < BROKER_POSITION_TTL_SECONDS:
+            return val
+        try:
+            val = self.broker.get_protective_orders()
+        except Exception:
+            val = []
+        self._protection_cache = (now, val)
+        return val
+
     def close_broker_position(self, symbol: str, quantity: int,
                               side: str) -> tuple[bool, str]:
         """Square off a REAL broker position directly, sourced from the
@@ -1431,12 +1596,14 @@ class TradingEngine:
             exit_price = float(tracked.get("_live_price", tracked["entry_price"]))
             pnl = self._finalize_close(inst, tracked, exit_price, "MANUAL")
             self._all_positions_cache = (0.0, [])   # force a fresh read next time
+            self._protection_cache = (0.0, [])      # its GTT was just cancelled
             return True, f"Closed tracked position ({pnl:+,.2f} PnL)."
 
         # Not tracked by this bot at all — square off directly; nothing in our
         # own DB describes it, so there is nothing to update there.
         res = self.broker.square_off(inst, side, quantity, 0.0)
         self._all_positions_cache = (0.0, [])       # force a fresh read next time
+        self._protection_cache = (0.0, [])
         if res.ok:
             self.state.push_log(
                 f"{symbol}: closed an UNTRACKED broker position ({side} "

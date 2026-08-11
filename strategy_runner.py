@@ -48,7 +48,7 @@ from typing import Any, Optional, Protocol
 import config
 from config import Instrument, Mode, market_hours_for_segment, now_ist
 from data_feed import LiveQuote, MarketDataFeed, SimulatedFeed, make_feed
-from strategy import BoundStrategy, Signal, run_strategy
+from strategy import BoundStrategy, Signal, atr as atr_series, run_strategy
 
 # A tick older than this during market hours means the stream has stalled; we
 # stop calling it "live" in the UI rather than pricing PnL off stale data.
@@ -77,6 +77,13 @@ class TickEvent:
     market_open: bool
     bar_ts: Any
     now_dt: datetime
+    #: Current ATR for this instrument, or 0.0 when nothing needs it. Computed
+    #: HERE, once per poll, and handed to every account — an indicator is a
+    #: DECIDING input (Immutable Rule #4), so N accounts holding the same
+    #: symbol must never each recompute it and risk disagreeing. Only consumed
+    #: by engine._apply_trail today; 0.0 means "no trailing symbol on this
+    #: instrument", and the trail is then a no-op for every account.
+    atr: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -329,7 +336,8 @@ class StrategyRunner:
             # exit, unchanged. This runs BEFORE the runner's own reference
             # trigger below so single-account behaviour is exactly what it was
             # before this split.
-            ev = TickEvent(inst, quote, live_price, market_open, bar_ts, now_dt)
+            ev = TickEvent(inst, quote, live_price, market_open, bar_ts,
+                           now_dt, self._trail_atr(inst, df, rules))
             closed = self._broadcast(lambda a, e=ev: a.on_tick(e), accounts)
             if any(closed) and bar_ts is not None:
                 self._last_action_bar[inst.symbol] = bar_ts
@@ -560,6 +568,30 @@ class StrategyRunner:
                 acct,
                 f"⏸️ {symbol}: new entries paused — {reason} (custom settings). "
                 f"Open positions are still managed normally.")
+
+    def _trail_atr(self, inst: Instrument, df, rules) -> float:
+        """ATR for TickEvent.atr — 0.0 unless this symbol actually trails.
+
+        Gated on the symbol's own rules so the cost is paid only by symbols
+        that opted in: every other instrument skips the calculation entirely
+        and its accounts receive 0.0, which makes _apply_trail a no-op. That
+        keeps a feature nobody has switched on off the hot path completely,
+        the same way rules_for() keeps unconfigured symbols off it.
+
+        Never raises — a short or malformed frame yields 0.0, and a position
+        then simply keeps the fixed stop it was entered with.
+        """
+        if rules is None or not rules.trail_enabled:
+            return 0.0
+        period = max(int(getattr(self.params, "atr_period", 14) or 14), 1)
+        if df is None or df.empty or len(df) < period + 2:
+            return 0.0
+        try:
+            value = float(atr_series(df, period).iloc[-1])
+        except Exception:
+            return 0.0
+        # NaN fails every comparison, so this rejects it too.
+        return value if value > 0 else 0.0
 
     @staticmethod
     def _live_price(quote: Optional[LiveQuote], df) -> tuple[Optional[float], str]:
