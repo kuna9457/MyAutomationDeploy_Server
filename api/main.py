@@ -37,7 +37,7 @@ from fastapi.security import OAuth2PasswordRequestForm  # noqa: E402
 from api.auth import (CurrentUser, TokenResponse, authenticate,  # noqa: E402
                       create_access_token, get_current_user)
 from api.routers import (account, admin_users, auditor, backtest,  # noqa: E402
-                         bot, broker, config_router, risk, trades)
+                         bot, broker, chart, config_router, risk, trades)
 
 app = FastAPI(title="Trading Bot API")
 
@@ -82,3 +82,5 @@ app.include_router(account.router)
 # READ-ONLY LLM review of past trades. Imports nothing from the trading path and
 # cannot act — see AI_AUDITOR_PLAN.md.
 app.include_router(auditor.router)
+# Trade replay: candles a trade was taken on, with the trade drawn over them.
+app.include_router(chart.router)
