@@ -14,6 +14,8 @@ import admin_config
 import config
 import mailer
 import presets
+import strategy
+import strategy_groups
 import symbol_config
 import user_manager
 from admin_config import BotConfig
@@ -23,7 +25,7 @@ from api.schemas import (AdminConfigRequest, ClientModesRequest,
                          CreateClientRequest, PresetSaveRequest,
                          RangeResetRequest, SetEmailRequest,
                          SetPasswordRequest, SetStatusRequest,
-                         SymbolConfigRequest)
+                         StrategyGroupsRequest, SymbolConfigRequest)
 from config import Environment, Mode
 from db_manager import DBManager
 from fastapi import APIRouter, Depends, HTTPException
@@ -381,6 +383,53 @@ def load_preset(name: str):
 def delete_preset(name: str):
     presets.delete(name)
     return list_presets()
+
+
+@router.get("/strategy-groups")
+def get_strategy_groups(mode: str):
+    """This mode's strategy board: which strategy trades which stocks. An
+    empty list means no board — the bot runs the single strategy picked in the
+    sidebar, exactly as before this existed."""
+    from dataclasses import asdict as _asdict
+    return [_asdict(g) for g in strategy_groups.get_all(_valid_mode(mode))]
+
+
+@router.put("/strategy-groups")
+def set_strategy_groups(req: StrategyGroupsRequest):
+    """Replace this mode's whole board in one write.
+
+    Wholesale rather than per-group because dragging a stock from one strategy
+    to another changes TWO groups at once; saving them separately could persist
+    half a move.
+    """
+    mode = _valid_mode(req.mode)
+    known = {s.key for s in strategy.strategies_for_mode(Mode(mode))}
+    incoming = [strategy_groups.StrategyGroup(
+        strategy_key=g.strategy_key, symbols=g.symbols, mcx_lots=g.mcx_lots,
+        risk_reward=g.risk_reward, min_score=g.min_score, enabled=g.enabled)
+        for g in req.groups]
+    unsupported = [g.strategy_key for g in incoming
+                   if g.strategy_key and g.strategy_key not in known]
+    if unsupported:
+        # resolve_strategy() silently falls back to the mode default for a
+        # key that doesn't support the mode, so an unchecked board could run a
+        # strategy nobody chose. Rejected here instead.
+        raise HTTPException(
+            400, f"Not available in {mode}: {', '.join(unsupported)}.")
+    try:
+        clean = strategy_groups.validate(incoming, mode)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    strategy_groups.replace_mode(mode, clean)
+    return get_strategy_groups(mode)
+
+
+@router.put("/config/auto-start-clients")
+def set_auto_start_clients(enabled: bool) -> BotConfig:
+    """Whether admin's Start Bot also publishes that run to clients and starts
+    them (admin_config.auto_start_clients). Off leaves the client config and
+    every client bot exactly as they are."""
+    return admin_config.set_auto_start_clients(enabled)
 
 
 @router.put("/config/client-modes")

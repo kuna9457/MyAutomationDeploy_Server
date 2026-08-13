@@ -63,6 +63,54 @@ class BacktestRequest(BaseModel):
     #: measure a score change on real history BEFORE putting it in front of
     #: the market — same symbol, same window, one variable moved.
     min_score: float = 0.0
+    #: BACKTEST-ONLY entry filters (backtester.TradeFilters). All empty/BOTH =
+    #: unrestricted, which is the original behaviour exactly. These gate
+    #: ENTRIES only; an open position is always managed to its exit.
+    #: Weekday numbers, Monday = 0.
+    trade_days: list[int] = []
+    #: IST hours 0-23; hour H covers H:00-H:59.
+    trade_hours: list[int] = []
+    #: "BOTH" | "BUY" | "SELL"
+    side: str = "BOTH"
+
+
+class BulkBacktestRequest(BaseModel):
+    """The same strategy and window across a bucket of symbols, ranked."""
+    tickers: list[str]
+    mode: str
+    strategy_key: str = ""
+    start: str
+    end: str
+    initial_capital: float = 100_000.0
+    risk_reward: float = 0.0
+    min_score: float = 0.0
+    trade_days: list[int] = []
+    trade_hours: list[int] = []
+    side: str = "BOTH"
+
+
+class RRSweepRequest(BaseModel):
+    """The same backtest run once per risk:reward in a ladder.
+
+    Everything except `risk_reward` is held constant, so the resulting table
+    isolates RR as the single variable. Bounds are enforced server-side
+    (backtester.rr_sweep_values) — a step of 0.001 would otherwise queue
+    thousands of full simulations.
+    """
+    ticker: str
+    mode: str
+    strategy_key: str = ""
+    start: str
+    end: str
+    initial_capital: float = 100_000.0
+    #: First RR to test (reward per 1 unit of risk, so 1.0 is 1:1).
+    rr_start: float = 1.0
+    #: How much to add each step.
+    rr_step: float = 0.25
+    #: Last RR to test, inclusive.
+    rr_end: float = 3.0
+    #: 0 = the strategy's own threshold. Held constant across the sweep.
+    min_score: float = 0.0
 
 
 class WatchlistSaveRequest(BaseModel):
@@ -202,6 +250,25 @@ class SymbolConfigRequest(BaseModel):
     #: ATR multiple the trail sits behind the peak. 0 = inherit the strategy's
     #: own atr_sl_mult. Ignored entirely unless trail_enabled.
     trail_atr_mult: float = 0.0
+
+
+class StrategyGroupPayload(BaseModel):
+    """One strategy and the stocks dropped onto it (strategy_groups.py)."""
+    strategy_key: str
+    symbols: list[str] = []
+    mcx_lots: dict[str, int] = {}
+    #: 0 = use the strategy's own. Validated against config.RR_CHOICES.
+    risk_reward: float = 0.0
+    #: 0 = use the strategy's own.
+    min_score: float = 0.0
+    enabled: bool = True
+
+
+class StrategyGroupsRequest(BaseModel):
+    """The WHOLE board for one mode. Replaces rather than merges — moving a
+    stock between strategies edits two groups at once."""
+    mode: str
+    groups: list[StrategyGroupPayload] = []
 
 
 class PresetSaveRequest(BaseModel):

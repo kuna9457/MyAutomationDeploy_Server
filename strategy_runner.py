@@ -122,6 +122,132 @@ class _Reference:
     opened_at: datetime
 
 
+# --------------------------------------------------------------------------- #
+#  Shared market-data feeds
+#
+#  A feed is identified by the DATA it carries — broker token and timeframe —
+#  never by the strategy consuming it. Two strategies on the same mode are
+#  looking at the identical candles, so they must share one socket.
+#
+#  This exists because the broker caps concurrent market-data WebSockets per
+#  user. With a feed per runner, a board of three strategies opened three
+#  sockets on one token: the first connected and the rest were refused and
+#  silently degraded to REST polling — so two thirds of the board traded on
+#  stale REST candles while the dashboard showed a healthy WebSocket for the
+#  first. One socket, many runners, is both correct and the only thing the
+#  broker will actually allow.
+#
+#  Ref-counted: the last runner to leave closes it. Instruments are the UNION
+#  of every borrower's needs.
+# --------------------------------------------------------------------------- #
+_feed_lock = threading.RLock()
+_feed_pool: dict[str, dict] = {}
+
+
+def feed_key(mode: Mode, feed_token: str) -> str:
+    """What must match for two runners to share a socket. NOT the strategy,
+    the instruments, or the RR — none of those change the ticks."""
+    return f"{mode.value}|{hash(feed_token)}"
+
+
+def acquire_feed(mode: Mode, feed_token: str, instruments: list[Instrument],
+                 log=None) -> tuple[MarketDataFeed, str]:
+    """Borrow the shared feed for this (mode, token), covering `instruments`.
+
+    Creates it on first use. If an existing feed does not already carry every
+    requested symbol it is RESTARTED on the union — a brief reconnect, and far
+    better than the alternative of a second socket that the broker refuses.
+    Call prewarm_feed() with the full set first to avoid that churn entirely.
+
+    Falls back to SimulatedFeed exactly as the per-runner path used to, so a
+    dead token still yields a running bot rather than an exception.
+    """
+    key = feed_key(mode, feed_token)
+    want = {i.symbol: i for i in instruments}
+    with _feed_lock:
+        entry = _feed_pool.get(key)
+        if entry is not None:
+            missing = [s for s in want if s not in entry["symbols"]]
+            if not missing:
+                entry["refs"] += 1
+                return entry["feed"], key
+            # Extend: restart the one socket on the union rather than opening
+            # a second one beside it.
+            merged = dict(entry["instruments"])
+            merged.update(want)
+            if log:
+                log(f"📡 Extending the shared feed with {', '.join(missing)} "
+                    f"({len(merged)} instruments).")
+            try:
+                entry["feed"].stop()
+            except Exception:
+                pass
+            feed = _build_feed(mode, feed_token, list(merged.values()), log)
+            entry.update(feed=feed, instruments=merged,
+                         symbols=set(merged), refs=entry["refs"] + 1)
+            return feed, key
+
+        feed = _build_feed(mode, feed_token, list(want.values()), log)
+        _feed_pool[key] = {"feed": feed, "refs": 1, "instruments": want,
+                           "symbols": set(want)}
+        return feed, key
+
+
+def _build_feed(mode: Mode, feed_token: str, instruments: list[Instrument],
+                log=None) -> MarketDataFeed:
+    """Construct and START one feed. Never raises — a live feed that cannot
+    start degrades to simulated, which is what the per-runner code did."""
+    feed = make_feed(prefer_real=bool(feed_token), access_token=feed_token,
+                     mode=mode)
+    try:
+        feed.start(instruments)
+        return feed
+    except Exception as exc:
+        if log:
+            log(f"⚠️ Live feed unavailable ({exc}); using simulated feed.")
+        feed = SimulatedFeed(mode=mode)
+        feed.start(instruments)
+        return feed
+
+
+def release_feed(key: str) -> None:
+    """Give the shared feed back. The socket closes only when the LAST
+    borrower leaves — stopping it while another runner is still reading would
+    silently strand that runner on empty candles."""
+    with _feed_lock:
+        entry = _feed_pool.get(key)
+        if entry is None:
+            return
+        entry["refs"] -= 1
+        if entry["refs"] > 0:
+            return
+        _feed_pool.pop(key, None)
+    try:
+        entry["feed"].stop()
+    except Exception:
+        pass
+
+
+def prewarm_feed(mode: Mode, feed_token: str, instruments: list[Instrument],
+                 log=None) -> str:
+    """Open the shared feed on the FULL instrument set before any runner
+    borrows it, and return its key.
+
+    Used when starting a whole strategy board: the union is known up front, so
+    warming once means every runner then finds a superset and just increments
+    the ref count — instead of N-1 restarts as each group discovers its symbols
+    are missing.
+
+    THE CALLER OWNS A REFERENCE and must pass the returned key to
+    release_feed() once every runner has started. That reference is what keeps
+    the feed alive across the gap between warming it and the first runner
+    borrowing it; without it a failure part-way through starting the board
+    would drop the socket to zero refs and close it.
+    """
+    _feed, key = acquire_feed(mode, feed_token, instruments, log)
+    return key
+
+
 class StrategyRunner:
     def __init__(
         self,
@@ -159,6 +285,9 @@ class StrategyRunner:
         self._squared_off_day = ""
 
         self.feed: Optional[MarketDataFeed] = None
+        #: Handle into the shared feed pool, held while running so stop() can
+        #: give the borrow back. "" when not started.
+        self._feed_key: str = ""
         self._accounts: list[Account] = []
         self._accounts_lock = threading.Lock()
         self._pool: Optional[ThreadPoolExecutor] = None
@@ -228,14 +357,11 @@ class StrategyRunner:
         if self.running:
             return
         self._stop.clear()
-        self.feed = make_feed(prefer_real=bool(self.feed_token),
-                              access_token=self.feed_token, mode=self.mode)
-        try:
-            self.feed.start(self.instruments)
-        except Exception as exc:
-            self._log(f"⚠️ Live feed unavailable ({exc}); using simulated feed.")
-            self.feed = SimulatedFeed(mode=self.mode)
-            self.feed.start(self.instruments)
+        # BORROW the shared feed rather than opening one. Several strategies on
+        # the same mode/token are reading identical candles, and the broker
+        # refuses a second concurrent market-data socket — see the feed pool.
+        self.feed, self._feed_key = acquire_feed(
+            self.mode, self.feed_token, self.instruments, self._log)
         self._pool = ThreadPoolExecutor(
             max_workers=MAX_DISPATCH_WORKERS,
             thread_name_prefix=f"dispatch-{self.key[:16]}")
@@ -246,8 +372,13 @@ class StrategyRunner:
     def stop(self) -> None:
         self._stop.set()
         self.running = False
-        if self.feed:
-            self.feed.stop()
+        # Hand the feed back rather than stopping it: another strategy group
+        # may still be reading it. release_feed closes the socket only when the
+        # last borrower leaves.
+        if self._feed_key:
+            release_feed(self._feed_key)
+            self._feed_key = ""
+        self.feed = None
         if self._pool is not None:
             self._pool.shutdown(wait=False)
             self._pool = None

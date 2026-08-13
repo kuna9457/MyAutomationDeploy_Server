@@ -23,6 +23,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -273,6 +274,84 @@ def synthetic_history(start: str, end: str, interval: str = "1d",
 
 
 # --------------------------------------------------------------------------- #
+#  Entry filters — BACKTEST ONLY
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class TradeFilters:
+    """Restrict WHEN and WHICH WAY new entries may open, for research.
+
+    Three deliberate properties:
+
+      * ENTRIES ONLY. An open position is managed to its stop/target/time-exit
+        on every bar regardless — a filter must never strand a position by
+        switching off the bars that would have closed it.
+      * EMPTY MEANS UNRESTRICTED. A default TradeFilters() changes nothing, and
+        run_backtest(filters=None) takes the identical code path it did before
+        this existed.
+      * BACKTEST ONLY. engine.py never reads this. The live equivalent is
+        symbol_config.py's per-symbol days/hours, which is a different feature
+        with a different scope (per symbol, and it can also square off).
+
+    `days` are Python weekday numbers (Monday = 0). `hours` are IST hours 0-23,
+    where hour H covers H:00-H:59 — so [9, 10] means 09:00-10:59.
+    """
+    days: frozenset[int] = frozenset()
+    hours: frozenset[int] = frozenset()
+    side: str = "BOTH"                      # "BOTH" | "BUY" | "SELL"
+
+    @property
+    def active(self) -> bool:
+        return bool(self.days or self.hours or self.side != "BOTH")
+
+    def allows_bar(self, ts) -> bool:
+        """May a NEW entry open on this bar's timestamp?"""
+        if self.days:
+            try:
+                if ts.weekday() not in self.days:
+                    return False
+            except AttributeError:          # non-datetime index; no day to test
+                return True
+        if self.hours:
+            try:
+                if ts.hour not in self.hours:
+                    return False
+            except AttributeError:
+                return True
+        return True
+
+    def allows_side(self, side: str) -> bool:
+        return self.side == "BOTH" or self.side == side
+
+    def describe(self) -> str:
+        bits = []
+        if self.days:
+            names = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+            bits.append("/".join(names[d] for d in sorted(self.days)))
+        if self.hours:
+            bits.append(", ".join(f"{h}:00" for h in sorted(self.hours)))
+        if self.side != "BOTH":
+            bits.append(f"{self.side} only")
+        return " · ".join(bits)
+
+
+def parse_filters(days=None, hours=None, side: str = "BOTH"
+                  ) -> Optional[TradeFilters]:
+    """Build a TradeFilters, or None when nothing is actually restricted.
+
+    Returning None for the unrestricted case keeps the "no filters means the
+    original code path" property honest at the call site rather than relying on
+    every branch below to check `.active`.
+    """
+    day_set = frozenset(int(d) for d in (days or []) if 0 <= int(d) <= 6)
+    hour_set = frozenset(int(h) for h in (hours or []) if 0 <= int(h) <= 23)
+    side = (side or "BOTH").upper()
+    if side not in ("BOTH", "BUY", "SELL"):
+        raise ValueError(f"side must be BOTH, BUY or SELL — got {side!r}.")
+    f = TradeFilters(days=day_set, hours=hour_set, side=side)
+    return f if f.active else None
+
+
+# --------------------------------------------------------------------------- #
 #  Core simulation
 # --------------------------------------------------------------------------- #
 def run_backtest(
@@ -285,6 +364,7 @@ def run_backtest(
     strategy_key: str = "",
     risk_reward: float = 0.0,
     min_score: float = 0.0,
+    filters: Optional["TradeFilters"] = None,
 ) -> BacktestResult:
     # Same resolution the engine uses, so a backtest measures exactly the
     # strategy the bot would trade — parameters included. That has to include
@@ -424,8 +504,14 @@ def run_backtest(
                    and (i - last_action_i) < params.reentry_cooldown_bars)
         # `window` is already enriched, so we call the signal fn directly
         # (generate_signal would re-enrich = O(n^2)).
-        if position is None and not cooling:
+        # Entry filters gate ENTRIES ONLY — the position block above has
+        # already run, so a bar excluded here can still close a position.
+        bar_allowed = filters is None or filters.allows_bar(bar.name)
+        if position is None and not cooling and bar_allowed:
             sig = signal_fn(window)
+            if sig is not None and filters is not None \
+                    and not filters.allows_side(sig.side):
+                sig = None
             if sig is not None:
                 if is_mcx:
                     # Fixed-lot commodity sizing (mirrors engine._mcx_fixed_size):
@@ -464,6 +550,275 @@ def run_backtest(
 
 
 # --------------------------------------------------------------------------- #
+#  Trade analytics — the cuts of a trade log worth plotting
+# --------------------------------------------------------------------------- #
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+#: Below this many trades a bucket's win rate is noise, so insights refuse to
+#: name it. The improvement doc uses the same rule of thumb ("don't trust any
+#: symbol bucket with fewer than ~30 trades") — 8 is the floor for saying
+#: anything at all about a weekday or hour, which have far fewer buckets.
+MIN_BUCKET_TRADES = 8
+
+
+def _bucket(df: pd.DataFrame, key) -> list[dict]:
+    """[{key, pnl, trades, wins, win_rate}] grouped by `key`, key order kept."""
+    out = []
+    for k, g in df.groupby(key, sort=True):
+        wins = int(g["win"].sum())
+        n = int(len(g))
+        out.append({
+            "key": k,
+            "pnl": round(float(g["pnl"].sum()), 2),
+            "trades": n,
+            "wins": wins,
+            "win_rate": round(100.0 * wins / n, 2) if n else 0.0,
+        })
+    return out
+
+
+def trade_analytics(trades: pd.DataFrame, top_setups: int = 10) -> dict:
+    """Cuts of the trade log for the analytics charts.
+
+    Everything is derived from the trade rows the simulation already records —
+    no second simulation, so these numbers cannot disagree with the metrics
+    beside them. Bucketed by ENTRY time throughout: a trade belongs to the hour
+    and the day it was TAKEN, which is the decision being judged. Bucketing by
+    exit would attribute a Monday decision to Tuesday whenever a position was
+    held across the boundary.
+
+    Returns empty lists (never raises) when there are no trades, so a filtered
+    run that took none still renders.
+    """
+    empty = {"by_weekday": [], "by_hour": [], "by_setup": [],
+             "by_side": [], "insights": [], "total_trades": 0}
+    if trades is None or trades.empty or "pnl" not in trades.columns:
+        return empty
+
+    t = trades.copy()
+    t["pnl"] = pd.to_numeric(t["pnl"], errors="coerce").fillna(0.0)
+    if "win" not in t.columns:
+        t["win"] = t["pnl"] > 0
+    t["win"] = t["win"].astype(bool)
+
+    entry = pd.to_datetime(t["entry_time"], errors="coerce")
+    t = t[entry.notna()].copy()
+    if t.empty:
+        return empty
+    entry = entry[entry.notna()]
+    t["_weekday"] = entry.dt.weekday.values
+    t["_hour"] = entry.dt.hour.values
+
+    by_weekday = [{**b, "label": WEEKDAY_NAMES[int(b["key"])]}
+                  for b in _bucket(t, "_weekday")]
+    by_hour = [{**b, "label": f"{int(b['key']):02d}:00"}
+               for b in _bucket(t, "_hour")]
+
+    # A "setup" is the entry reason the strategy logged. Candlestick strategies
+    # put the pattern names there, which is exactly the cut worth ranking; a
+    # strategy with one fixed reason simply yields one row.
+    if "entry_reason" in t.columns:
+        t["_setup"] = (t["entry_reason"].astype(str)
+                       # Drop the parenthetical detail ("(evidence 4.2, ...)")
+                       # so the same pattern set groups together instead of
+                       # splitting into one bucket per evidence value.
+                       .str.split("(").str[0].str.strip().replace("", "unnamed"))
+    else:
+        t["_setup"] = "unnamed"
+    setups = sorted(_bucket(t, "_setup"), key=lambda b: b["pnl"], reverse=True)
+    by_setup = [{**b, "label": str(b["key"])} for b in setups[:top_setups]]
+
+    by_side = [{**b, "label": str(b["key"])} for b in _bucket(t, "side")]
+
+    return {
+        "by_weekday": by_weekday,
+        "by_hour": by_hour,
+        "by_setup": by_setup,
+        "by_side": by_side,
+        "total_trades": int(len(t)),
+        "insights": _insights(by_weekday, by_hour, by_setup, by_side, int(len(t))),
+    }
+
+
+def _insights(by_weekday, by_hour, by_setup, by_side, total) -> list[str]:
+    """Plain-language findings from the buckets above.
+
+    Every claim names the sample it rests on, and a bucket under
+    MIN_BUCKET_TRADES is never held up as a finding — a 100% win rate on three
+    trades is the single easiest way to talk yourself into a bad change.
+    """
+    out: list[str] = []
+    solid = lambda rows: [r for r in rows if r["trades"] >= MIN_BUCKET_TRADES]
+
+    wk = solid(by_weekday)
+    if wk:
+        best = max(wk, key=lambda r: r["pnl"])
+        worst = min(wk, key=lambda r: r["pnl"])
+        if best["label"] != worst["label"]:
+            out.append(
+                f"{best['label']} is the best day (₹{best['pnl']:,.0f} over "
+                f"{best['trades']} trades); {worst['label']} is the worst "
+                f"(₹{worst['pnl']:,.0f} over {worst['trades']}).")
+        if worst["pnl"] < 0:
+            out.append(
+                f"Dropping {worst['label']} would have removed "
+                f"₹{abs(worst['pnl']):,.0f} of losses — test it before trusting it.")
+
+    hr = solid(by_hour)
+    if hr:
+        best = max(hr, key=lambda r: r["pnl"])
+        worst = min(hr, key=lambda r: r["pnl"])
+        out.append(
+            f"{best['label']} is the strongest hour (₹{best['pnl']:,.0f}, "
+            f"{best['win_rate']:.0f}% win over {best['trades']} trades)"
+            + (f"; {worst['label']} is the weakest (₹{worst['pnl']:,.0f})."
+               if worst["label"] != best["label"] else "."))
+        losing = [r for r in hr if r["pnl"] < 0]
+        if losing:
+            out.append(
+                "Loss-making hours: "
+                + ", ".join(f"{r['label']} (₹{r['pnl']:,.0f})" for r in losing)
+                + ".")
+
+    if by_setup:
+        top = by_setup[0]
+        out.append(
+            f"Best setup is {top['label']} (₹{top['pnl']:,.0f} over "
+            f"{top['trades']} trades, {top['win_rate']:.0f}% win).")
+        bad = [s for s in by_setup
+               if s["pnl"] < 0 and s["trades"] >= MIN_BUCKET_TRADES]
+        if bad:
+            out.append(
+                f"{len(bad)} setup(s) lost money on a meaningful sample, worst "
+                f"{min(bad, key=lambda s: s['pnl'])['label']}.")
+
+    sides = {r["label"]: r for r in by_side}
+    buy, sell = sides.get("BUY"), sides.get("SELL")
+    if buy and sell and min(buy["trades"], sell["trades"]) >= MIN_BUCKET_TRADES:
+        better, worse = ((buy, sell) if buy["pnl"] >= sell["pnl"]
+                         else (sell, buy))
+        out.append(
+            f"{better['label']} outperformed {worse['label']}: "
+            f"₹{better['pnl']:,.0f} at {better['win_rate']:.0f}% win vs "
+            f"₹{worse['pnl']:,.0f} at {worse['win_rate']:.0f}%.")
+    elif buy and not sell:
+        out.append("Long-only in this run — no short trades to compare.")
+    elif sell and not buy:
+        out.append("Short-only in this run — no long trades to compare.")
+
+    if total < 30:
+        out.append(
+            f"Only {total} trades — too few to act on. Treat everything above "
+            "as a hint, not a finding.")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  RR sweep — the SAME symbol and window at a range of risk:reward ratios
+# --------------------------------------------------------------------------- #
+
+#: Ceiling on how many RRs one sweep may run. Each step is a full simulation,
+#: so an unbounded (start, step, end) typo — say step 0.001 — would otherwise
+#: queue thousands of runs and hang the request. Raising this only costs time,
+#: never correctness.
+RR_SWEEP_MAX_STEPS = 40
+
+#: Floor on the step. Below this the runs are indistinguishable anyway: a stop
+#: is tick-rounded, so a 0.01 change in RR frequently produces the identical
+#: target price and therefore a byte-identical run.
+RR_SWEEP_MIN_STEP = 0.05
+
+
+def rr_sweep_values(start: float, step: float, end: float) -> list[float]:
+    """The RR ladder a sweep will run, inclusive of both ends.
+
+    Built with integer arithmetic rather than repeated addition: accumulating
+    0.1 in binary float lands on 1.0000000000000007 by the eighth step, which
+    would both mis-label the row and defeat the cache key.
+
+    Raises ValueError with an HTTP-400-worthy message on a nonsensical range.
+    """
+    start, step, end = float(start), float(step), float(end)
+    if start <= 0:
+        raise ValueError("Start RR must be greater than 0.")
+    if end < start:
+        raise ValueError(f"End RR ({end:g}) must be at or above start ({start:g}).")
+    if step < RR_SWEEP_MIN_STEP:
+        raise ValueError(
+            f"Step must be at least {RR_SWEEP_MIN_STEP:g} — smaller steps often "
+            "produce the identical target once the stop is tick-rounded.")
+    steps = int(round((end - start) / step)) + 1
+    if steps > RR_SWEEP_MAX_STEPS:
+        raise ValueError(
+            f"That range needs {steps} runs; the limit is {RR_SWEEP_MAX_STEPS}. "
+            "Use a bigger step or a narrower range.")
+    return [round(start + i * step, 4) for i in range(steps)]
+
+
+def run_rr_sweep(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    initial_capital: float,
+    mode: Mode,
+    rr_start: float,
+    rr_step: float,
+    rr_end: float,
+    lot_size: int = 1,
+    strategy_key: str = "",
+    min_score: float = 0.0,
+) -> list[dict]:
+    """Run the same backtest once per RR and return one summary row each.
+
+    Purely a LOOP over the existing run_backtest — no simulation logic is
+    duplicated or altered, so a sweep row and a single run at the same RR are
+    the same number by construction. RR is already a first-class override on
+    run_backtest (it does `replace(params, risk_reward=...)`, exactly as the
+    live engine does), which is what makes this honest rather than an
+    approximation.
+
+    History is fetched once and served from the parquet cache thereafter, so N
+    runs cost roughly one download plus N simulations.
+
+    A failing RR yields a row with an `error` rather than aborting the sweep —
+    one bad step must not throw away the rows already computed.
+
+    NOTE ON VALIDATION: RR here is deliberately NOT checked against
+    config.RR_CHOICES. Those choices bound what may be armed on LIVE money;
+    this is research on history, and the whole point is to discover whether a
+    ratio outside the offered set is better. Immutable Rule #1 is untouched
+    either way — RR moves the TARGET only, and position size is
+    risk_budget / stop_distance, which never reads it.
+    """
+    rows: list[dict] = []
+    for rr in rr_sweep_values(rr_start, rr_step, rr_end):
+        try:
+            res = run_backtest(ticker, start_date, end_date, initial_capital,
+                               mode, lot_size=lot_size,
+                               strategy_key=strategy_key,
+                               risk_reward=rr, min_score=min_score)
+            m = res.metrics
+            rows.append({
+                "risk_reward": rr,
+                "trades": m.get("Total Trades", 0),
+                "return_pct": m.get("Total Return %", 0.0),
+                "win_rate": m.get("Win Rate %", 0.0),
+                "max_drawdown": m.get("Max Drawdown %", 0.0),
+                "sharpe": m.get("Sharpe Ratio", 0.0),
+                "calmar": m.get("Calmar Ratio", 0.0),
+                "final_equity": m.get("Final Equity", 0.0),
+                "data_source": m.get("Data Source", ""),
+                "error": "",
+            })
+        except Exception as exc:
+            rows.append({"risk_reward": rr, "trades": 0, "return_pct": 0.0,
+                         "win_rate": 0.0, "max_drawdown": 0.0, "sharpe": 0.0,
+                         "calmar": 0.0, "final_equity": 0.0, "data_source": "",
+                         "error": f"{type(exc).__name__}: {exc}"[:200]})
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 #  Bulk simulation — same strategy/params across a bucket of instruments
 # --------------------------------------------------------------------------- #
 def run_bulk_backtest(
@@ -475,6 +830,9 @@ def run_bulk_backtest(
     strategy_key: str = "",
     progress_cb=None,
     max_workers: int = BULK_MAX_WORKERS,
+    risk_reward: float = 0.0,
+    min_score: float = 0.0,
+    filters: Optional["TradeFilters"] = None,
 ) -> dict[str, BacktestResult]:
     """Run the SAME strategy with the SAME parameters over every ticker in the
     bucket and return {ticker: BacktestResult}. Each instrument is simulated
@@ -501,7 +859,9 @@ def run_bulk_backtest(
         try:
             return ticker, run_backtest(
                 ticker, start, end, initial_capital, mode,
-                lot_size=lot_size, strategy_key=strategy_key)
+                lot_size=lot_size, strategy_key=strategy_key,
+                risk_reward=risk_reward, min_score=min_score,
+                filters=filters)
         except Exception as exc:
             # One bad symbol must not sink the whole bucket — record an empty
             # result so the UI can show it failed rather than aborting the run.

@@ -80,6 +80,15 @@ class BotConfig:
     by_mode: dict[str, ModeConfig] = field(default_factory=dict)
     #: which of CLIENT_SELECTABLE_MODES the admin currently offers to clients.
     client_modes: list[str] = field(default_factory=list)
+    #: Start every eligible client's bot when ADMIN starts theirs, and publish
+    #: the run admin just started as the config clients follow — so the setup
+    #: never has to be saved for clients as a separate step.
+    #:
+    #: Only ever acts on a mode in CLIENT_SELECTABLE_MODES: an admin running
+    #: Swing (or any mode clients cannot select) publishes nothing and starts
+    #: nobody, so experimenting outside the client modes cannot overwrite what
+    #: clients are trading.
+    auto_start_clients: bool = True
 
 
 def _from_disk() -> BotConfig:
@@ -111,7 +120,13 @@ def _from_disk() -> BotConfig:
     }
     client_modes = [m for m in (data.get("client_modes") or [])
                     if m in CLIENT_SELECTABLE_MODES]
-    return BotConfig(by_mode=by_mode, client_modes=client_modes)
+    # Absent in every file written before this field existed. Defaulting those
+    # to False (rather than the dataclass default) keeps an existing
+    # deployment's behaviour exactly as it was — nobody's clients start
+    # trading because the server was upgraded. New installs get True.
+    auto_start = bool(data.get("auto_start_clients", False))
+    return BotConfig(by_mode=by_mode, client_modes=client_modes,
+                     auto_start_clients=auto_start)
 
 
 def _to_disk(cfg: BotConfig) -> None:
@@ -148,6 +163,45 @@ def set_client_modes(modes: list[str]) -> BotConfig:
                             if m in CLIENT_SELECTABLE_MODES]
         _to_disk(cfg)
         return cfg
+
+
+def auto_start_clients() -> bool:
+    """Whether admin's Start Bot also publishes its config to clients and
+    starts them. See BotConfig.auto_start_clients."""
+    return bool(get_config().auto_start_clients)
+
+
+def set_auto_start_clients(enabled: bool) -> BotConfig:
+    with _lock:
+        cfg = _from_disk()
+        cfg.auto_start_clients = bool(enabled)
+        _to_disk(cfg)
+        return cfg
+
+
+def publish_run(mode: str, **kwargs) -> bool:
+    """Make the run admin just started the one clients follow: save it as this
+    mode's config AND make sure the mode is offered to clients.
+
+    Returns False without writing anything when `mode` is not client-
+    selectable — the guard that stops an admin's Swing (or any non-client)
+    run from silently replacing what clients trade.
+
+    This is exactly what "save as client default" did as a separate button;
+    doing it here means the setup can never drift from the run that is
+    actually happening.
+    """
+    if mode not in CLIENT_SELECTABLE_MODES:
+        return False
+    set_mode_config(mode, **kwargs)
+    with _lock:
+        cfg = _from_disk()
+        # active_client_mode() reads the FIRST entry, so the published mode
+        # goes to the front — starting Scalper after Intraday must move
+        # clients onto Scalper, not leave them on the older one.
+        cfg.client_modes = [mode] + [m for m in cfg.client_modes if m != mode]
+        _to_disk(cfg)
+    return True
 
 
 def is_set(mode: str) -> bool:

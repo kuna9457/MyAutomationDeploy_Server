@@ -235,6 +235,15 @@ class TradingEngine:
         # status read on a constructed-but-unstarted engine is simply blank
         # rather than describing a run that has not begun.
         self.run_config: dict = {}
+        # Set by capital_ledger.attach() when this account runs SEVERAL
+        # strategy groups at once; None for an ordinary single-strategy run.
+        # Only two places consult it — _available_capital (share one wallet)
+        # and on_signal (one open trade per stock across groups) — and both
+        # take exactly the original path when it is None.
+        self.ledger = None
+        # Which strategy group this engine is, for the dashboard. "" for a
+        # single-strategy run, which is every run that predates the board.
+        self.group_key: str = ""
         # The Scalper trades 1-minute bars with a 7-minute time exit, so a 3s loop
         # would be a meaningful share of the whole trade. Poll sub-second there.
         self.poll_seconds = poll_seconds or (
@@ -744,6 +753,28 @@ class TradingEngine:
         # Never stack a second position on a symbol this account already holds.
         if self.holds(inst.symbol):
             return False
+        # ...and, when several strategy groups run for this account, not on one
+        # ANOTHER group already holds either. A stock may sit on several
+        # strategies — that is the point of the board — but only one trade in
+        # it may be open at a time; whichever group signals first takes it and
+        # the others wait for that trade to close. The claim is held across the
+        # whole entry attempt (hence the try/finally) because two groups can
+        # signal the same stock on the SAME tick, and a plain check here would
+        # let both through before either position existed.
+        if self.ledger is not None:
+            if not self.ledger.claim_symbol(inst.symbol):
+                return False
+            try:
+                return self._on_signal_locked(ev)
+            finally:
+                self.ledger.release_symbol(inst.symbol)
+        return self._on_signal_locked(ev)
+
+    def _on_signal_locked(self, ev) -> bool:
+        """The real body of on_signal, with this symbol already reserved when a
+        ledger is in play. Split out purely so the claim can be released in a
+        `finally` without indenting the entire method."""
+        inst, sig, quote = ev.instrument, ev.signal, ev.quote
         live_limits = getattr(self, "_live_limits", None)
         # LIVE risk kill-switch: open positions are still managed to their
         # SL/TP/time-exit either way — this only blocks OPENING new risk once
@@ -1081,9 +1112,17 @@ class TradingEngine:
         today, not my whole broker balance" strict: sizing never sees more
         than min(total_capital, capital_allocated).
         """
-        with self.state.lock:
-            committed = sum(float(t.get("_margin", 0.0))
-                            for t in self.state.open_positions.values())
+        if self.ledger is not None:
+            # Several strategy groups are running for this account. They share
+            # ONE wallet, so committed margin is summed across every group's
+            # engine — otherwise each would see the full ceiling and they could
+            # collectively commit several times the account. The ceiling below
+            # is untouched, so LIVE capital_allocated still caps the pool.
+            committed = self.ledger.committed_margin()
+        else:
+            with self.state.lock:
+                committed = sum(float(t.get("_margin", 0.0))
+                                for t in self.state.open_positions.values())
         ceiling = self.total_capital
         if self.environment == Environment.LIVE:
             limits = risk_manager.get_limits(self.user_id)

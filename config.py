@@ -130,6 +130,47 @@ UPSTOX_LIVE_SECRET = _env("UPSTOX_LIVE_SECRET")
 DHAN_CLIENT_ID = _env("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = _env("DHAN_ACCESS_TOKEN")
 
+# --------------------------------------------------------------------------- #
+#  AI Auditor (ai_auditor/) — an ON-DEMAND, READ-ONLY review of how the bot has
+#  traded. These are the only credentials it uses, and they reach nothing but
+#  the chosen LLM endpoint. Absent keys simply disable that provider in the UI.
+# --------------------------------------------------------------------------- #
+AI_AUDITOR_PROVIDER = _env("AI_AUDITOR_PROVIDER", "openrouter")
+OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
+#: Preferred OpenRouter model. Left blank on purpose: with no explicit choice
+#: the auditor walks OPENROUTER_MODEL_CHAIN below, so it keeps working when a
+#: model id is retired — which they are, regularly.
+OPENROUTER_MODEL = _env("OPENROUTER_MODEL", "")
+#: Ordered fallback chain, strongest first. Tried in turn until one answers; a
+#: model that no longer exists on OpenRouter is skipped rather than fatal.
+#: Model ids change — check https://openrouter.ai/models and override this in
+#: .env rather than editing code.
+OPENROUTER_MODEL_CHAIN = [
+    m.strip() for m in _env(
+        "OPENROUTER_MODEL_CHAIN",
+        "anthropic/claude-sonnet-4.5,"
+        "openai/gpt-5,"
+        "google/gemini-2.5-pro,"
+        "anthropic/claude-3.7-sonnet,"
+        "deepseek/deepseek-r1"
+    ).split(",") if m.strip()
+]
+GEMINI_API_KEY = _env("GEMINI_API_KEY")
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.5-pro")
+#: Fall back to the OTHER provider when the first one cannot produce a report.
+#: The audit is a manual, occasional action — finishing on the second provider
+#: beats making the operator notice and retry.
+AI_AUDITOR_FALLBACK = _env("AI_AUDITOR_FALLBACK", "true").lower() not in (
+    "false", "0", "no")
+try:
+    AI_AUDITOR_MAX_TOKENS = max(512, int(_env("AI_AUDITOR_MAX_TOKENS", "8000")))
+except ValueError:
+    AI_AUDITOR_MAX_TOKENS = 8000
+try:
+    AI_AUDITOR_TIMEOUT_SECONDS = max(10, int(_env("AI_AUDITOR_TIMEOUT_SECONDS", "120")))
+except ValueError:
+    AI_AUDITOR_TIMEOUT_SECONDS = 120
+
 # Zerodha (Kite Connect). ZERODHA_ACCESS_TOKEN is a DAILY token (Kite sessions
 # expire ~06:00 IST every day) generated via the login flow in kite_auth.py /
 # the sidebar's "Zerodha Token" panel — API_KEY/SECRET are the app credentials
@@ -783,6 +824,8 @@ def reload_tokens() -> None:
     global UPSTOX_LIVE_SECRET, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
     global ZERODHA_API_KEY, ZERODHA_API_SECRET, ZERODHA_ACCESS_TOKEN
     global KOTAK_NEO_ACCESS_TOKEN
+    global OPENROUTER_API_KEY, OPENROUTER_MODEL, GEMINI_API_KEY, GEMINI_MODEL
+    global AI_AUDITOR_PROVIDER
     try:
         from dotenv import load_dotenv as _ld
         _ld(override=True)
@@ -798,6 +841,11 @@ def reload_tokens() -> None:
     ZERODHA_API_SECRET = _env("ZERODHA_API_SECRET")
     ZERODHA_ACCESS_TOKEN = _env("ZERODHA_ACCESS_TOKEN")
     KOTAK_NEO_ACCESS_TOKEN = _env("KOTAK_NEO_ACCESS_TOKEN")
+    AI_AUDITOR_PROVIDER = _env("AI_AUDITOR_PROVIDER", "openrouter")
+    OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
+    OPENROUTER_MODEL = _env("OPENROUTER_MODEL", "")
+    GEMINI_API_KEY = _env("GEMINI_API_KEY")
+    GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.5-pro")
 
 
 # Local storage fallback location (used when MongoDB is unreachable)

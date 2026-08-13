@@ -17,17 +17,44 @@ from typing import Optional
 from engine import TradingEngine
 
 _lock = threading.Lock()
-_engines: dict[str, TradingEngine] = {}
+#: owner -> that owner's engines, in start order. A single-strategy run has
+#: exactly one entry (every case that predates the strategy board); a run off
+#: the board has one per enabled group, all sharing a CapitalLedger.
+_engines: dict[str, list[TradingEngine]] = {}
 
 
 def get_engine(owner: str) -> Optional[TradingEngine]:
+    """The owner's PRIMARY engine — the first started.
+
+    Every call site that predates multi-group trading keeps working through
+    this: with one engine it is that engine, and with several it is a real,
+    running one whose environment, mode and capital are shared by the whole
+    board. Callers that must see the WHOLE board (status, stop, PnL) use
+    get_engines() instead.
+    """
     with _lock:
-        return _engines.get(owner)
+        engines = _engines.get(owner) or []
+        return engines[0] if engines else None
+
+
+def get_engines(owner: str) -> list[TradingEngine]:
+    """Every engine this owner is running — one per strategy group."""
+    with _lock:
+        return list(_engines.get(owner) or [])
 
 
 def set_engine(owner: str, engine: TradingEngine) -> None:
+    """Replace the owner's engines with this single one — the ordinary
+    single-strategy start. Any previous board is dropped, which is correct:
+    starting a plain run replaces whatever was running before it."""
     with _lock:
-        _engines[owner] = engine
+        _engines[owner] = [engine]
+
+
+def set_engines(owner: str, engines: list[TradingEngine]) -> None:
+    """Replace the owner's engines with a whole strategy board."""
+    with _lock:
+        _engines[owner] = list(engines)
 
 
 def stop_engine(owner: str) -> bool:
@@ -42,10 +69,18 @@ def stop_engine(owner: str) -> bool:
     same owner starts a new one — bounded by user count, and those buffers are
     capped at 600 rows per instrument (data_feed.py), so it is small and does
     not grow. Releasing it belongs in TradingEngine.stop(), not here.
+
+    Stops EVERY engine the owner is running, so one Stop Bot halts the whole
+    strategy board rather than just its first group. Each stop is isolated:
+    one group's broker or feed throwing must not leave the rest running.
     """
     with _lock:
-        engine = _engines.get(owner)
-    if engine is None:
+        engines = list(_engines.get(owner) or [])
+    if not engines:
         return False
-    engine.stop()
+    for engine in engines:
+        try:
+            engine.stop()
+        except Exception as exc:                  # pragma: no cover
+            print(f"[engine_registry] {owner}: a group failed to stop: {exc}")
     return True
