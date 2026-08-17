@@ -55,6 +55,102 @@ def _cache_stem(ticker: str, interval: str, start: str, end: str) -> str:
     return os.path.join(_CACHE_DIR, safe)
 
 
+# --------------------------------------------------------------------------- #
+#  SUPERSET cache — one file per (ticker, interval) holding the widest range
+#  ever fetched, sliced in memory per request.
+#
+#  The range-keyed cache above only hits on an EXACT date match, so moving the
+#  start date by a day re-downloaded everything. Real evidence from a live cache
+#  directory: ADANIENT_15m_2026-01-01_2026-08-16 sitting beside
+#  ADANIENT_15m_2026-07-01_2026-08-09 — the same bars, downloaded twice.
+#
+#  That is fine for the odd manual backtest and useless for a combination
+#  search, which re-runs the same symbols over and over. With a superset a
+#  20-symbol search downloads once, ever, per timeframe; narrowing the window
+#  then costs nothing.
+#
+#  The old files stay readable (see _load_cached_history) so nothing already
+#  downloaded is wasted.
+# --------------------------------------------------------------------------- #
+def _superset_path(ticker: str, interval: str, source: str) -> str:
+    safe = f"{ticker}_{interval}__{source}".replace("/", "-").replace(":", "-")
+    return os.path.join(_CACHE_DIR, f"super_{safe}.parquet")
+
+
+def _slice_window(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    """Rows within [start, end] INCLUSIVE of the end date.
+
+    `end` is a date, and an intraday frame carries times, so a naive
+    `df.loc[:end]` would silently drop the whole of the final day. +1 day and a
+    strict upper bound is the correct reading of "up to and including this
+    date".
+    """
+    out = df
+    if start:
+        out = out[out.index >= pd.Timestamp(start)]
+    if end:
+        out = out[out.index < pd.Timestamp(end) + pd.Timedelta(days=1)]
+    return out
+
+
+def _load_superset(ticker: str, interval: str, start: str,
+                   end: str) -> tuple[pd.DataFrame, str] | None:
+    """The requested window from a superset file, or None if no file covers it.
+
+    "Covers" is judged on the file's own first/last bar, not on the range it
+    was requested with — a symbol simply has no bars before it listed, and
+    demanding otherwise would make the cache permanently miss.
+    """
+    for path in glob.glob(_superset_path(ticker, interval, "*")):
+        source = os.path.basename(path).rsplit("__", 1)[-1][:-len(".parquet")]
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:
+            print(f"[backtester] superset cache unreadable for {ticker} ({exc}).")
+            continue
+        if df.empty:
+            continue
+        want_start = pd.Timestamp(start) if start else df.index[0]
+        want_end = (pd.Timestamp(end) + pd.Timedelta(days=1) if end
+                    else df.index[-1])
+        # A one-day tolerance at the start: the requested date may fall on a
+        # weekend or holiday, when no bar can exist however complete the file.
+        if df.index[0] > want_start + pd.Timedelta(days=1):
+            continue
+        if df.index[-1] < want_end - pd.Timedelta(days=1):
+            continue
+        window = _slice_window(df, start, end)
+        if window.empty:
+            continue
+        return window, source
+    return None
+
+
+def _merge_into_superset(ticker: str, interval: str, df: pd.DataFrame,
+                         source: str) -> None:
+    """Union freshly-fetched bars into the superset for this (ticker, interval).
+
+    Never raises — caching is a speed optimisation, and a write failure must
+    not break the backtest that produced the data.
+    """
+    if df is None or df.empty:
+        return
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        path = _superset_path(ticker, interval, source)
+        merged = df
+        if os.path.exists(path):
+            try:
+                merged = pd.concat([pd.read_parquet(path), df])
+            except Exception:
+                merged = df
+        # Fresher rows win on overlap: a re-fetch corrects a partial last bar.
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        merged.to_parquet(path)
+    except Exception as exc:
+        print(f"[backtester] superset cache write failed for {ticker} ({exc}).")
+
+
 def _load_cached_history(ticker: str, interval: str, start: str,
                          end: str) -> tuple[pd.DataFrame, str] | None:
     matches = glob.glob(_cache_stem(ticker, interval, start, end) + "__*.parquet")
@@ -195,11 +291,24 @@ def fetch_history(
     # 0) Local disk cache — a re-run over the same ticker/interval/range (very
     #    common while iterating on a strategy, or across bulk-backtest tickers
     #    re-run later) skips the network entirely.
+    # 0a) SUPERSET cache first — covers any window inside what was ever
+    #     fetched, so changing the dates no longer re-downloads.
+    superset = _load_superset(ticker, interval, start, end)
+    if superset is not None:
+        df, source = superset
+        print(f"[backtester] {ticker}: {len(df)} candles from superset cache "
+              f"({source}).")
+        return df, source
+
+    # 0b) The original exact-range cache. Kept so files downloaded before the
+    #     superset existed are still used rather than re-fetched; a hit here is
+    #     also promoted into the superset so it is reusable next time.
     cached = _load_cached_history(ticker, interval, start, end)
     if cached is not None:
         df, source = cached
         print(f"[backtester] {ticker}: {len(df)} candles from local cache "
               f"({source}).")
+        _merge_into_superset(ticker, interval, df, source)
         return df, source
 
     # 1) REAL Upstox historical data — the good path. Ticker-specific & real, so
@@ -210,6 +319,7 @@ def fetch_history(
             if len(df) > 30:
                 print(f"[backtester] {ticker}: {len(df)} real Upstox candles.")
                 _save_cached_history(ticker, interval, start, end, df, "upstox")
+                _merge_into_superset(ticker, interval, df, "upstox")
                 return df, "upstox"
             print(f"[backtester] {ticker}: Upstox returned too few candles "
                   f"({len(df)}); trying next source.")
@@ -228,6 +338,7 @@ def fetch_history(
             df.index = pd.to_datetime(df.index)
             df = df.dropna()
             _save_cached_history(ticker, interval, start, end, df, "yfinance")
+            _merge_into_superset(ticker, interval, df, "yfinance")
             return df, "yfinance"
     except Exception as exc:
         print(f"[backtester] yfinance unavailable ({exc}); using synthetic data.")
@@ -365,6 +476,7 @@ def run_backtest(
     risk_reward: float = 0.0,
     min_score: float = 0.0,
     filters: Optional["TradeFilters"] = None,
+    patterns: Optional[list[str]] = None,
 ) -> BacktestResult:
     # Same resolution the engine uses, so a backtest measures exactly the
     # strategy the bot would trade — parameters included. That has to include
@@ -380,6 +492,14 @@ def run_backtest(
     # the control that makes "change the score and test the market" honest.
     if min_score and min_score > 0:
         params = replace(params, cs_min_score=float(min_score))
+    # ...and the candlestick pattern allow-list, for the same reason again: it
+    # decides WHICH setups are even eligible. Passing it per-run lets a
+    # backtest try a pattern set WITHOUT editing the saved dashboard filter the
+    # live bot is trading on. Empty/None leaves params untouched, so the run
+    # falls through to whatever is saved — which is what makes an un-overridden
+    # backtest measure the same strategy the bot is actually running.
+    if patterns:
+        params = replace(params, allowed_patterns=tuple(patterns))
     # NOTE: this local `params` is what actually reaches the strategy — both
     # enrich() and sd.fn() below are called with it explicitly rather than
     # through run_strategy(), so the overrides take effect without rebinding
@@ -767,6 +887,7 @@ def run_rr_sweep(
     lot_size: int = 1,
     strategy_key: str = "",
     min_score: float = 0.0,
+    patterns: Optional[list[str]] = None,
 ) -> list[dict]:
     """Run the same backtest once per RR and return one summary row each.
 
@@ -796,7 +917,8 @@ def run_rr_sweep(
             res = run_backtest(ticker, start_date, end_date, initial_capital,
                                mode, lot_size=lot_size,
                                strategy_key=strategy_key,
-                               risk_reward=rr, min_score=min_score)
+                               risk_reward=rr, min_score=min_score,
+                               patterns=patterns)
             m = res.metrics
             rows.append({
                 "risk_reward": rr,
@@ -833,6 +955,7 @@ def run_bulk_backtest(
     risk_reward: float = 0.0,
     min_score: float = 0.0,
     filters: Optional["TradeFilters"] = None,
+    patterns: Optional[list[str]] = None,
 ) -> dict[str, BacktestResult]:
     """Run the SAME strategy with the SAME parameters over every ticker in the
     bucket and return {ticker: BacktestResult}. Each instrument is simulated
@@ -861,7 +984,7 @@ def run_bulk_backtest(
                 ticker, start, end, initial_capital, mode,
                 lot_size=lot_size, strategy_key=strategy_key,
                 risk_reward=risk_reward, min_score=min_score,
-                filters=filters)
+                filters=filters, patterns=patterns)
         except Exception as exc:
             # One bad symbol must not sink the whole bucket — record an empty
             # result so the UI can show it failed rather than aborting the run.

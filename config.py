@@ -658,6 +658,17 @@ class StrategyParams:
     cs_sl_buffer_atr: float = 0.25  # stop sits this far beyond the pattern extreme
     cs_min_sl_atr: float = 0.5      # ...but never closer to entry than this
     cs_max_sl_atr: float = 3.0      # ...and never further than this
+    #: PER-RUN candlestick pattern allow-list. Empty (the default, and what
+    #: every live run uses) means "defer to the saved allow-list in
+    #: pattern_config.py" — so the live bot keeps reading its dashboard
+    #: setting and nothing here changes its behaviour.
+    #:
+    #: A non-empty value OVERRIDES that saved setting for this run only. It
+    #: exists so a backtest can try a pattern set WITHOUT editing what the live
+    #: bot is trading — the same relationship `risk_reward` and `cs_min_score`
+    #: already have with their admin overrides. A tuple, not a list, because
+    #: StrategyParams is frozen and gets copied with dataclasses.replace().
+    allowed_patterns: tuple[str, ...] = ()
 
 
 INTRADAY_PARAMS = StrategyParams(

@@ -39,6 +39,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import pattern_config
 from config import (CANDLE_INTRADAY_PARAMS, CANDLE_SCALPER_PARAMS,
                     CANDLE_SWING_PARAMS, Mode, StrategyParams)
 from strategy import (Signal, StrategyDef, _atr_in_normal_range,
@@ -524,6 +525,12 @@ def candlestick_signal(df: pd.DataFrame, params: StrategyParams,
         return None
 
     hits = detect_patterns(df, params)
+    # OPT-IN pattern allow-list (pattern_config.py). Returns `hits` unchanged —
+    # the same object — unless an allow-list is configured AND switched on for
+    # this strategy and mode, so an unconfigured bot takes the identical path it
+    # always did. It can only ever REMOVE evidence, never add or resize any.
+    hits = pattern_config.filter_hits(hits, "candlestick_engine", params.mode,
+                                      params)
     if not hits:
         return None
     bull, bear = score_patterns(hits)

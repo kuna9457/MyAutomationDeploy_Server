@@ -13,6 +13,8 @@ import os
 import admin_config
 import config
 import mailer
+import pandas as pd
+import pattern_config
 import presets
 import strategy
 import strategy_groups
@@ -24,8 +26,9 @@ from api.auth import CurrentUser, require_admin
 from api.schemas import (AdminConfigRequest, ClientModesRequest,
                          CreateClientRequest, PresetSaveRequest,
                          RangeResetRequest, SetEmailRequest,
-                         SetPasswordRequest, SetStatusRequest,
-                         StrategyGroupsRequest, SymbolConfigRequest)
+                         PatternConfigRequest, SetPasswordRequest,
+                         SetStatusRequest, StrategyGroupsRequest,
+                         SymbolConfigRequest)
 from config import Environment, Mode
 from db_manager import DBManager
 from fastapi import APIRouter, Depends, HTTPException
@@ -383,6 +386,110 @@ def load_preset(name: str):
 def delete_preset(name: str):
     presets.delete(name)
     return list_presets()
+
+
+# --------------------------------------------------------------------------- #
+#  Candlestick pattern allow-list (pattern_config.py)
+# --------------------------------------------------------------------------- #
+@router.get("/pattern-catalogue")
+def pattern_catalogue():
+    """Every pattern the engine can emit, plus which strategies can be
+    filtered. The list is a picker convenience — the filter matches on the name
+    a hit actually carries, so a pattern added to the engine later still works
+    the moment its name is allow-listed."""
+    return {"patterns": list(pattern_config.PATTERN_CATALOGUE),
+            "strategies": list(pattern_config.FILTERABLE_STRATEGIES)}
+
+
+@router.get("/pattern-config")
+def get_pattern_config(mode: str):
+    from dataclasses import asdict as _asdict
+    return {k: _asdict(v)
+            for k, v in pattern_config.get_all(_valid_mode(mode)).items()}
+
+
+@router.put("/pattern-config")
+def set_pattern_config(req: PatternConfigRequest):
+    """Save one (strategy, mode) allow-list.
+
+    Rejects a strategy that does not go through pattern detection: a filter on
+    a VWAP strategy would be a control that silently does nothing, which is
+    worse than no control.
+    """
+    mode = _valid_mode(req.mode)
+    if req.strategy_key not in pattern_config.FILTERABLE_STRATEGIES:
+        raise HTTPException(
+            400, f"{req.strategy_key} does not use candlestick patterns. "
+                 f"Filterable: {', '.join(pattern_config.FILTERABLE_STRATEGIES)}.")
+    saved = pattern_config.set_rules(
+        req.strategy_key, mode,
+        pattern_config.PatternRules(enabled=req.enabled, allowed=req.allowed))
+    from dataclasses import asdict as _asdict
+    return {req.strategy_key: _asdict(saved)}
+
+
+@router.get("/pattern-stats")
+def pattern_stats(environment: str = "Paper", strategy: str = "", mode: str = ""):
+    """Realised PnL attributed back to individual patterns.
+
+    A trade's `entry_reason` records the COMBINATION that fired ("Bullish
+    Engulfing, Hammer"), so a trade counts toward every pattern in it. That
+    overlap is why `solo_*` is reported separately: those are the trades where
+    a pattern fired ALONE, and they are the only clean read on that pattern by
+    itself. Judge on `solo` where the sample allows, and treat the attributed
+    figures as a hint about company a pattern keeps.
+    """
+    try:
+        env = Environment(environment)
+    except ValueError:
+        raise HTTPException(400, "environment must be 'Paper' or 'Live'.")
+
+    df = _db.get_trades(env)
+    if df.empty or "status" not in df.columns:
+        return {"patterns": [], "trades": 0}
+    df = df[df["status"] == "CLOSED"]
+    if strategy:
+        df = df[df.get("strategy", "") == strategy]
+    if mode:
+        df = df[df.get("mode", "") == mode]
+    if df.empty:
+        return {"patterns": [], "trades": 0}
+
+    agg: dict[str, dict] = {}
+    for _, t in df.iterrows():
+        names = [p.strip() for p in
+                 str(t.get("entry_reason", "")).split(" (")[0].split(",")
+                 if p.strip()]
+        if not names:
+            continue
+        pnl = float(pd.to_numeric(t.get("realized_pnl"), errors="coerce") or 0.0)
+        solo = len(names) == 1
+        for n in names:
+            a = agg.setdefault(n, {"trades": 0, "pnl": 0.0, "wins": 0,
+                                   "solo_trades": 0, "solo_pnl": 0.0,
+                                   "solo_wins": 0})
+            a["trades"] += 1
+            a["pnl"] += pnl
+            a["wins"] += 1 if pnl > 0 else 0
+            if solo:
+                a["solo_trades"] += 1
+                a["solo_pnl"] += pnl
+                a["solo_wins"] += 1 if pnl > 0 else 0
+
+    out = []
+    for name, a in agg.items():
+        out.append({
+            "pattern": name,
+            "trades": a["trades"], "pnl": round(a["pnl"], 2),
+            "win_rate": round(100.0 * a["wins"] / a["trades"], 1),
+            "avg_pnl": round(a["pnl"] / a["trades"], 2),
+            "solo_trades": a["solo_trades"],
+            "solo_pnl": round(a["solo_pnl"], 2),
+            "solo_win_rate": (round(100.0 * a["solo_wins"] / a["solo_trades"], 1)
+                              if a["solo_trades"] else 0.0),
+        })
+    out.sort(key=lambda r: r["pnl"], reverse=True)
+    return {"patterns": out, "trades": int(len(df))}
 
 
 @router.get("/strategy-groups")

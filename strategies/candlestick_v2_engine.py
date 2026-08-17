@@ -56,6 +56,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import pattern_config
 from config import (CANDLE_INTRADAY_PARAMS, CANDLE_SCALPER_PARAMS,
                     CANDLE_SWING_PARAMS, Mode, StrategyParams)
 from strategy import (Signal, StrategyDef, _atr_in_normal_range,
@@ -197,6 +198,11 @@ def candlestick_v2_signal(df: pd.DataFrame, params: StrategyParams,
         return None
 
     hits = detect_patterns(df, params)
+    # Same opt-in allow-list as Phase 1, configured separately for this
+    # strategy — a pattern worth trading under Phase 1's scoring is not
+    # automatically worth trading under the regime gate and volume weighting.
+    hits = pattern_config.filter_hits(hits, "candlestick_engine_v2", params.mode,
+                                      params)
     if not hits:
         return None
 

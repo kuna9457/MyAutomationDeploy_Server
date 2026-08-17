@@ -36,8 +36,9 @@ from fastapi.security import OAuth2PasswordRequestForm  # noqa: E402
 
 from api.auth import (CurrentUser, TokenResponse, authenticate,  # noqa: E402
                       create_access_token, get_current_user)
-from api.routers import (account, admin_users, auditor, backtest,  # noqa: E402
-                         bot, broker, chart, config_router, risk, trades)
+from api.routers import (account, admin_users, advanced_backtest,  # noqa: E402
+                         auditor, backtest, bot, broker, chart,
+                         config_router, risk, trades)
 
 app = FastAPI(title="Trading Bot API")
 
@@ -84,3 +85,5 @@ app.include_router(account.router)
 app.include_router(auditor.router)
 # Trade replay: candles a trade was taken on, with the trade drawn over them.
 app.include_router(chart.router)
+# Combination search: which symbol x pattern actually works. Read-only.
+app.include_router(advanced_backtest.router)

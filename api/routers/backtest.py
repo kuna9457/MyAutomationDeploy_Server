@@ -52,7 +52,7 @@ def run_backtest(req: BacktestRequest):
         req.ticker, req.start, req.end, req.initial_capital, mode,
         lot_size=inst.lot_size, strategy_key=req.strategy_key,
         risk_reward=req.risk_reward, min_score=req.min_score,
-        filters=filters,
+        filters=filters, patterns=req.patterns,
     )
     equity = result.equity_curve
     return {
@@ -98,7 +98,7 @@ def bulk_backtest(req: BulkBacktestRequest):
     results = backtester.run_bulk_backtest(
         req.tickers, req.start, req.end, req.initial_capital, mode,
         strategy_key=req.strategy_key, risk_reward=req.risk_reward,
-        min_score=req.min_score, filters=filters,
+        min_score=req.min_score, filters=filters, patterns=req.patterns,
     )
     summary = backtester.bulk_summary_frame(results)
 
@@ -134,7 +134,7 @@ def rr_sweep(req: RRSweepRequest):
             req.ticker, req.start, req.end, req.initial_capital, mode,
             rr_start=req.rr_start, rr_step=req.rr_step, rr_end=req.rr_end,
             lot_size=inst.lot_size, strategy_key=req.strategy_key,
-            min_score=req.min_score,
+            min_score=req.min_score, patterns=req.patterns,
         )
     except ValueError as exc:
         # Bad ladder (start<=0, end<start, step too small, too many runs) —

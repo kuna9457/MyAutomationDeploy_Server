@@ -72,6 +72,11 @@ class BacktestRequest(BaseModel):
     trade_hours: list[int] = []
     #: "BOTH" | "BUY" | "SELL"
     side: str = "BOTH"
+    #: PER-RUN candlestick pattern allow-list. EMPTY = fall back to the saved
+    #: dashboard filter, so an untouched form measures what the live bot
+    #: actually trades. Non-empty overrides it for this run only and never
+    #: writes anything back.
+    patterns: list[str] = []
 
 
 class BulkBacktestRequest(BaseModel):
@@ -87,6 +92,10 @@ class BulkBacktestRequest(BaseModel):
     trade_days: list[int] = []
     trade_hours: list[int] = []
     side: str = "BOTH"
+    #: Held constant across every symbol in the bucket, so the ranking compares
+    #: symbols and nothing else. Empty = fall back to the saved dashboard
+    #: filter, exactly as in a single run.
+    patterns: list[str] = []
 
 
 class RRSweepRequest(BaseModel):
@@ -111,6 +120,8 @@ class RRSweepRequest(BaseModel):
     rr_end: float = 3.0
     #: 0 = the strategy's own threshold. Held constant across the sweep.
     min_score: float = 0.0
+    #: Held constant across the sweep, like every other input except RR.
+    patterns: list[str] = []
 
 
 class WatchlistSaveRequest(BaseModel):
@@ -262,6 +273,20 @@ class StrategyGroupPayload(BaseModel):
     #: 0 = use the strategy's own.
     min_score: float = 0.0
     enabled: bool = True
+
+
+class PatternConfigRequest(BaseModel):
+    """One candlestick strategy's pattern allow-list, for one mode.
+
+    `enabled=False` OR an empty `allowed` means no filtering at all — the
+    strategy behaves exactly as it did before the feature existed. Empty-while-
+    enabled is deliberately a no-op rather than "block everything", so building
+    a list up cannot accidentally halt trading.
+    """
+    strategy_key: str
+    mode: str
+    enabled: bool = False
+    allowed: list[str] = []
 
 
 class StrategyGroupsRequest(BaseModel):
