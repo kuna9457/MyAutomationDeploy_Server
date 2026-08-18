@@ -34,6 +34,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import pattern_config
 from config import Mode, StrategyParams
 from strategy import (Signal, StrategyDef, _atr_in_normal_range,
                       _past_entry_window, register)
@@ -228,6 +229,14 @@ def chart_pattern_signal(df: pd.DataFrame, params: StrategyParams,
             continue
         side, invalidation, name = hit
         if side == "SELL" and not params.allow_short:
+            continue
+        # OPT-IN allow-list (pattern_config.py). `continue` rather than
+        # `return None` on purpose: detectors are tried in priority order, so
+        # excluding one lets a LATER detector fire on this same bar instead of
+        # the bar being skipped entirely. Returns True for everyone when
+        # nothing is configured, so an unfiltered bot is unchanged.
+        if not pattern_config.allows(f"{name} breakout", "chart_pattern_engine",
+                                     params.mode, params):
             continue
         buf = SL_BUFFER_ATR * atr_val
         if side == "BUY":

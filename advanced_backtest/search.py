@@ -93,6 +93,14 @@ class Combo:
     oos_win_rate: float = 0.0
     oos_profit_factor: Optional[float] = None
     oos_max_dd: Optional[float] = None
+    #: The SAME symbol, UNFILTERED, over the SAME out-of-sample window. Without
+    #: this there is nothing to compare against: a combination returning 19%
+    #: looks excellent until you notice the symbol made 26% with no filter at
+    #: all, and that filtering it cost you seven points.
+    baseline_oos_return: Optional[float] = None
+    #: oos_return - baseline_oos_return. Positive means the filter EARNED its
+    #: place; negative means the strategy was better left alone on this symbol.
+    edge: Optional[float] = None
     verdict: str = ""
     note: str = ""
     score: float = 0.0
@@ -115,7 +123,26 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
     res = backtester.run_backtest(
         symbol, spec.start, spec.end, spec.capital, spec.mode,
         lot_size=lot, strategy_key=spec.strategy_key,
-        risk_reward=spec.risk_reward, min_score=spec.min_score)
+        risk_reward=spec.risk_reward, min_score=spec.min_score,
+        # THE WHOLE POINT of the screen: look at every pattern, not just the
+        # ones the dashboard filter currently allows.
+        ignore_saved_patterns=True)
+
+    # The comparison that makes the whole table meaningful: this symbol with NO
+    # pattern filter, over the very window the combinations are scored on. The
+    # full-window figure below cannot serve — it spans both halves, so holding
+    # it next to an out-of-sample return compares two different lengths of time
+    # and flatters whichever is longer.
+    baseline_oos = None
+    try:
+        oos = backtester.run_backtest(
+            symbol, spec.split_date(), spec.end, spec.capital, spec.mode,
+            lot_size=lot, strategy_key=spec.strategy_key,
+            risk_reward=spec.risk_reward, min_score=spec.min_score,
+            ignore_saved_patterns=True)
+        baseline_oos = oos.metrics.get("Total Return %", 0.0)
+    except Exception:
+        pass                       # a missing baseline must not lose the screen
 
     summary = {
         "symbol": symbol,
@@ -123,6 +150,7 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
         "return_pct": res.metrics.get("Total Return %", 0.0),
         "win_rate": res.metrics.get("Win Rate %", 0.0),
         "source": res.metrics.get("Data Source", ""),
+        "baseline_oos_return": baseline_oos,
     }
     if res.trades is None or res.trades.empty:
         return [], summary
@@ -140,7 +168,8 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
         Combo(symbol=symbol, pattern=name,
               screen_trades=a["n"],
               screen_pnl=round(a["pnl"], 2),
-              screen_win_rate=round(100.0 * a["wins"] / a["n"], 1))
+              screen_win_rate=round(100.0 * a["wins"] / a["n"], 1),
+              baseline_oos_return=baseline_oos)
         for name, a in agg.items()
     ]
     return combos, summary
@@ -182,6 +211,8 @@ def verify_combo(spec: SearchSpec, combo: Combo) -> Combo:
         gross_loss = float(-pnl[pnl < 0].sum())
         combo.oos_profit_factor = (round(gross_win / gross_loss, 3)
                                    if gross_loss > 0 else None)
+    if combo.baseline_oos_return is not None and combo.oos_return is not None:
+        combo.edge = round(combo.oos_return - combo.baseline_oos_return, 2)
     return combo
 
 

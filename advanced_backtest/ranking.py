@@ -59,7 +59,14 @@ def _score(c: Combo) -> float:
     else:
         keep = 1.0
     pf = c.oos_profit_factor or 1.0
-    return base * conf * min(keep, 1.0) * min(pf, 3.0) / 3.0
+    ranked = base * conf * min(keep, 1.0) * min(pf, 3.0) / 3.0
+    # A combination that trails the SAME symbol traded unfiltered has earned
+    # nothing, however good its own return looks. Sink it below everything that
+    # did add something, but keep the ordering among such rows intact so the
+    # table still reads sensibly.
+    if c.edge is not None and c.edge <= 0:
+        ranked = min(ranked, 0.0) + c.edge / 1000.0
+    return ranked
 
 
 def rank(combos: list[Combo], spec: SearchSpec) -> list[dict]:
@@ -71,19 +78,79 @@ def rank(combos: list[Combo], spec: SearchSpec) -> list[dict]:
     return [asdict(c) for c in ordered]
 
 
-def recommended_bucket(ranked: list[dict], limit: int = 12) -> dict:
-    """The symbols and patterns worth actually trading, from a finished search.
+def recommended_bucket(ranked: list[dict], limit: int = 20) -> dict:
+    """What is actually worth trading — as PAIRINGS, not two flat lists.
 
-    Only "holds" qualifies — not "promising", and never "overfit" or "thin".
-    The output is shaped to be pasted straight into the strategy board and the
-    pattern allow-list, but it is NEVER applied automatically: a search result
-    is evidence, and committing it to live money stays a human decision.
+    Two rules beyond the verdict:
+
+      * THE PAIRING IS THE FINDING. "INFY with Identical Three Crows" is what
+        was validated; "INFY" and "Identical Three Crows" separately are not.
+        Flattening to {symbols, patterns} and pasting the cross product
+        re-enables every unvalidated pairing between them — including ones this
+        very search marked `fails`. `conflicts` below names those explicitly.
+      * IT MUST BEAT DOING NOTHING. A combination is only kept when it also
+        out-performs the SAME symbol traded unfiltered over the SAME window
+        (`edge > 0`). Otherwise the honest advice is to leave that symbol alone,
+        not to filter it.
+
+    Nothing is ever applied automatically; this is evidence, and committing it
+    to live money stays a human decision.
     """
-    keep = [r for r in ranked if r["verdict"] == "holds"][:limit]
+    holds = [r for r in ranked if r["verdict"] == "holds"]
+    keep = [r for r in holds
+            if r.get("edge") is None or r["edge"] > 0][:limit]
+    dropped_no_edge = [r for r in holds
+                       if r.get("edge") is not None and r["edge"] <= 0]
+    truncated = max(0, len([r for r in holds
+                            if r.get("edge") is None or r["edge"] > 0]) - limit)
+
+    symbols = sorted({r["symbol"] for r in keep})
+    patterns = sorted({r["pattern"] for r in keep})
+
+    # Which cross-product cells would be switched on by the flat lists, and
+    # what this search already knows about them. This is the warning the old
+    # bucket could not give.
+    validated = {(r["symbol"], r["pattern"]) for r in keep}
+    known = {(r["symbol"], r["pattern"]): r for r in ranked}
+    conflicts = []
+    for sym in symbols:
+        for pat in patterns:
+            if (sym, pat) in validated:
+                continue
+            other = known.get((sym, pat))
+            if other and other["verdict"] in ("fails", "overfit"):
+                conflicts.append({
+                    "symbol": sym, "pattern": pat,
+                    "verdict": other["verdict"],
+                    "oos_return": other["oos_return"],
+                })
+    conflicts.sort(key=lambda c: (c["oos_return"] is None, c["oos_return"] or 0))
+
+    # Grouped by pattern: a SINGLE pattern with its own symbol list is the one
+    # shape today's settings can express exactly, because the pattern filter is
+    # per (strategy, mode) while symbols are per strategy group. Running one
+    # pattern at a time therefore has no cross-product risk at all.
+    by_pattern: dict[str, list[str]] = {}
+    for r in keep:
+        by_pattern.setdefault(r["pattern"], []).append(r["symbol"])
+    safe = max(by_pattern.items(), key=lambda kv: len(kv[1]),
+               default=(None, []))
+
     return {
-        "symbols": sorted({r["symbol"] for r in keep}),
-        "patterns": sorted({r["pattern"] for r in keep}),
-        "combinations": keep,
-        "why": (f"{len(keep)} combination(s) stayed profitable on the held-back "
-                f"half of the window with at least {MIN_TRADES} trades there."),
+        "pairs": keep,
+        "symbols": symbols,
+        "patterns": patterns,
+        "combinations": keep,          # kept for older callers
+        "by_pattern": {k: sorted(v) for k, v in by_pattern.items()},
+        "conflicts": conflicts,
+        "safe_plan": ({"pattern": safe[0], "symbols": sorted(safe[1])}
+                      if safe[0] else None),
+        "dropped_no_edge": [
+            {"symbol": r["symbol"], "pattern": r["pattern"],
+             "oos_return": r["oos_return"], "edge": r["edge"]}
+            for r in dropped_no_edge],
+        "truncated": truncated,
+        "why": (f"{len(keep)} pairing(s) stayed profitable out of sample on at "
+                f"least {MIN_TRADES} trades AND beat the same symbol traded "
+                f"unfiltered."),
     }

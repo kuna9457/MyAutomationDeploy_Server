@@ -38,6 +38,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import pattern_config
 from config import Mode, StrategyParams
 from strategy import (Signal, StrategyDef, _atr_in_normal_range,
                       _past_entry_window, register)
@@ -197,6 +198,15 @@ def context_signal(df: pd.DataFrame, params: StrategyParams,
         return None
 
     bull, bear, sup, res, note = _context_scores(df, params, atr_val)
+    # OPT-IN required-factor filter (pattern_config.py). This strategy scores
+    # confluence rather than naming a pattern, so the rule is that at least one
+    # CHOSEN factor must be among the evidence. It narrows which setups qualify
+    # and never touches the score or the CONFLUENCE_MIN threshold. A no-op
+    # unless configured, so an unfiltered bot behaves exactly as before.
+    if not pattern_config.allows_factors(
+            [f.strip() for f in str(note).split(",") if f.strip()],
+            "context_engine", params.mode, params):
+        return None
     buf = SL_BUFFER_ATR * atr_val
 
     # -- Long --------------------------------------------------------------- #

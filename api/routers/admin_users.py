@@ -397,8 +397,23 @@ def pattern_catalogue():
     filtered. The list is a picker convenience — the filter matches on the name
     a hit actually carries, so a pattern added to the engine later still works
     the moment its name is allow-listed."""
-    return {"patterns": list(pattern_config.PATTERN_CATALOGUE),
-            "strategies": list(pattern_config.FILTERABLE_STRATEGIES)}
+    return {
+        # Kept for older callers: the candlestick list.
+        "patterns": list(pattern_config.PATTERN_CATALOGUE),
+        "strategies": list(pattern_config.FILTERABLE_STRATEGIES),
+        # Per strategy, because the three filterable families have different
+        # vocabularies AND different semantics — a chart-pattern list is not a
+        # candlestick list, and context factors are not patterns at all.
+        "by_strategy": {
+            key: {
+                "kind": spec["kind"],
+                "label": spec["label"],
+                "help": spec["help"],
+                "catalogue": list(spec["catalogue"]),
+            }
+            for key, spec in pattern_config.STRATEGY_FILTERS.items()
+        },
+    }
 
 
 @router.get("/pattern-config")

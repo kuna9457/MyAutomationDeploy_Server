@@ -477,6 +477,7 @@ def run_backtest(
     min_score: float = 0.0,
     filters: Optional["TradeFilters"] = None,
     patterns: Optional[list[str]] = None,
+    ignore_saved_patterns: bool = False,
 ) -> BacktestResult:
     # Same resolution the engine uses, so a backtest measures exactly the
     # strategy the bot would trade — parameters included. That has to include
@@ -500,6 +501,11 @@ def run_backtest(
     # backtest measure the same strategy the bot is actually running.
     if patterns:
         params = replace(params, allowed_patterns=tuple(patterns))
+    # ...or ignore the saved filter altogether. The combination search's screen
+    # needs the full pattern set; without this it could only rediscover
+    # whatever was already allowed on the dashboard.
+    elif ignore_saved_patterns:
+        params = replace(params, ignore_pattern_filter=True)
     # NOTE: this local `params` is what actually reaches the strategy — both
     # enrich() and sd.fn() below are called with it explicitly rather than
     # through run_strategy(), so the overrides take effect without rebinding

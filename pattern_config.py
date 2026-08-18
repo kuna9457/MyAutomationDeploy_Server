@@ -92,12 +92,77 @@ PATTERN_CATALOGUE: tuple[str, ...] = (
     "Rising Three Methods", "Falling Three Methods", "Mat Hold", "Breakaway",
 )
 
-#: Strategies whose signal goes through candlestick pattern detection. Only
-#: these are offered in the UI — a filter on a VWAP strategy would be a control
-#: that silently does nothing.
-FILTERABLE_STRATEGIES: tuple[str, ...] = (
-    "candlestick_engine", "candlestick_engine_v2",
+#: Chart patterns (chart_pattern_engine). The engine appends " breakout" to the
+#: detector's name when it builds the signal reason, so these are stored in the
+#: SAME form the trade log and the combination search report — otherwise a name
+#: chosen from a search result would not match the filter.
+CHART_PATTERN_CATALOGUE: tuple[str, ...] = (
+    "Double Bottom breakout", "Double Top breakout",
+    "Head & Shoulders breakout", "Inverse Head & Shoulders breakout",
+    "Ascending Triangle breakout", "Descending Triangle breakout",
+    "Symmetrical Triangle breakout",
 )
+
+#: Context confluence factors (context_engine). NOT patterns — this strategy
+#: has none. It scores a bar across several dimensions and trades when the
+#: total clears a threshold, so what can be selected here is WHICH EVIDENCE
+#: must be part of that total. See CONTEXT semantics below.
+CONTEXT_FACTOR_CATALOGUE: tuple[str, ...] = (
+    "uptrend", "downtrend", "vol+", "ATR↑", "at support", "at resistance",
+)
+
+#: How a strategy's filter behaves. Two genuinely different semantics, and
+#: conflating them would make one of the controls lie:
+#:
+#:   "any-of"  — the signal names ONE thing (a candlestick pattern, a chart
+#:               pattern). It may fire only if that thing is on the list.
+#:   "require" — the signal is a SCORE assembled from several contributing
+#:               factors. It may fire only if at least one CHOSEN factor is
+#:               among the contributors. This narrows setups; it never changes
+#:               the score or the threshold.
+ANY_OF, REQUIRE = "any-of", "require"
+
+STRATEGY_FILTERS: dict[str, dict] = {
+    "candlestick_engine": {
+        "kind": ANY_OF, "label": "Candlestick patterns",
+        "catalogue": PATTERN_CATALOGUE,
+        "help": "Only these patterns may open a trade.",
+    },
+    "candlestick_engine_v2": {
+        "kind": ANY_OF, "label": "Candlestick patterns",
+        "catalogue": PATTERN_CATALOGUE,
+        "help": "Only these patterns may open a trade.",
+    },
+    "chart_pattern_engine": {
+        "kind": ANY_OF, "label": "Chart patterns",
+        "catalogue": CHART_PATTERN_CATALOGUE,
+        "help": ("Only these breakouts may open a trade. Detectors are tried "
+                 "in order, so excluding one lets a later detector fire on the "
+                 "same bar instead of skipping the bar."),
+    },
+    "context_engine": {
+        "kind": REQUIRE, "label": "Required context factors",
+        "catalogue": CONTEXT_FACTOR_CATALOGUE,
+        "help": ("This strategy scores confluence rather than naming a "
+                 "pattern. Ticking factors requires at least one of them to be "
+                 "among the evidence behind a signal — it does not change the "
+                 "score or the confluence threshold."),
+    },
+}
+
+#: Strategies whose signal can be filtered at all. Only these are offered in
+#: the UI — a filter on a VWAP strategy would be a control that silently does
+#: nothing.
+FILTERABLE_STRATEGIES: tuple[str, ...] = tuple(STRATEGY_FILTERS)
+
+
+def catalogue_for(strategy_key: str) -> tuple[str, ...]:
+    """What may be ticked for this strategy. Empty for an unfilterable one."""
+    return tuple(STRATEGY_FILTERS.get(str(strategy_key), {}).get("catalogue", ()))
+
+
+def kind_for(strategy_key: str) -> str:
+    return STRATEGY_FILTERS.get(str(strategy_key), {}).get("kind", ANY_OF)
 
 
 @dataclass
@@ -197,35 +262,74 @@ def set_rules(strategy_key: str, mode, rules: PatternRules) -> PatternRules:
 # --------------------------------------------------------------------------- #
 #  The filter itself
 # --------------------------------------------------------------------------- #
+def allowed_set(strategy_key: str, mode, params=None):
+    """The effective allow-list, or None when nothing is filtering.
+
+    ONE resolution path for every strategy, most-specific first:
+
+      1. `params.ignore_pattern_filter` — an explicit bypass, used by the
+         combination search so its screen sees everything.
+      2. `params.allowed_patterns` — a PER-RUN override (a backtest trying a
+         set without touching the saved dashboard filter).
+      3. The saved allow-list for this (strategy, mode).
+
+    None means "no filtering" and every caller must treat it as such, so an
+    unconfigured strategy takes exactly the path it did before this existed.
+    Never raises: a storage problem degrades to no filtering rather than
+    stopping a running bot from taking signals.
+    """
+    try:
+        if getattr(params, "ignore_pattern_filter", False):
+            return None
+        override = tuple(getattr(params, "allowed_patterns", ()) or ())
+        if override:
+            return set(override)
+        rules = get_rules(strategy_key, mode)
+        if not rules.is_active():
+            return None
+        return set(rules.allowed)
+    except Exception:
+        return None
+
+
 def filter_hits(hits, strategy_key: str, mode, params=None):
     """Drop pattern hits that are not on the effective allow-list.
 
-    Two sources, most-specific first:
-
-      1. `params.allowed_patterns` — a PER-RUN override. Set only by a backtest
-         that wants to try a pattern set without touching the saved dashboard
-         setting. When present it wins outright, so a backtest measures exactly
-         the list it was given rather than that list plus whatever is saved.
-      2. The saved allow-list for this (strategy, mode) — what the live bot and
-         an un-overridden backtest both read.
-
-    Returns `hits` UNCHANGED — the same list object — when neither applies, so
-    an unconfigured strategy takes exactly the path it did before this existed.
-
-    Never raises: a storage failure must not stop a running bot from taking
-    signals, so any problem here degrades to "no filtering".
+    For the ANY-OF strategies that produce a LIST of pattern hits
+    (candlestick). Returns `hits` UNCHANGED — the same list object — when
+    nothing is filtering.
     """
     if not hits:
         return hits
-    try:
-        override = tuple(getattr(params, "allowed_patterns", ()) or ())
-        if override:
-            allowed = set(override)
-        else:
-            rules = get_rules(strategy_key, mode)
-            if not rules.is_active():
-                return hits
-            allowed = set(rules.allowed)
-        return [h for h in hits if h.name in allowed]
-    except Exception:
+    allowed = allowed_set(strategy_key, mode, params)
+    if allowed is None:
         return hits
+    return [h for h in hits if h.name in allowed]
+
+
+def allows(name: str, strategy_key: str, mode, params=None) -> bool:
+    """May a signal named `name` fire?
+
+    For the ANY-OF strategies that produce ONE named signal rather than a list
+    of hits (chart patterns). True whenever nothing is filtering.
+    """
+    allowed = allowed_set(strategy_key, mode, params)
+    return allowed is None or name in allowed
+
+
+def allows_factors(factors, strategy_key: str, mode, params=None) -> bool:
+    """May a signal supported by `factors` fire?
+
+    For the REQUIRE strategies (context confluence). The signal is a score, not
+    a named pattern, so the rule is that at least ONE chosen factor must be
+    among the evidence. True whenever nothing is filtering — and also true when
+    the strategy emitted no factors at all, since refusing on missing evidence
+    would silently disable a strategy whose notes are simply empty.
+    """
+    allowed = allowed_set(strategy_key, mode, params)
+    if allowed is None:
+        return True
+    present = {str(f).strip() for f in (factors or []) if str(f).strip()}
+    if not present:
+        return True
+    return bool(present & allowed)

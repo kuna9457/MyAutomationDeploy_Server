@@ -5,21 +5,34 @@ reads history and returns a ranking. Applying a result stays a human action.
 """
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import config
 from advanced_backtest import jobs
-from advanced_backtest.search import DEFAULT_VERIFY_TOP, SearchSpec
+from advanced_backtest.search import (DEFAULT_VERIFY_TOP, MAX_WORKERS,
+                                      SearchSpec)
 from api.auth import require_admin
 from config import Mode
 
 router = APIRouter(prefix="/advanced-backtest", tags=["advanced-backtest"],
                    dependencies=[Depends(require_admin)])
 
-#: Each symbol is a full simulation in the screen pass, plus its share of the
-#: verify pass. 40 keeps a search inside a couple of minutes.
-MAX_SYMBOLS = 40
+#: Ceiling on symbols per search. Each one is a full simulation in the screen
+#: pass (~1.8 s, five at a time) plus a one-off download if it is not cached
+#: yet, so the cost is linear and modest: 114 symbols is roughly 40 s of
+#: simulation, plus about a minute of fetching the FIRST time only — the
+#: superset cache means later runs re-use it whatever the date range.
+#:
+#: The default comfortably covers the whole equity universe (114 instruments).
+#: Raise it via the environment if you add more; nothing here breaks at a
+#: higher number, it simply takes proportionally longer.
+try:
+    MAX_SYMBOLS = max(1, int(os.getenv("ADV_BACKTEST_MAX_SYMBOLS", "150")))
+except ValueError:
+    MAX_SYMBOLS = 150
 
 
 class SearchRequest(BaseModel):
@@ -90,3 +103,10 @@ def cancel(job_id: str):
     if not jobs.cancel(job_id):
         raise HTTPException(404, "That search is not running.")
     return {"ok": True}
+
+
+@router.get("/limits")
+def limits():
+    """What the UI needs to describe the form honestly — rather than repeating
+    a number that then drifts from the server's."""
+    return {"max_symbols": MAX_SYMBOLS, "workers": MAX_WORKERS}

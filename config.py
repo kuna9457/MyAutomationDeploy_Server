@@ -669,6 +669,14 @@ class StrategyParams:
     #: already have with their admin overrides. A tuple, not a list, because
     #: StrategyParams is frozen and gets copied with dataclasses.replace().
     allowed_patterns: tuple[str, ...] = ()
+    #: Ignore the SAVED dashboard pattern filter entirely for this run.
+    #:
+    #: Needed by the combination search: its screening pass must see every
+    #: pattern the engine can emit, or it can only ever "discover" patterns
+    #: that were already switched on — which is not discovery at all. Default
+    #: False everywhere else, so the live bot and ordinary backtests keep
+    #: reading the saved filter exactly as before.
+    ignore_pattern_filter: bool = False
 
 
 INTRADAY_PARAMS = StrategyParams(
