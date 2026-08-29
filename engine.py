@@ -584,6 +584,16 @@ class TradingEngine:
                 # pointless modify against every reloaded position.
                 trade["_protected_stop"] = (
                     trade["stop_loss"] if trade.get("broker_gtt_id") else None)
+                # A position that had already scaled out comes back as a RUNNER:
+                # partial spent, and trailing again if its strategy trails. The
+                # stop/target/quantity it reloads with are the post-partial ones
+                # (update_trade_fields persisted them), so restoring these two
+                # flags is all it takes to resume mid-runner rather than
+                # re-partialing at the runner target.
+                if trade.get("partial_done"):
+                    trade["_partial_done"] = True
+                    trade["_trail_active"] = bool(
+                        getattr(self.params, "trail_remainder", False))
                 notional = trade["entry_price"] * trade["quantity"] * max(mult, 1)
                 if inst is not None and inst.segment == Segment.MCX:
                     # Restore the broker's REAL margin (same source as entry) so
@@ -1408,6 +1418,131 @@ class TradingEngine:
         self.state.push_log(
             f"{inst.symbol}: broker-side stop moved to {stop:.2f}.")
 
+    def _maybe_scale_out(self, inst: Instrument, trade: dict,
+                         live_price: float) -> None:
+        """Book PART of a multi-lot position at its first target, move the rest
+        to break-even-plus-friction, and hand it to the trail. Commodity.md
+        §9.2-9.5.
+
+        A NO-OP for every strategy that does not set partial_exit_fraction —
+        which today is all of them except CRUDEOIL — so this cannot change how
+        anything else exits.
+
+            ONE LOT NEVER SCALES OUT.
+            A single lot is indivisible: "half" of it is all of it, so a
+            partial would just be an ordinary target exit wearing a different
+            name, and the position would give up the runner it was never able
+            to have. So qty <= 1 returns immediately and the position runs to
+            its FULL target on the normal path below. Only 2+ lots split.
+
+        Booked as a SEPARATE CLOSED trade document rather than by mutating this
+        one, because realized PnL, the day's PnL, the Excel log and every
+        analytic read `quantity` off the document at close time. A child doc
+        makes the partial a real, first-class exit that all of them already
+        understand, instead of a special case each would have to learn.
+
+        Not counted against max_trades_per_day: it is an exit of a position
+        already opened, not a new entry, and counting it would let a scale-out
+        consume the day's trade budget.
+        """
+        frac = getattr(self.params, "partial_exit_fraction", 0.0)
+        # Both spellings: the local flag for this process, and the PERSISTED one
+        # so a restart cannot scale the same position out a second time (the
+        # runner target would otherwise look like a fresh first target).
+        if frac <= 0 or trade.get("_partial_done") or trade.get("partial_done"):
+            return
+        qty = int(trade["quantity"])
+        if qty <= 1:
+            return                    # indivisible — runs to the full target
+
+        side = trade["side"]
+        target = float(trade["target"])
+        if side == "BUY":
+            if live_price < target:
+                return
+        elif live_price > target:
+            return
+
+        exit_qty = max(1, int(math.floor(qty * frac)))
+        exit_qty = min(exit_qty, qty - 1)      # always leave a runner behind
+        remaining = qty - exit_qty
+        entry = float(trade["entry_price"])
+        tick = inst.tick_size or 0.05
+        mult = max(inst.contract_multiplier, 1)
+
+        res = self.broker.square_off(inst, side, exit_qty, target)
+
+        # The booked half, as its own closed trade. Same entry, same strategy,
+        # so analytics group it with its parent; the reason names it a partial.
+        child = self.db.new_trade(
+            mode=self.mode.value, environment=self.environment.value,
+            user_id=self.user_id, broker=self.broker.name, ticker=inst.symbol,
+            side=side, entry_price=entry, stop_loss=float(trade["stop_loss"]),
+            target=target, quantity=exit_qty,
+            risk_amount=float(trade.get("risk_amount", 0.0)) * exit_qty / qty,
+            segment=inst.segment.value, contract_multiplier=mult,
+            strategy=self.strategy.key,
+            entry_reason=trade.get("entry_reason", ""),
+        )
+        self.db.insert_trade(child, self.environment)
+        self.db.close_trade(child["trade_id"], target, self.environment,
+                            exit_reason="PARTIAL-TARGET")
+
+        # Break-even plus the friction buffer: far enough past entry that the
+        # runner is genuinely free after ROUND-TRIP costs, not merely level
+        # before them. Rounded the same direction _enter and _apply_trail round
+        # a stop — always to the looser side, never a hair tighter.
+        buf = getattr(self.params, "breakeven_buffer_ticks", 0.0) * tick
+        if side == "BUY":
+            new_stop = round(math.floor((entry + buf) / tick) * tick, 2)
+        else:
+            new_stop = round(math.ceil((entry - buf) / tick) * tick, 2)
+
+        # Runner target, as a multiple of the ORIGINAL risk distance. Derived
+        # from the target and the RR actually used rather than from the current
+        # stop, which the trail may already have moved.
+        rr = max(self._rr_for(inst.symbol), 1e-9)
+        risk_dist = abs(target - entry) / rr
+        runner_mult = getattr(self.params, "runner_rr_mult", 0.0) or (rr * 2.0)
+        if side == "BUY":
+            new_target = round(entry + runner_mult * risk_dist, 2)
+        else:
+            new_target = round(entry - runner_mult * risk_dist, 2)
+
+        trade["quantity"] = remaining
+        trade["stop_loss"] = new_stop
+        trade["target"] = new_target
+        trade["_partial_done"] = True
+        trade["partial_done"] = True
+        # Turns the trail on for THIS position only. _apply_trail is otherwise
+        # opt-in per symbol, and the runner must trail whether or not the
+        # symbol opted in — that is the whole point of leaving it on.
+        trade["_trail_active"] = bool(getattr(self.params, "trail_remainder", False))
+        trade["_trail_peak"] = live_price
+        # Free the margin the booked lots were holding, so available capital
+        # reflects the smaller position immediately.
+        if trade.get("_margin"):
+            trade["_margin"] = float(trade["_margin"]) * remaining / qty
+        self.db.update_trade_fields(trade["trade_id"], self.environment, {
+            "quantity": remaining, "stop_loss": new_stop, "target": new_target,
+            "partial_done": True,
+        })
+
+        pnl = (target - entry) * exit_qty * mult * (1 if side == "BUY" else -1)
+        today_real = self.db.today_realized(self.environment,
+                                            user_id=self.user_id)
+        with self.state.lock:
+            self.state.realized_pnl = today_real
+        self._refresh_daily()
+        self.state.push_log(
+            f"PARTIAL {inst.symbol} {side} {exit_qty}/{qty} @ {target:.2f} "
+            f"[TARGET] PnL ₹{pnl:,.2f} (order {res.order_id}) | "
+            f"{remaining} left, stop → {new_stop:.2f} (break-even + "
+            f"{getattr(self.params, 'breakeven_buffer_ticks', 0):g} ticks), "
+            f"runner target {new_target:.2f}"
+            f"{', trailing' if trade['_trail_active'] else ''}.")
+        self._recompute_unrealized()
+
     def _apply_trail(self, inst: Instrument, trade: dict, live_price: float,
                      atr: float) -> None:
         """ATR chandelier trailing stop — OPT-IN PER SYMBOL, default off.
@@ -1446,10 +1581,20 @@ class TradingEngine:
         ATR, so an unconfigured symbol keeps its fixed entry stop exactly as
         before this existed.
         """
-        rules = self.symbol_rules.get(inst.symbol)
-        if rules is None or atr <= 0:
+        if atr <= 0:
             return
-        mult = rules.trail_mult(self.params.atr_sl_mult)
+        rules = self.symbol_rules.get(inst.symbol)
+        if trade.get("_trail_active"):
+            # A scaled-out runner trails regardless of the per-symbol opt-in —
+            # _maybe_scale_out already decided this position trails, and the
+            # symbol's setting must not be able to countermand it. Falls back
+            # to the strategy's own ATR multiple when the symbol has no rule.
+            mult = (rules.trail_mult(self.params.atr_sl_mult)
+                    if rules is not None else self.params.atr_sl_mult)
+        elif rules is None:
+            return
+        else:
+            mult = rules.trail_mult(self.params.atr_sl_mult)
         if mult <= 0:
             return
 
@@ -1498,6 +1643,13 @@ class TradingEngine:
         if trade is None:
             return False
         trade["_live_price"] = live_price
+        # Scale-out FIRST, before anything reads stop/target/quantity on this
+        # tick. A multi-lot position touching its first target books part of
+        # itself here and rewrites all three; running this after the exit check
+        # below would instead close the WHOLE position at that target and the
+        # runner would never exist. A no-op for every strategy that does not
+        # set partial_exit_fraction, and for any position of one lot.
+        self._maybe_scale_out(inst, trade, live_price)
         # Order matters: move the stop FIRST, then let _resync_protection push
         # it to the broker on this same tick, then check the exits against the
         # stop we just set. Trailing after the exit check would leave the

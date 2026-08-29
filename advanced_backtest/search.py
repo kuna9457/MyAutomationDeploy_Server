@@ -81,6 +81,11 @@ class Combo:
     """One (symbol, pattern) candidate and how it did."""
     symbol: str
     pattern: str
+    #: "NSE_EQUITY" | "MCX_COMMODITY". Carried because the two size trades
+    #: COMPLETELY differently — equity solves qty from risk, MCX trades a fixed
+    #: lot — so their returns are not comparable and must not be ranked against
+    #: each other without the reader knowing.
+    segment: str = ""
     # Stage 1, attributed — a screen, not a measurement.
     screen_trades: int = 0
     screen_pnl: float = 0.0
@@ -120,6 +125,7 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
     symbol's own unfiltered summary for comparison."""
     inst = config.INSTRUMENTS_BY_SYMBOL.get(symbol)
     lot = inst.lot_size if inst else 1
+    segment = inst.segment.value if inst else ""
     res = backtester.run_backtest(
         symbol, spec.start, spec.end, spec.capital, spec.mode,
         lot_size=lot, strategy_key=spec.strategy_key,
@@ -151,6 +157,16 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
         "win_rate": res.metrics.get("Win Rate %", 0.0),
         "source": res.metrics.get("Data Source", ""),
         "baseline_oos_return": baseline_oos,
+        "segment": segment,
+        # MCX trades a FIXED lot gated on margin, so a commodity whose margin
+        # exceeds the capital produces zero trades and no error. Saying so is
+        # the difference between "this commodity has no edge" and "this run
+        # never placed a trade".
+        "margin_per_lot": (config.mcx_margin_per_lot(symbol)
+                           if segment == "MCX_COMMODITY" else None),
+        "unaffordable": bool(
+            segment == "MCX_COMMODITY"
+            and config.mcx_margin_per_lot(symbol) > spec.capital),
     }
     if res.trades is None or res.trades.empty:
         return [], summary
@@ -169,7 +185,7 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
               screen_trades=a["n"],
               screen_pnl=round(a["pnl"], 2),
               screen_win_rate=round(100.0 * a["wins"] / a["n"], 1),
-              baseline_oos_return=baseline_oos)
+              baseline_oos_return=baseline_oos, segment=segment)
         for name, a in agg.items()
     ]
     return combos, summary

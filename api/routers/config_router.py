@@ -60,6 +60,9 @@ def list_strategies(mode: str):
             # setting it would do nothing — a silently-ignored threshold is
             # worse than no control at all.
             "uses_min_score": s.uses_min_score,
+            # Segments this strategy can trade; [] = any. The UI uses it to
+            # warn before a run that would silently return zero trades.
+            "segments": [seg.value for seg in s.segments],
             "params": {
                 "timeframe": p.timeframe,
                 "risk_per_trade": p.risk_per_trade,
@@ -71,6 +74,17 @@ def list_strategies(mode: str):
                 # The strategy's OWN threshold, shown as the "inherit" value
                 # so an admin can see what they are deviating from.
                 "cs_min_score": p.cs_min_score,
+                # Session-anchored / multi-timeframe / scale-out settings.
+                # Zero on every strategy that does not use them, which is what
+                # lets the UI show the extra panel for exactly the ones that do
+                # rather than hardcoding a list of keys.
+                "htf_minutes": p.htf_minutes,
+                "orb_minutes": p.orb_minutes,
+                "orb_anchor_tz": p.orb_anchor_tz,
+                "orb_anchor_hhmm": p.orb_anchor_hhmm,
+                "partial_exit_fraction": p.partial_exit_fraction,
+                "runner_rr_mult": p.runner_rr_mult,
+                "trail_remainder": p.trail_remainder,
             },
         })
     return out

@@ -34,6 +34,26 @@ def _jsonable_trades(trades: pd.DataFrame) -> list[dict]:
     return t.to_dict("records")
 
 
+#: Bounds on a requested Intraday bar-size override. 1 = effectively Scalper's
+#: own grain (that mode exists for a reason — this endpoint doesn't stop you,
+#: but it won't silently accept nonsense either); 60 = a bar coarser than this
+#: is Swing's job, not an Intraday override.
+_MIN_TF_MINUTES, _MAX_TF_MINUTES = 1, 60
+
+
+def _check_timeframe(mode: "Mode", timeframe_minutes: int) -> None:
+    if not timeframe_minutes:
+        return
+    if mode != Mode.INTRADAY:
+        raise HTTPException(
+            400, "timeframe_minutes only overrides Intraday's bar size — "
+                 f"{mode.value} is not Intraday.")
+    if not (_MIN_TF_MINUTES <= timeframe_minutes <= _MAX_TF_MINUTES):
+        raise HTTPException(
+            400, f"timeframe_minutes must be between {_MIN_TF_MINUTES} and "
+                 f"{_MAX_TF_MINUTES}.")
+
+
 @router.post("/run")
 def run_backtest(req: BacktestRequest):
     if req.ticker not in config.INSTRUMENTS_BY_SYMBOL:
@@ -48,11 +68,13 @@ def run_backtest(req: BacktestRequest):
                                            req.side)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    _check_timeframe(mode, req.timeframe_minutes)
     result = backtester.run_backtest(
         req.ticker, req.start, req.end, req.initial_capital, mode,
         lot_size=inst.lot_size, strategy_key=req.strategy_key,
         risk_reward=req.risk_reward, min_score=req.min_score,
         filters=filters, patterns=req.patterns,
+        timeframe_minutes=req.timeframe_minutes,
     )
     equity = result.equity_curve
     return {
@@ -94,11 +116,13 @@ def bulk_backtest(req: BulkBacktestRequest):
                                            req.side)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    _check_timeframe(mode, req.timeframe_minutes)
 
     results = backtester.run_bulk_backtest(
         req.tickers, req.start, req.end, req.initial_capital, mode,
         strategy_key=req.strategy_key, risk_reward=req.risk_reward,
         min_score=req.min_score, filters=filters, patterns=req.patterns,
+        timeframe_minutes=req.timeframe_minutes,
     )
     summary = backtester.bulk_summary_frame(results)
 
@@ -129,12 +153,14 @@ def rr_sweep(req: RRSweepRequest):
     except ValueError:
         raise HTTPException(400, "Invalid mode.")
     inst = config.INSTRUMENTS_BY_SYMBOL[req.ticker]
+    _check_timeframe(mode, req.timeframe_minutes)
     try:
         rows = backtester.run_rr_sweep(
             req.ticker, req.start, req.end, req.initial_capital, mode,
             rr_start=req.rr_start, rr_step=req.rr_step, rr_end=req.rr_end,
             lot_size=inst.lot_size, strategy_key=req.strategy_key,
             min_score=req.min_score, patterns=req.patterns,
+            timeframe_minutes=req.timeframe_minutes,
         )
     except ValueError as exc:
         # Bad ladder (start<=0, end<start, step too small, too many runs) —

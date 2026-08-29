@@ -77,6 +77,11 @@ class BacktestRequest(BaseModel):
     #: actually trades. Non-empty overrides it for this run only and never
     #: writes anything back.
     patterns: list[str] = []
+    #: 0 = the mode's own bar size (15 for Intraday). Only meaningful for
+    #: Intraday — Swing (daily) and Scalper (native 1m) ignore it. Lets you
+    #: compare a 5m base against the saved 15m before committing the change
+    #: to live, the same way risk_reward/min_score already let you.
+    timeframe_minutes: int = 0
 
 
 class BulkBacktestRequest(BaseModel):
@@ -96,6 +101,8 @@ class BulkBacktestRequest(BaseModel):
     #: symbols and nothing else. Empty = fall back to the saved dashboard
     #: filter, exactly as in a single run.
     patterns: list[str] = []
+    #: 0 = the mode's own bar size. See BacktestRequest.timeframe_minutes.
+    timeframe_minutes: int = 0
 
 
 class RRSweepRequest(BaseModel):
@@ -122,6 +129,8 @@ class RRSweepRequest(BaseModel):
     min_score: float = 0.0
     #: Held constant across the sweep, like every other input except RR.
     patterns: list[str] = []
+    #: 0 = the mode's own bar size. See BacktestRequest.timeframe_minutes.
+    timeframe_minutes: int = 0
 
 
 class WatchlistSaveRequest(BaseModel):

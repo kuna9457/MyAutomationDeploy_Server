@@ -677,6 +677,63 @@ class StrategyParams:
     #: False everywhere else, so the live bot and ordinary backtests keep
     #: reading the saved filter exactly as before.
     ignore_pattern_filter: bool = False
+    # -- Session-anchored Opening Range knobs (Commodity.md) ----------------- #
+    #  Every one of these is INERT AT ITS DEFAULT. `orb_minutes = 0` switches
+    #  the whole opening-range apparatus off, and `partial_exit_fraction = 0.0`
+    #  switches the scale-out off, so a strategy that does not set them takes
+    #  the identical code path it did before this existed. Only the CRUDEOIL
+    #  strategy sets them today.
+    #
+    #  The anchor is a TIMEZONE + wall-clock time, never a fixed IST string:
+    #  09:00 America/New_York is 18:30 IST under EDT but 19:30 IST under EST,
+    #  so a hardcoded IST anchor silently builds the opening range on the wrong
+    #  bars for roughly five months of the year.
+    #: MULTI-TIMEFRAME bias filter, in minutes. 0 (the default) = single
+    #: timeframe, which is what every pre-existing strategy is and stays.
+    #:
+    #: The higher timeframe is RESAMPLED from the base candles inside the
+    #: strategy rather than fetched as a second feed. That is a deliberate
+    #: trade: one subscription, one candle stream, no second websocket to keep
+    #: in sync, and — the part that matters — a backtest replays the identical
+    #: derivation, so the higher timeframe cannot silently differ between live
+    #: and test. It must be an exact multiple of the base timeframe.
+    htf_minutes: int = 0
+    #: How many completed higher-timeframe bars set the bias, and how much of
+    #: them must agree. Ignored entirely when htf_minutes is 0.
+    htf_bars: int = 3
+    orb_anchor_tz: str = ""          # "" = no session anchor (day-anchored)
+    orb_anchor_hhmm: str = ""        # wall-clock time IN orb_anchor_tz, "HH:MM"
+    orb_minutes: int = 0             # 0 = no opening range; feature off
+    #: The opening range must be a sane multiple of current ATR before it is
+    #: worth trading. A collapsed range gives instant whipsaw breakouts; a
+    #: blown-out one means the move already happened inside the window and the
+    #: resulting stop would be enormous. 0 disables either bound.
+    orb_range_min_atr: float = 0.0
+    orb_range_max_atr: float = 0.0
+    #: Stop opening NEW positions this many minutes before the segment's
+    #: square-off, so an entry always has room to resolve. 0 = no cutoff.
+    entry_cutoff_before_close: int = 0
+    # -- Scale-out / runner management (Commodity.md §9.2-9.5) --------------- #
+    #: Fraction of the position booked when the first target prints. 0.0 (the
+    #: default) = no partial: the whole position closes at the target exactly
+    #: as it always has.
+    #:
+    #: A ONE-LOT position NEVER partials regardless of this value — there is
+    #: nothing to split, so it runs to the full target and closes there. The
+    #: engine enforces that, not this number.
+    partial_exit_fraction: float = 0.0
+    #: After the partial is booked, the remainder's stop moves to entry plus
+    #: this many ticks (long; minus for a short) — the friction buffer that
+    #: makes the runner genuinely risk-free after ROUND-TRIP costs rather than
+    #: merely break-even before them.
+    breakeven_buffer_ticks: float = 0.0
+    #: Runner target, as a multiple of the ORIGINAL risk distance. The
+    #: remainder is managed by the trail; this is the backstop beyond it.
+    runner_rr_mult: float = 0.0
+    #: Trail the remainder after the partial, independently of the per-symbol
+    #: opt-in trail. False = the remainder simply holds to its break-even stop
+    #: or the runner target.
+    trail_remainder: bool = False
 
 
 INTRADAY_PARAMS = StrategyParams(
@@ -797,6 +854,83 @@ CANDLE_SWING_PARAMS = StrategyParams(
     max_leverage=1.0,           # delivery = unleveraged
     cs_min_score=3.0,
     cs_trend_lookback=20,       # a daily "trend" deserves a longer look-back
+)
+
+# --------------------------------------------------------------------------- #
+#  CRUDEOIL — US-session Opening Range Breakout (Commodity.md)
+#
+#  MCX crude barely moves on its own in the Indian morning; it moves when the
+#  US session opens and NYMEX starts trading. So this strategy ignores the
+#  09:00 IST MCX open entirely, anchors its VWAP and its opening range to
+#  09:00 New York, and trades the break of that range.
+#
+#  Timeframe is 15m because Mode.INTRADAY's feed is 15m (data_feed.TF_MINUTES);
+#  the opening range is therefore the first TWO bars after the anchor. Filed
+#  under INTRADAY (not a new Mode) on purpose: INTRADAY is already in
+#  SQUARE_OFF_MODES and already square-offs MCX at 23:15, which is exactly the
+#  behaviour this strategy needs, so it inherits it rather than re-declaring it.
+#
+#  SIZING IS NOT SET HERE. Commodities size at the FIXED lot count the admin
+#  puts next to the symbol in the sidebar (engine._mcx_fixed_size) — the same
+#  path every other MCX trade takes. risk_per_trade below is the ceiling that
+#  path is checked against, never a second sizing rule.
+# --------------------------------------------------------------------------- #
+CRUDEOIL_PARAMS = StrategyParams(
+    mode=Mode.INTRADAY, timeframe="15m",
+    # 1% risk ceiling — well inside the 2% Immutable Rule #1 forbids crossing.
+    # Crude gaps harder than equity, so it gets the tighter of the two.
+    risk_per_trade=0.01,
+    risk_reward=1.5,            # in RR_CHOICES; admin/per-symbol may override
+    atr_period=14, atr_sl_mult=1.5,
+    allow_short=True,           # crude is genuinely two-sided
+    use_atr_gate=True,          # skip dead tape and volatility spikes
+    atr_median_window=50, atr_norm_low=0.5, atr_norm_high=2.0,
+    context_bars=10, context_min_frac=0.6,
+    use_limit_entry=True,       # bounds slippage, which bounds realised risk
+    limit_offset_ticks=2.0,
+    max_hold_minutes=0,         # no time stop — an ORB trade needs room
+    reentry_cooldown_bars=3,
+    max_leverage=25.0,          # MCX MIS margin ~4.5% => ~22x
+    # -- multi-timeframe ----------------------------------------------------- #
+    # Signal on the 15m base bar, bias from the 60m structure resampled off it.
+    # Commodity.md specified 5m/15m; the base timeframe here is 15m because
+    # Mode.INTRADAY's feed is 15m (data_feed.TF_MINUTES), so the SAME 1:4 ratio
+    # is preserved one rung up rather than pretending to a 5m feed that does
+    # not exist. Whatever the base becomes, htf_minutes must stay a multiple.
+    htf_minutes=60, htf_bars=3,
+    # -- the opening range itself ------------------------------------------- #
+    orb_anchor_tz="America/New_York",
+    orb_anchor_hhmm="09:00",    # = 18:30 IST (EDT) / 19:30 IST (EST)
+    orb_minutes=30,             # two 15-minute bars
+    orb_range_min_atr=0.3, orb_range_max_atr=3.0,
+    entry_cutoff_before_close=45,   # no new entries after ~22:30 IST
+    # -- scale-out (only ever applies to a MULTI-lot position) -------------- #
+    partial_exit_fraction=0.5,
+    breakeven_buffer_ticks=3.0,
+    runner_rr_mult=3.0,
+    trail_remainder=True,
+)
+
+
+# --------------------------------------------------------------------------- #
+#  Crudeoil Pipeline bridge params (crudeoil_pipeline/, newcrudeoil.md)
+#
+#  These configure the PLATFORM side of the bridge only — the feed timeframe,
+#  the risk ceiling the engine enforces, and the ATR inputs handed across.
+#  Everything else the pipeline does (session anchoring, event overlays, the
+#  cost gate, regime classification) is governed by
+#  crudeoil_pipeline/config/settings.yaml, which stays that package's single
+#  source of truth. Two config files is deliberate: the package must remain
+#  runnable and testable with no WelthWest code present at all.
+# --------------------------------------------------------------------------- #
+CRUDEOIL_PIPELINE_PARAMS = StrategyParams(
+    mode=Mode.INTRADAY, timeframe="15m",
+    risk_per_trade=0.01,        # 1% — inside the 2% Immutable Rule #1 ceiling
+    risk_reward=2.0,            # the pipeline's momentum target, in R
+    atr_period=14, atr_sl_mult=1.25,
+    allow_short=True,
+    max_leverage=25.0,
+    reentry_cooldown_bars=3,
 )
 
 

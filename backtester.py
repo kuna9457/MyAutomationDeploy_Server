@@ -180,6 +180,29 @@ def _save_cached_history(ticker: str, interval: str, start: str, end: str,
 # Equity: ~6.25h/day => 25 fifteen-minute bars, 375 one-minute bars.
 BARS_PER_YEAR = {"1d": TRADING_DAYS, "15m": TRADING_DAYS * 25,
                  "1m": TRADING_DAYS * 375}
+# The session length the two intraday constants above already encode (375 min
+# = 25 bars * 15 min = 6.25h). Any OTHER intraday bar size (a 5m Intraday run,
+# say) derives its own bars/year from this instead of silently reusing the 15m
+# constant via a bare dict .get() fallback — that would under-annualise Sharpe
+# by the size of the mismatch (3x too few periods/year for a 5m run) without
+# ever raising an error.
+EQUITY_SESSION_MINUTES = 6.25 * 60
+
+
+def _bars_per_year(interval: str) -> float:
+    """Bars/year for Sharpe/Calmar annualisation, generalised beyond the two
+    hardcoded intraday constants above so an alternate Intraday timeframe
+    (interval == "5m", "10m", ...) still annualises correctly."""
+    if interval in BARS_PER_YEAR:
+        return BARS_PER_YEAR[interval]
+    if interval.endswith("m"):
+        try:
+            tf = int(interval[:-1])
+            if tf > 0:
+                return TRADING_DAYS * (EQUITY_SESSION_MINUTES / tf)
+        except ValueError:
+            pass
+    return TRADING_DAYS * 25
 
 
 @dataclass
@@ -251,11 +274,25 @@ def _fetch_upstox_candles_raw(hist_api, instrument_key: str, up_interval: str,
     return candles
 
 
+def _interval_minutes(interval: str) -> Optional[int]:
+    """"5m" -> 5, "15m" -> 15, "1m"/"1d" -> None (nothing to resample to — 1m
+    IS Upstox's native grain and 1d is fetched as native daily candles)."""
+    if interval in ("1d", "1m") or not interval.endswith("m"):
+        return None
+    try:
+        n = int(interval[:-1])
+        return n if n > 0 else None
+    except ValueError:
+        return None
+
+
 def _fetch_upstox_hist(
     instrument_key: str, start: str, end: str, interval: str, token: str
 ) -> pd.DataFrame:
     """Real historical candles from Upstox for one instrument over [start, end].
-    Daily for swing; 1-minute resampled to 15m for intraday. Indexed IST-naive."""
+    Daily for swing; 1-minute resampled to the requested intraday bar size
+    (15m by default, or any other "Xm" — e.g. a 5m Intraday run) otherwise.
+    Indexed IST-naive."""
     import upstox_client  # type: ignore
     cfg = upstox_client.Configuration()
     cfg.access_token = token
@@ -272,10 +309,13 @@ def _fetch_upstox_hist(
     df = (df.set_index("ts").sort_index()
           [["open", "high", "low", "close", "volume"]].astype(float))
     df = df[~df.index.duplicated(keep="last")]
-    # Only 15m needs building; "1m" is already what Upstox returned, and
-    # resampling it to 15min would silently backtest the wrong timeframe.
-    if interval == "15m":
-        df = df.resample("15min").agg(
+    # Only a coarser-than-1m interval needs building; "1m" is already what
+    # Upstox returned, and resampling it to itself would silently backtest the
+    # wrong timeframe. Generalised beyond 15m so any "Xm" Intraday override
+    # (5m, 10m, ...) gets built off the identical raw 1-minute candles.
+    tf = _interval_minutes(interval)
+    if tf:
+        df = df.resample(f"{tf}min").agg(
             {"open": "first", "high": "max", "low": "min",
              "close": "last", "volume": "sum"}).dropna()
     return df
@@ -352,7 +392,15 @@ def fetch_history(
 
 def synthetic_history(start: str, end: str, interval: str = "1d",
                       seed_key: str = "") -> pd.DataFrame:
-    freq = {"1d": "1D", "15m": "15min", "1m": "1min"}.get(interval, "15min")
+    if interval == "1d":
+        freq = "1D"
+    elif interval == "1m":
+        freq = "1min"
+    else:
+        # Any "Xm" Intraday override (15m default, or a 5m/10m run) — falls
+        # back to 15min only for a genuinely malformed interval string.
+        tf = _interval_minutes(interval)
+        freq = f"{tf}min" if tf else "15min"
     idx = pd.date_range(start=start, end=end, freq=freq)
     if len(idx) < 50:
         idx = pd.date_range(end=config.now_ist(), periods=400, freq=freq)
@@ -478,6 +526,7 @@ def run_backtest(
     filters: Optional["TradeFilters"] = None,
     patterns: Optional[list[str]] = None,
     ignore_saved_patterns: bool = False,
+    timeframe_minutes: int = 0,
 ) -> BacktestResult:
     # Same resolution the engine uses, so a backtest measures exactly the
     # strategy the bot would trade — parameters included. That has to include
@@ -511,13 +560,31 @@ def run_backtest(
     # through run_strategy(), so the overrides take effect without rebinding
     # `sd`. (The live engine DOES rebind, because its runner goes through
     # run_strategy(sd, ...) and would otherwise read the strategy's own.)
-    interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
+    # timeframe_minutes ONLY overrides Intraday's bar size (0 = its default,
+    # 15). Swing (daily bars, by design) and Scalper (native 1m, by design)
+    # are not this knob's business — an override passed under either mode is
+    # silently ignored rather than raising, matching how risk_reward=0 /
+    # min_score=0 already mean "don't override" everywhere else here.
+    if mode == Mode.INTRADAY and timeframe_minutes and timeframe_minutes > 0:
+        interval = f"{int(timeframe_minutes)}m"
+    else:
+        interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
     # Resolve the Upstox instrument key + live token so we backtest on REAL data.
     inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)
     instrument_key = inst.instrument_key if inst else ""
     contract_multiplier = inst.contract_multiplier if inst else 1
     session_open = (config.market_hours_for_segment(inst.segment).open_t
                     if inst else None)
+    # End-of-session flat-out — the backtest's counterpart to
+    # strategy_runner._square_off_due/_do_square_off. Live, an INTRADAY/SCALPER
+    # position is force-closed at this wall-clock time regardless of P&L
+    # (15:09 equity, 23:15 MCX — config.DEFAULT_SQUARE_OFF); a backtest that
+    # skips this lets a position run past it and grants trades runway the live
+    # bot never gives them, which systematically flatters slow-moving symbols
+    # and high-RR targets that would have been cut off. None for Swing (holds
+    # overnight by design) and when the instrument is unknown.
+    square_off_cutoff = (config.square_off_time_for(inst.segment, mode)
+                         if inst else None)
     # Same notional cap the live engine applies, so backtest quantities are ones
     # the account could actually have funded.
     max_leverage = (config.max_leverage_for(inst.segment, params) if inst
@@ -579,9 +646,40 @@ def run_backtest(
     # The signal fns read only the last two bars (indicators are pre-computed), but
     # keep a >= warmup-sized tail so their internal length guard still passes.
     tail = warmup + 6
+
+    # SESSION-ANCHORED strategies (Commodity.md) are the exception: they do not
+    # read the last two bars, they rebuild a whole session — an anchored VWAP
+    # from the US open, an opening range, and a resampled higher timeframe —
+    # from the window they are handed. A 34-bar tail would silently truncate the
+    # session and make the anchored VWAP disagree with the live bot's.
+    #
+    # Gated on the strategy DECLARING an anchor or a higher timeframe, so every
+    # existing strategy keeps the exact warmup and tail it had before this
+    # existed and its backtests stay bit-identical.
+    if getattr(params, "orb_minutes", 0) or getattr(params, "htf_minutes", 0):
+        # Derived from the ACTUAL resolved interval (honours timeframe_minutes)
+        # rather than re-hardcoding 15 for Intraday, so a session-anchored /
+        # HTF-bias strategy run at an overridden bar size still sizes its
+        # session and HTF look-back correctly.
+        bar_min = (_interval_minutes(interval)
+                  or {Mode.SWING: 24 * 60, Mode.INTRADAY: 15, Mode.SCALPER: 1}[mode])
+        # One MCX session is 09:00-23:30 IST; two of them covers the anchor even
+        # when the window opens mid-session, plus the ATR median look-back.
+        session_bars = int((14.5 * 60) / bar_min) + 1
+        htf_bars_needed = (int(params.htf_minutes / bar_min) * (params.htf_bars + 2)
+                           if params.htf_minutes else 0)
+        warmup = max(warmup, params.atr_median_window + params.atr_period + 2)
+        tail = max(tail, session_bars * 2, htf_bars_needed,
+                   params.atr_median_window + params.atr_period + 6)
     for i in range(warmup, len(data)):
         window = data.iloc[max(0, i - tail + 1): i + 1]
         bar = data.iloc[i]
+        # True from the first bar whose wall-clock time is at/after the
+        # session's square-off cutoff. Resets naturally on the next day's
+        # first bar since it's read straight off the bar's own timestamp —
+        # no day-rollover bookkeeping needed, unlike the live poller.
+        past_cutoff = (square_off_cutoff is not None
+                       and bar.name.time() >= square_off_cutoff)
 
         # manage an open position first
         if position is not None:
@@ -605,6 +703,13 @@ def run_backtest(
                 if held_bars >= params.max_hold_minutes:   # 1 bar == 1 minute
                     exit_price = float(bar["close"])
                     exit_reason = f"TIME-EXIT ({params.max_hold_minutes}m)"
+            # End-of-session square-off. Checked LAST, same order as the live
+            # runner (own SL/TP/time-exit first, square-off after) — it only
+            # fires when nothing else already closed the position this bar.
+            # Unconditional on P&L: a time stop, not a decision.
+            if exit_price is None and past_cutoff:
+                exit_price = float(bar["close"])
+                exit_reason = f"SQUARE-OFF ({square_off_cutoff.strftime('%H:%M')})"
             if exit_price is not None:
                 direction = 1 if is_long else -1
                 pnl = ((exit_price - position["entry"]) * position["qty"]
@@ -632,7 +737,10 @@ def run_backtest(
         # (generate_signal would re-enrich = O(n^2)).
         # Entry filters gate ENTRIES ONLY — the position block above has
         # already run, so a bar excluded here can still close a position.
-        bar_allowed = filters is None or filters.allows_bar(bar.name)
+        # `not past_cutoff` mirrors the live runner: past the square-off time
+        # nothing new may be opened, whatever the setup looks like.
+        bar_allowed = ((filters is None or filters.allows_bar(bar.name))
+                       and not past_cutoff)
         if position is None and not cooling and bar_allowed:
             sig = signal_fn(window)
             if sig is not None and filters is not None \
@@ -894,6 +1002,7 @@ def run_rr_sweep(
     strategy_key: str = "",
     min_score: float = 0.0,
     patterns: Optional[list[str]] = None,
+    timeframe_minutes: int = 0,
 ) -> list[dict]:
     """Run the same backtest once per RR and return one summary row each.
 
@@ -924,7 +1033,8 @@ def run_rr_sweep(
                                mode, lot_size=lot_size,
                                strategy_key=strategy_key,
                                risk_reward=rr, min_score=min_score,
-                               patterns=patterns)
+                               patterns=patterns,
+                               timeframe_minutes=timeframe_minutes)
             m = res.metrics
             rows.append({
                 "risk_reward": rr,
@@ -962,6 +1072,7 @@ def run_bulk_backtest(
     min_score: float = 0.0,
     filters: Optional["TradeFilters"] = None,
     patterns: Optional[list[str]] = None,
+    timeframe_minutes: int = 0,
 ) -> dict[str, BacktestResult]:
     """Run the SAME strategy with the SAME parameters over every ticker in the
     bucket and return {ticker: BacktestResult}. Each instrument is simulated
@@ -980,7 +1091,10 @@ def run_bulk_backtest(
     single-ticker path resolves it, so quantities stay realistic.
     """
     total = len(tickers)
-    interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
+    if mode == Mode.INTRADAY and timeframe_minutes and timeframe_minutes > 0:
+        interval = f"{int(timeframe_minutes)}m"
+    else:
+        interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
 
     def _run_one(ticker: str) -> tuple[str, BacktestResult]:
         inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)
@@ -990,7 +1104,8 @@ def run_bulk_backtest(
                 ticker, start, end, initial_capital, mode,
                 lot_size=lot_size, strategy_key=strategy_key,
                 risk_reward=risk_reward, min_score=min_score,
-                filters=filters, patterns=patterns)
+                filters=filters, patterns=patterns,
+                timeframe_minutes=timeframe_minutes)
         except Exception as exc:
             # One bad symbol must not sink the whole bucket — record an empty
             # result so the UI can show it failed rather than aborting the run.
@@ -1061,7 +1176,7 @@ def _metrics(equity: pd.Series, trades: pd.DataFrame,
     max_dd = drawdown.min() * 100  # negative
 
     rets = equity.pct_change().dropna()
-    periods_per_year = BARS_PER_YEAR.get(interval, TRADING_DAYS * 25)
+    periods_per_year = _bars_per_year(interval)
     if rets.std() > 0:
         sharpe = (rets.mean() / rets.std()) * np.sqrt(periods_per_year)
     else:

@@ -37,8 +37,9 @@ from fastapi.security import OAuth2PasswordRequestForm  # noqa: E402
 from api.auth import (CurrentUser, TokenResponse, authenticate,  # noqa: E402
                       create_access_token, get_current_user)
 from api.routers import (account, admin_users, advanced_backtest,  # noqa: E402
-                         auditor, backtest, bot, broker, chart,
-                         config_router, risk, trades)
+                         auditor, backtest, bot, broker, bulk_backtest,
+                         chart, config_router, crudeoil_pipeline_api,
+                         risk, trades)
 
 app = FastAPI(title="Trading Bot API")
 
@@ -87,3 +88,10 @@ app.include_router(auditor.router)
 app.include_router(chart.router)
 # Combination search: which symbol x pattern actually works. Read-only.
 app.include_router(advanced_backtest.router)
+# MCX crude pipeline (crudeoil_pipeline/) — an ISOLATED, greenfield package.
+# This adapter is the only thing that bridges it to the app; the package
+# imports nothing from here, which is what keeps it independently testable
+# (see crudeoil_pipeline/CLAUDE.md RULE #1 and tests/test_isolation.py).
+app.include_router(crudeoil_pipeline_api.router)
+# Multi-axis optimizer: separate funnel search (bulk_backtest/).
+app.include_router(bulk_backtest.router)

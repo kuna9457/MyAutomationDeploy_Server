@@ -500,6 +500,19 @@ class StrategyDef:
     #: reads it is silent, and silent settings are how people lose an evening.
     #: A new scoring strategy opts in by setting this True at registration.
     uses_min_score: bool = False
+    #: Segments this strategy can actually trade. EMPTY (the default) means
+    #: "any", which is what every general-purpose strategy is and stays.
+    #:
+    #: Declared rather than inferred because the failure it prevents is silent:
+    #: a session-anchored commodity strategy run on an equity produces ZERO
+    #: signals and no error — the US-open anchor (18:30/19:30 IST) simply falls
+    #: outside the 09:15-15:30 equity session, so the opening range never forms.
+    #: An empty result then reads as "no setups found" rather than "wrong
+    #: instrument", which is a genuinely misleading thing for a UI to show.
+    segments: tuple = ()
+
+    def supports_segment(self, segment) -> bool:
+        return not self.segments or segment in self.segments
 
     @property
     def modes(self) -> tuple[Mode, ...]:
@@ -512,7 +525,8 @@ class StrategyDef:
         return BoundStrategy(key=self.key, name=self.name, mode=mode,
                              params=self.params_by_mode[mode], fn=self.fn,
                              summary=self.summary,
-                             uses_min_score=self.uses_min_score)
+                             uses_min_score=self.uses_min_score,
+                             segments=self.segments)
 
 
 @dataclass(frozen=True)
@@ -530,6 +544,10 @@ class BoundStrategy:
     fn: SignalFn
     summary: str
     uses_min_score: bool = False
+    segments: tuple = ()
+
+    def supports_segment(self, segment) -> bool:
+        return not self.segments or segment in self.segments
 
 
 _REGISTRY: dict[str, StrategyDef] = {}
@@ -590,6 +608,14 @@ _DEFAULT_BY_MODE = {
     Mode.SWING: "swing_trend_momentum",
     Mode.SCALPER: "scalp_vwap_atr",
 }
+
+
+def all_strategies() -> list[StrategyDef]:
+    """Every registered strategy, unbound — for callers that list the whole
+    catalogue rather than one timeframe's slice (e.g. a form that picks the mode
+    after the strategy). Anything that RUNS a strategy wants
+    `strategies_for_mode` instead, so it gets that mode's own params."""
+    return list(_REGISTRY.values())
 
 
 def strategies_for_mode(mode: Mode) -> list[BoundStrategy]:

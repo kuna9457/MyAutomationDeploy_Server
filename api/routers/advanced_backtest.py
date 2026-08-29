@@ -15,7 +15,7 @@ from advanced_backtest import jobs
 from advanced_backtest.search import (DEFAULT_VERIFY_TOP, MAX_WORKERS,
                                       SearchSpec)
 from api.auth import require_admin
-from config import Mode
+from config import Mode, Segment
 
 router = APIRouter(prefix="/advanced-backtest", tags=["advanced-backtest"],
                    dependencies=[Depends(require_admin)])
@@ -109,4 +109,13 @@ def cancel(job_id: str):
 def limits():
     """What the UI needs to describe the form honestly — rather than repeating
     a number that then drifts from the server's."""
-    return {"max_symbols": MAX_SYMBOLS, "workers": MAX_WORKERS}
+    # The MCX margin table travels with the limits so the form can warn BEFORE
+    # a run that a commodity is unaffordable at the chosen capital — otherwise
+    # it silently returns zero trades, which reads as "no edge".
+    margins = {
+        i.symbol: config.mcx_margin_per_lot(i.symbol)
+        for i in config.ALL_INSTRUMENTS
+        if i.segment == Segment.MCX
+    }
+    return {"max_symbols": MAX_SYMBOLS, "workers": MAX_WORKERS,
+            "mcx_margin_per_lot": margins}
