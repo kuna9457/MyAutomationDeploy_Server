@@ -61,6 +61,14 @@ def get_client() -> Optional[Any]:
         return _client
 
 
+def is_connected() -> bool:
+    """Whether a Mongo connection is currently cached. NO network call — unlike
+    get_client(), which retries a failed connection (and blocks up to its
+    1.5s selection timeout) every time it is asked. For status reporting that
+    runs on a timer, where asking must never cost a connection attempt."""
+    return _client is not None
+
+
 def get_db() -> Optional[Any]:
     """The shared database handle, or None when Mongo is unreachable."""
     client = get_client()

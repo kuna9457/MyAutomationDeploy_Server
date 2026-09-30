@@ -98,6 +98,22 @@ class CostModel:
 
         return brokerage + stt + exchange_txn + gst + stamp + sebi + slippage
 
+    def duplicate_entry_charge(self) -> float:
+        """What a SECOND exit leg over-charges, per leg, in Rs.
+
+        round_trip_cost() prices one entry + one exit. A position that scales
+        out is really ONE entry and TWO exits — three orders — but charging a
+        round trip per leg counts four. Every other head is turnover-based and
+        sums correctly across the legs (each leg carries half the quantity);
+        only the FLAT per-order brokerage, and the GST charged on it, are
+        counted twice.
+
+        The caller subtracts this from each leg after the first. Without it a
+        scale-out is penalised for an entry it never placed, which is exactly
+        the thing that decides whether booking a partial is worth doing.
+        """
+        return self.brokerage_per_order * (1.0 + self.gst_pct / 100.0)
+
     def cost_per_crore(self) -> float:
         """Approximate all-in cost per ₹1 crore of round-trip turnover.
 
@@ -121,3 +137,75 @@ MCX_COMMODITY = CostModel(
     stamp_pct=0.002,         # futures stamp duty (lower than equity)
     slippage_bps=5.0,        # MCX is less liquid; wider estimate
 )
+
+
+# --------------------------------------------------------------------------- #
+#  US equities.
+#
+#  A SEPARATE CLASS, not CostModel with different numbers, because none of the
+#  Indian heads exist here: there is no STT, no stamp duty, no GST and no SEBI
+#  fee, and retail commission is routinely zero. Reusing those field names with
+#  zeros in them would make every reader of this file believe something false.
+#
+#  What a US intraday round trip actually costs:
+#    * Commission       — $0 at Alpaca and most retail brokers.
+#    * SEC Section 31   — SELL side only, on notional.
+#    * FINRA TAF        — SELL side only, PER SHARE, capped per trade.
+#    * Spread/slippage  — the real cost, same as everywhere.
+#
+#  RATES CHANGE. The SEC fee is re-set by the Commission (it has moved by more
+#  than 3x within a single decade) and FINRA revises the TAF. The two defaults
+#  below are the right ORDER OF MAGNITUDE, not a live schedule — verify them
+#  against the current SEC/FINRA fee notices before trusting a net figure, the
+#  same way you would re-check an STT change.
+#
+#  Amounts are in USD. Do not add these to a rupee P&L (config.SEGMENT_CURRENCY).
+# --------------------------------------------------------------------------- #
+@dataclass
+class USEquityCostModel:
+    """All-in round-trip cost for one US intraday equity trade, in USD.
+
+    Duck-types CostModel: it exposes the same round_trip_cost() signature, so
+    the backtester can hold either without caring which market it is pricing.
+    """
+    #: Per ORDER. Zero at Alpaca; set it if your broker charges.
+    commission_per_order: float = 0.0
+    #: SEC Section 31 fee, PERCENT of sell-side notional. VERIFY (see above).
+    sec_fee_pct: float = 0.00278
+    #: FINRA Trading Activity Fee, USD per share sold. VERIFY (see above).
+    finra_taf_per_share: float = 0.000166
+    #: FINRA caps the TAF per trade.
+    finra_taf_cap: float = 8.30
+    #: Estimated slippage per leg, in basis points. Same caveat as CostModel's:
+    #: unknowable from OHLCV, and a haircut rather than a measurement. Large-cap
+    #: US spreads are typically tighter than Indian ones, hence 2 rather than 3.
+    slippage_bps: float = 2.0
+
+    def duplicate_entry_charge(self) -> float:
+        """See CostModel.duplicate_entry_charge. No GST here, and commission
+        is usually zero at a US retail broker, so this is normally 0.0."""
+        return self.commission_per_order
+
+    def round_trip_cost(self, entry_price: float, exit_price: float,
+                        qty: float, contract_multiplier: float = 1.0) -> float:
+        """Total cost of one round trip, in USD. Always positive.
+
+        NOTE the asymmetry that makes this worth its own class: the SEC fee and
+        the TAF are charged on the SELL leg ONLY. This function is handed entry
+        and exit rather than buy and sell, so for a SHORT the two are swapped —
+        the error is bounded by the price move over the trade and is well under
+        a cent at retail size, but it is an approximation, not an identity.
+        """
+        buy_notional = entry_price * qty * contract_multiplier
+        sell_notional = exit_price * qty * contract_multiplier
+
+        commission = self.commission_per_order * 2
+        sec_fee = sell_notional * (self.sec_fee_pct / 100.0)
+        taf = min(qty * contract_multiplier * self.finra_taf_per_share,
+                  self.finra_taf_cap)
+        slippage = (buy_notional + sell_notional) * (self.slippage_bps / 10_000.0)
+        return commission + sec_fee + taf + slippage
+
+
+#: Default US intraday equity cost model — a commission-free broker (Alpaca).
+US_EQUITY = USEquityCostModel()

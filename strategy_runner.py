@@ -46,7 +46,8 @@ from datetime import datetime
 from typing import Any, Optional, Protocol
 
 import config
-from config import Instrument, Mode, market_hours_for_segment, now_ist
+from config import (Instrument, Mode, Segment, market_hours_for_segment,
+                    now_for_segment, now_ist)
 from data_feed import LiveQuote, MarketDataFeed, SimulatedFeed, make_feed
 from strategy import BoundStrategy, Signal, atr as atr_series, run_strategy
 
@@ -182,9 +183,20 @@ def acquire_feed(mode: Mode, feed_token: str, instruments: list[Instrument],
                 entry["feed"].stop()
             except Exception:
                 pass
+            old_feed = entry["feed"]
             feed = _build_feed(mode, feed_token, list(merged.values()), log)
             entry.update(feed=feed, instruments=merged,
                          symbols=set(merged), refs=entry["refs"] + 1)
+            # Runners ALREADY borrowing this socket still hold the feed we just
+            # stopped. Left alone they read a dead object forever — candles and
+            # quotes frozen at the moment of the restart — while the dashboard
+            # keeps reporting the last status. Re-point them at the new one.
+            # list() over the dict's values is one C-level copy, so no registry
+            # lock is taken here (release() takes that lock THEN this one; the
+            # reverse order would be a deadlock).
+            for runner in list(_runners.values()):
+                if runner.feed is old_feed:
+                    runner.feed = feed
             return feed, key
 
         feed = _build_feed(mode, feed_token, list(want.values()), log)
@@ -197,8 +209,24 @@ def _build_feed(mode: Mode, feed_token: str, instruments: list[Instrument],
                 log=None) -> MarketDataFeed:
     """Construct and START one feed. Never raises — a live feed that cannot
     start degrades to simulated, which is what the per-runner code did."""
-    feed = make_feed(prefer_real=bool(feed_token), access_token=feed_token,
-                     mode=mode)
+    # US instruments cannot be served by an Upstox socket, and their bars must
+    # arrive in New York local time. Route them to Alpaca; everything else
+    # takes the exact path it always did.
+    if instruments and all(i.segment == Segment.US_EQUITY for i in instruments):
+        from data_feed import AlpacaRestFeed
+        feed = AlpacaRestFeed(mode=mode)
+    elif any(i.segment == Segment.US_EQUITY for i in instruments or []):
+        # A runner is one feed, and no feed can serve both venues. Groups are
+        # already per-strategy/per-mode, so this only happens if someone mixes
+        # venues inside ONE group — which is a configuration mistake, not a
+        # case to paper over with a half-working feed.
+        raise ValueError(
+            "A strategy group cannot mix US_EQUITY with Indian instruments — "
+            "they need different feeds, different market hours and different "
+            "currencies. Put the US symbols in their own group.")
+    else:
+        feed = make_feed(prefer_real=bool(feed_token), access_token=feed_token,
+                         mode=mode)
     try:
         feed.start(instruments)
         return feed
@@ -440,11 +468,34 @@ class StrategyRunner:
                 self._log(f"⚠️ tick error: {exc}")
             self._stop.wait(self.poll_seconds)
 
+    def _end_tick(self, accounts: list[Account]) -> None:
+        """Tell accounts the poll is over. OPTIONAL on an account: a local
+        TradingEngine has nothing to flush, so only accounts that buffer their
+        events (fleet_broadcast.RemoteAccount sends one batched frame per poll)
+        define it. Same failure isolation as every other broadcast."""
+        flushers = [a for a in accounts if hasattr(a, "end_tick")]
+        if flushers:
+            self._broadcast(lambda a: a.end_tick(), flushers)
+
     def tick(self) -> None:
+        """One poll, then the end-of-poll flush for accounts that buffer."""
+        try:
+            self._tick_inner()
+        finally:
+            with self._accounts_lock:
+                accounts = list(self._accounts)
+            self._end_tick(accounts)
+
+    def _tick_inner(self) -> None:
         """One poll: refresh every instrument, let accounts manage what they
         hold, then decide entries once and broadcast them."""
+        # The ACCOUNT clock stays IST — begin_tick, logs and the daily rollover
+        # are book-keeping for the operator, who is in India whatever the
+        # instrument is. Each INSTRUMENT then gets its own exchange-local clock
+        # below, because a US session runs 09:30-16:00 New York, which in IST
+        # terms wraps past midnight and would make is_open() and the square-off
+        # comparison false for the whole session. See config.now_for_segment.
         now_dt = now_ist()
-        now_t = now_dt.time()
         accounts = self._snapshot_accounts()
         if not accounts:
             return
@@ -452,8 +503,12 @@ class StrategyRunner:
         self._broadcast(lambda a: a.begin_tick(now_dt, feed_status), accounts)
 
         for inst in self.instruments:
+            # Exchange-local wall clock for THIS instrument. Identical to
+            # now_ist() for every Indian segment, so nothing about the existing
+            # path changes.
+            local_dt = now_for_segment(inst.segment)
             hours = market_hours_for_segment(inst.segment)
-            market_open = hours.is_open(now_t)
+            market_open = hours.is_open(local_dt.time())
             rules = self.symbol_rules.get(inst.symbol)
 
             quote = self.feed.get_quote(inst)
@@ -468,7 +523,7 @@ class StrategyRunner:
             # trigger below so single-account behaviour is exactly what it was
             # before this split.
             ev = TickEvent(inst, quote, live_price, market_open, bar_ts,
-                           now_dt, self._trail_atr(inst, df, rules))
+                           local_dt, self._trail_atr(inst, df, rules))
             closed = self._broadcast(lambda a, e=ev: a.on_tick(e), accounts)
             if any(closed) and bar_ts is not None:
                 self._last_action_bar[inst.symbol] = bar_ts
@@ -476,22 +531,35 @@ class StrategyRunner:
             # 2) END-OF-SESSION FLAT-OUT. Runs BEFORE the strategy's own exit
             # logic and before any entry: past the cutoff nothing may be held
             # and nothing new may be opened, whatever the position is worth.
-            if self._square_off_due(inst, now_dt):
-                self._do_square_off(inst, live_price, now_dt, accounts)
+            if self._square_off_due(inst, local_dt):
+                self._do_square_off(inst, live_price, local_dt, accounts)
                 continue
 
             # 3) The runner's own exit trigger: the unifier that gets every
             # account out at the SAME moment, whatever price each of them
             # happened to fill at. Accounts already out are a no-op.
-            if self._reference_exit(inst, live_price, now_dt, accounts) and bar_ts:
+            if self._reference_exit(inst, live_price, local_dt, accounts) and bar_ts:
                 self._last_action_bar[inst.symbol] = bar_ts
                 continue
 
             # 3) Entry gating — identical order to the original engine loop.
             if not market_open or df.empty:
                 continue
+            # No new positions once there is too little session left for one to
+            # resolve (config.entry_cutoff_for). A no-op for every strategy
+            # that leaves entry_cutoff_before_close at 0. Checked here, with
+            # the other ENTRY gates, so it can never close an open position —
+            # it only declines to open new ones.
+            cutoff = config.entry_cutoff_for(
+                inst.segment, self.mode, self.params, self.square_off_time)
+            if cutoff is not None and local_dt.time() >= cutoff:
+                self._log_window_skip(
+                    inst.symbol,
+                    f"past the entry cutoff ({cutoff.strftime('%H:%M')})",
+                    accounts)
+                continue
             if rules is not None:
-                blocked = rules.entry_block_reason(now_dt)
+                blocked = rules.entry_block_reason(local_dt)
                 if blocked:
                     self._log_window_skip(inst.symbol, blocked, accounts)
                     continue
@@ -508,7 +576,7 @@ class StrategyRunner:
             # 5) Record it platform-wide, then broadcast simultaneously. Each
             # account sizes it against its own capital and risk limits and
             # punches its own order.
-            self._record_signal(inst, sig, now_dt)
+            self._record_signal(inst, sig, local_dt)
             sev = SignalEvent(inst, sig, quote, bar_ts)
             entered = self._broadcast(lambda a, e=sev: a.on_signal(e), accounts)
 
@@ -532,7 +600,7 @@ class StrategyRunner:
                     side=sig.side, entry=sig.entry_price,
                     stop=sig.stop_loss,
                     target=self._effective_target(inst.symbol, sig),
-                    opened_at=now_dt)
+                    opened_at=local_dt)
 
     # -- end-of-session square-off -------------------------------------------- #
     def _square_off_due(self, inst: Instrument, now_dt: datetime) -> bool:
@@ -630,6 +698,18 @@ class StrategyRunner:
         return (sig.entry_price + rr * dist if sig.side == "BUY"
                 else sig.entry_price - rr * dist)
 
+    def _strategy_trails(self) -> bool:
+        """True when this strategy manages exits AFTER the first target — a
+        partial scale-out, a runner trail, or a trail from entry.
+
+        Such a position's real stop and target are no longer the signal's:
+        exit_manager moves them per account. See _reference_exit.
+        """
+        p = self.params
+        return bool(float(getattr(p, "partial_exit_fraction", 0.0) or 0.0) > 0
+                    or getattr(p, "trail_remainder", False)
+                    or getattr(p, "trail_from_entry", False))
+
     def _reference_exit(self, inst: Instrument, live_price: float,
                         now_dt: datetime, accounts: list[Account]) -> bool:
         """Fire a platform-wide exit when the reference levels are hit.
@@ -644,7 +724,17 @@ class StrategyRunner:
         if ref is None:
             return False
         reason = ""
-        if ref.side == "BUY":
+        # A MANAGED exit (partial / trail) has no shared price level to unify
+        # on: after the first target each account's stop and target are its
+        # own, moved per account by exit_manager against its own fill. Firing
+        # the signal's ORIGINAL target here would flatten every runner at 1R
+        # the instant the partial booked — i.e. delete the feature. So the
+        # price triggers are skipped and each account exits on its own levels;
+        # the TIME exit below still unifies, because that one is a clock, not
+        # a price, and is identical for everybody.
+        if self._strategy_trails():
+            pass
+        elif ref.side == "BUY":
             if live_price <= ref.stop:
                 reason = "STOP-LOSS"
             elif live_price >= ref.target:
@@ -703,16 +793,26 @@ class StrategyRunner:
     def _trail_atr(self, inst: Instrument, df, rules) -> float:
         """ATR for TickEvent.atr — 0.0 unless this symbol actually trails.
 
-        Gated on the symbol's own rules so the cost is paid only by symbols
-        that opted in: every other instrument skips the calculation entirely
-        and its accounts receive 0.0, which makes _apply_trail a no-op. That
-        keeps a feature nobody has switched on off the hot path completely,
-        the same way rules_for() keeps unconfigured symbols off it.
+        Gated on whether anything can actually trail this symbol, so the cost
+        is paid only where it buys something: every other instrument skips the
+        calculation entirely and its accounts receive 0.0, which makes the
+        exit manager's trail a no-op. That keeps a feature nobody has switched
+        on off the hot path completely, the same way rules_for() keeps
+        unconfigured symbols off it.
+
+        TWO ways to be switched on, and BOTH must be checked:
+          * the symbol's own opt-in (`rules.trail_enabled`), and
+          * the STRATEGY's — `trail_remainder` (a scaled-out runner trails
+            whether or not the symbol opted in) or `trail_from_entry`.
+        Only the first was checked before, which meant CRUDEOIL's runner —
+        `trail_remainder=True`, no per-symbol rule — was handed atr=0.0 by the
+        shared runner and silently never trailed at all.
 
         Never raises — a short or malformed frame yields 0.0, and a position
         then simply keeps the fixed stop it was entered with.
         """
-        if rules is None or not rules.trail_enabled:
+        if not self._strategy_trails() and (rules is None
+                                            or not rules.trail_enabled):
             return 0.0
         period = max(int(getattr(self.params, "atr_period", 14) or 14), 1)
         if df is None or df.empty or len(df) < period + 2:
@@ -761,10 +861,27 @@ def replication_enabled() -> bool:
 _registry_lock = threading.Lock()
 _runners: dict[str, StrategyRunner] = {}
 
+#: The class engines build their runner from. StrategyRunner everywhere EXCEPT
+#: a fleet client node (NODE_MODE=worker), where hub_link installs a runner that
+#: is FED decisions by the admin hub instead of computing them. The engine only
+#: ever calls this with the StrategyRunner constructor arguments, so a node's
+#: TradingEngine is the ordinary engine, unmodified.
+_runner_class: Optional[type] = None
+
+
+def set_runner_class(cls: Optional[type]) -> None:
+    global _runner_class
+    _runner_class = cls
+
+
+def runner_class() -> type:
+    return _runner_class or StrategyRunner
+
 
 def runner_key(mode: Mode, strategy_key: str, instruments: list[Instrument],
                risk_reward: float, feed_token: str,
-               min_score: float = 0.0, square_off: str = "") -> str:
+               min_score: float = 0.0, square_off: str = "",
+               exit_style: str = "") -> str:
     """Everything that must match for two accounts to share a decision.
 
     risk_reward is in the key because it moves the TARGET, and the runner's
@@ -773,11 +890,14 @@ def runner_key(mode: Mode, strategy_key: str, instruments: list[Instrument],
     not running the same decision and must never share one runner, or the
     stricter account would silently receive the looser one's entries. The
     square-off cutoff is in it for the same reason — it decides when every
-    position is force-closed.
+    position is force-closed. So is the exit style: it decides whether the
+    runner's own reference exit fires at all (_reference_exit) and whether an
+    ATR is computed for the trail (_trail_atr), so two accounts on different
+    styles are not running the same decision either.
     """
     syms = ",".join(sorted(i.symbol for i in instruments))
     return (f"{mode.value}|{strategy_key}|{risk_reward:g}|{min_score:g}"
-            f"|{square_off}|{syms}|{hash(feed_token)}")
+            f"|{square_off}|{exit_style}|{syms}|{hash(feed_token)}")
 
 
 def acquire(key: str, factory) -> StrategyRunner:

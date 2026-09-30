@@ -272,7 +272,7 @@ _SCALPER = StrategyParams(
 _INTRADAY = StrategyParams(
     mode=Mode.INTRADAY, timeframe="15m", risk_per_trade=0.01, risk_reward=1.0,  # 1:1, see config.INTRADAY_RR_NOTE
     atr_period=14, allow_short=True, max_leverage=15.0,
-    max_capital_per_trade_pct=0.20,
+    max_capital_per_trade_pct=0.0,   # cap OFF - see config.INTRADAY_CAPITAL_CAP_NOTE
 )
 _SWING = StrategyParams(
     mode=Mode.SWING, timeframe="1d", risk_per_trade=0.03, risk_reward=3.0,

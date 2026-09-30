@@ -52,6 +52,19 @@ class SearchRequest(BaseModel):
     risk_reward: float = 0.0
     #: 0 = the strategy's own threshold.
     min_score: float = 0.0
+    #: How an OPEN position is managed after its first target — one of
+    #: config.EXIT_STYLES, held fixed like RR and score. "strategy" (the
+    #: default) is the plain fixed exit for any strategy that declares no
+    #: management, so a search left at the default ranks symbols on a
+    #: DIFFERENT bot from the one the Backtesting tab reports. Pass the style
+    #: you intend to trade.
+    exit_style: str = "strategy"
+    trail_atr_mult: float = 0.0
+    partial_exit_fraction: float = -1.0
+    runner_rr_mult: float = -1.0
+    #: Bounds on the ATR stop, in PERCENT of price. 0 = the strategy's own.
+    max_stop_pct: float = 0.0
+    min_stop_pct: float = 0.0
     #: Fraction of the window used to CHOOSE; the rest scores what was chosen.
     split: float = 0.7
     verify_top: int = DEFAULT_VERIFY_TOP
@@ -74,10 +87,18 @@ def start(req: SearchRequest):
             400, "Split must be between 0.3 and 0.9 — outside that one half is "
                  "too small to conclude anything from.")
 
+    if not config.is_valid_exit_style(req.exit_style):
+        raise HTTPException(
+            400, f"Unknown exit_style {req.exit_style!r}. Use one of "
+                 f"{', '.join(config.EXIT_STYLES)}.")
     spec = SearchSpec(
         symbols=symbols, start=req.start, end=req.end, capital=req.capital,
         mode=mode, strategy_key=req.strategy_key,
         risk_reward=req.risk_reward, min_score=req.min_score,
+        exit_style=req.exit_style, trail_atr_mult=req.trail_atr_mult,
+        partial_exit_fraction=req.partial_exit_fraction,
+        runner_rr_mult=req.runner_rr_mult,
+        max_stop_pct=req.max_stop_pct, min_stop_pct=req.min_stop_pct,
         split=req.split, verify_top=max(5, min(req.verify_top, 50)))
     try:
         return {"job_id": jobs.start(spec)}

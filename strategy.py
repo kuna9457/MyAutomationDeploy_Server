@@ -36,7 +36,7 @@ are stable.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import time as dtime
 from typing import Callable, Optional
 
@@ -655,10 +655,67 @@ def resolve_strategy(mode: Mode, key: str = "") -> BoundStrategy:
     return default_strategy(mode)
 
 
+def clamp_signal_risk(sig: Optional[Signal],
+                      params: StrategyParams) -> Optional[Signal]:
+    """Hold a signal's stop distance inside `params`' percent band.
+
+    THE STRATEGY STILL DECIDES THE STOP. This computes no level of its own; it
+    only bounds one the strategy already derived from ATR (and, where the
+    strategy uses one, its structural swing point). With both bounds at 0 it
+    returns the very same object — not a copy — so an unconfigured strategy is
+    bit-identical to before this existed.
+
+    THE RR IS PRESERVED. The target is recomputed from the CLAMPED distance at
+    the signal's own reward:risk, so a 1:1 setup stays 1:1 and a 1:3 stays
+    1:3. Moving the stop without moving the target would silently re-rate
+    every trade the clamp touched.
+
+    WHAT IT CANNOT DO is make a bad stop good. A 4%-of-price ATR stop is
+    telling you the instrument is moving 4%; clamping it to 1% does not calm
+    the market. It means the position is stopped out sooner AND sized four
+    times larger for the same rupee risk. That is a real trade-off — more
+    stop-outs and more turnover, in exchange for targets the session can
+    actually reach — and it belongs in a backtest, not in an opinion.
+
+    Returns None for None, so a caller can wrap a signal function directly.
+    """
+    if sig is None:
+        return None
+    lo_pct = float(getattr(params, "min_stop_pct", 0.0) or 0.0)
+    hi_pct = float(getattr(params, "max_stop_pct", 0.0) or 0.0)
+    if lo_pct <= 0 and hi_pct <= 0:
+        return sig
+    entry = float(sig.entry_price)
+    risk = abs(entry - float(sig.stop_loss))
+    if entry <= 0 or risk <= 0:
+        return sig                     # degenerate; leave it to the caller
+    # The strategy's OWN reward:risk, read off the levels it emitted rather
+    # than from params — a strategy may derive its target some other way, and
+    # the clamp must not quietly re-rate it.
+    rr = abs(float(sig.target) - entry) / risk
+
+    bounded = risk
+    if lo_pct > 0:
+        bounded = max(bounded, entry * lo_pct / 100.0)
+    if hi_pct > 0:
+        # Applied LAST so that with a misconfigured band (min above max) the
+        # cap wins — letting the floor push the stop past the cap would defeat
+        # the only thing the cap is there to do.
+        bounded = min(bounded, entry * hi_pct / 100.0)
+    if abs(bounded - risk) < 1e-12:
+        return sig
+
+    sign = 1 if sig.side == "BUY" else -1
+    return replace(sig,
+                   stop_loss=round(entry - sign * bounded, 2),
+                   target=round(entry + sign * rr * bounded, 2))
+
+
 def run_strategy(sd: BoundStrategy, df: pd.DataFrame,
                  session_open: Optional[dtime] = None) -> Optional[Signal]:
     """Enrich with indicators, then evaluate one strategy."""
-    return sd.fn(enrich(df, sd.params), sd.params, session_open)
+    return clamp_signal_risk(sd.fn(enrich(df, sd.params), sd.params,
+                                   session_open), sd.params)
 
 
 def generate_signal(df: pd.DataFrame, mode: Mode,

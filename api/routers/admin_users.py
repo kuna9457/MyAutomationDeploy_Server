@@ -33,10 +33,34 @@ from config import Environment, Mode
 from db_manager import DBManager
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
+import fleet_registry
+from fleet_broadcast import hub as fleet_hub
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
 _db = DBManager()
+
+
+def _live_view(username: str) -> dict:
+    """How a client's bot is doing RIGHT NOW: running / environment / broker,
+    and which server they are on.
+
+    A client trading on a fleet node has no TradingEngine on this (hub)
+    machine, so engine_registry alone reports them as stopped — while their
+    trades, written to the shared database, show up fine. The local engine
+    wins when there is one (an account running on this very server, exactly as
+    before); otherwise the connected nodes' reports are consulted."""
+    eng = engine_registry.get_engine(username)
+    if eng is not None:
+        return {"running": bool(eng.state.running),
+                "environment": eng.environment.value,
+                "broker": eng.broker.name if eng.broker else None,
+                "node": None}
+    live = fleet_hub.client_live(username)
+    if live is not None:
+        return {"running": live["running"], "environment": live["environment"],
+                "broker": live["broker"], "node": live["node_name"]}
+    return {"running": False, "environment": None, "broker": None, "node": None}
 
 
 # -- client accounts ----------------------------------------------------------- #
@@ -66,7 +90,55 @@ def create_client(req: CreateClientRequest):
             display_name=req.display_name, email=email)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    return {k: v for k, v in user.items() if k not in ("password_hash", "broker_tokens")}
+    out = {k: v for k, v in user.items() if k not in ("password_hash", "broker_tokens")}
+    # ONE CLIENT, ONE SERVER — created together, never one without the other.
+    # The client's bot must run on their own server (their broker app is locked
+    # to its static IP), and a server with no client trades nobody. The secret
+    # is returned ONCE, here, for the admin to put in that server's .env.
+    try:
+        out["server"] = _new_server(user)
+    except Exception as exc:
+        # The account exists; the admin can finish with "Create server".
+        out["server_error"] = f"Account created, but its server was not: {exc}"
+    return out
+
+
+def _new_server(user: dict) -> dict:
+    node, secret = fleet_registry.create_node(
+        user.get("display_name") or user["username"], username=user["username"])
+    return {"node_id": node["node_id"], "name": node["name"], "secret": secret}
+
+
+def _user_or_404(user_id: str) -> dict:
+    user = user_manager.get_user_by_id(user_id)
+    if user is None or user.get("role") != "client":
+        raise HTTPException(404, "Client not found.")
+    return user
+
+
+@router.post("/users/{user_id}/server")
+def create_client_server(user_id: str):
+    """Give an existing client their server — for accounts made before every
+    new client got one automatically. Returns the secret ONCE."""
+    user = _user_or_404(user_id)
+    try:
+        return _new_server(user)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.post("/users/{user_id}/server/secret")
+def regenerate_client_server_secret(user_id: str):
+    """A new secret for this client's server. The old one stops working at
+    once, and the server is disconnected until its .env has the new one. The
+    only way back from a lost secret — it is never shown twice."""
+    user = _user_or_404(user_id)
+    node = fleet_registry.node_for_client(user["username"])
+    if node is None:
+        raise HTTPException(404, "This client has no server yet.")
+    secret = fleet_registry.regenerate_secret(node["node_id"])
+    fleet_hub.disconnect(node["node_id"])
+    return {"node_id": node["node_id"], "name": node["name"], "secret": secret}
 
 
 @router.put("/users/{user_id}/email")
@@ -100,6 +172,10 @@ def set_client_status(user_id: str, req: SetStatusRequest):
     # trading with no one able to stop it.
     if req.status == "disabled":
         engine_registry.stop_engine(user["username"])
+        # ...and on their own server, where their bot actually runs.
+        node = fleet_registry.node_for_client(user["username"])
+        if node is not None:
+            fleet_hub.stop_node_clients(node["node_id"])
     return {k: v for k, v in user.items() if k not in ("password_hash", "broker_tokens")}
 
 
@@ -117,10 +193,13 @@ def reset_client_password(user_id: str, req: SetPasswordRequest):
 @router.get("/clients-overview")
 def clients_overview():
     rows = []
+    servers = {n.get("username"): n for n in fleet_registry.list_nodes()
+               if n.get("username")}
     for client in user_manager.list_users(role="client"):
         username = client["username"]
-        eng = engine_registry.get_engine(username)
-        running = bool(eng and eng.state.running)
+        live = _live_view(username)
+        node = servers.get(username)
+        conn = fleet_hub.connections.get(node["node_id"]) if node else None
         paper_pnl = _db.analytics_summary(Environment.PAPER, user_id=username)["total_pnl"]
         live_pnl = _db.analytics_summary(Environment.LIVE, user_id=username)["total_pnl"]
         rows.append({
@@ -133,9 +212,18 @@ def clients_overview():
             # typos — a wrong address here silently breaks that client's
             # ability to ever reset their own password.
             "email": mailer.optional_recipient(client.get("email")),
-            "running": running,
-            "environment": eng.environment.value if eng else None,
-            "broker": eng.broker.name if (eng and eng.broker) else None,
+            "running": live["running"],
+            "environment": live["environment"],
+            "broker": live["broker"],
+            # Which fleet server this client trades on; None for an account
+            # running on this machine (or not running at all).
+            "node": live["node"],
+            # Their one server: id, name and whether it is connected to this
+            # hub right now. None for an account made before servers existed.
+            "server": ({"node_id": node["node_id"], "name": node["name"],
+                        "connected": bool(conn and conn.connected),
+                        "last_connected_at": node.get("last_connected_at", "")}
+                       if node else None),
             "paper_total_pnl": paper_pnl,
             "live_total_pnl": live_pnl,
             # Booleans only — you can see who is set up without any endpoint
@@ -181,7 +269,7 @@ def client_stats(username: str, environment: str = "Paper"):
     daily = _db.daily_pnl(env, user_id=uname)
     by_strategy = _db.strategy_summary(env, user_id=uname)
     daily_by_strategy = _db.daily_strategy_pnl(env, user_id=uname)
-    eng = engine_registry.get_engine(uname)
+    live = _live_view(uname)
 
     def _rows(df):
         return df.to_dict("records") if not df.empty else []
@@ -189,7 +277,8 @@ def client_stats(username: str, environment: str = "Paper"):
     return {
         "username": uname,
         "environment": env.value,
-        "running": bool(eng and eng.state.running),
+        "running": live["running"],
+        "node": live["node"],
         "summary": _db.analytics_summary(env, user_id=uname),
         "daily_pnl": _rows(daily),
         "strategy_pnl": _rows(by_strategy),
@@ -243,6 +332,11 @@ def set_bot_config(req: AdminConfigRequest) -> BotConfig:
         raise HTTPException(
             400, f"square_off_time {cutoff!r} is not a valid time — use HH:MM "
                  f"(24-hour), or leave blank for the segment default.")
+    style = str(payload.get("exit_style") or "strategy")
+    if not config.is_valid_exit_style(style):
+        raise HTTPException(
+            400, f"Unknown exit_style {style!r}. Use one of "
+                 f"{', '.join(config.EXIT_STYLES)}.")
     return admin_config.set_mode_config(mode, **payload)
 
 

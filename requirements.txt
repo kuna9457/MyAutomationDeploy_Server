@@ -12,6 +12,10 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pyjwt>=2.8
 python-multipart>=0.0.9
+# Fleet: a client NODE dials the admin hub over a WebSocket (hub_link.py), and
+# the hub serves it (api/routers/fleet.py). uvicorn[standard] already pulls this
+# in; pinned explicitly so a node never relies on that transitively.
+websockets>=12.0
 # Encryption at rest for per-client broker credentials (credentials_vault.py).
 # Usually already present as a pymongo dependency; pinned explicitly so it is
 # never relied on transitively.
@@ -23,3 +27,5 @@ upstox-python-sdk>=2.9
 kiteconnect>=5.0  # Zerodha
 # neo-api-client   # Kotak Neo (from their GitHub)
 # yfinance>=0.2    # optional: real historical data for the backtester
+# US equities (Alpaca) needs NO extra package - alpaca_data.py talks to the
+# Market Data v2 REST API with `requests`, which is already a dependency.

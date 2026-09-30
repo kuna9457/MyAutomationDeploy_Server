@@ -34,10 +34,46 @@ def list_instruments():
     ]
 
 
+#: Display name per segment. A dict rather than the old inline
+#: "EQUITY ? NSE Equity : MCX Commodity" ternary, which labelled EVERY
+#: non-equity segment as MCX — so CRYPTO already showed up as "MCX Commodity"
+#: and US_EQUITY would have too.
+_SEGMENT_LABELS = {
+    Segment.EQUITY: "NSE Equity",
+    Segment.MCX: "MCX Commodity",
+    Segment.CRYPTO: "Crypto",
+    Segment.US_EQUITY: "US Equity",
+}
+
+
 @router.get("/segments")
 def list_segments():
-    return [{"key": s.value, "label": "NSE Equity" if s == Segment.EQUITY
-             else "MCX Commodity"} for s in Segment]
+    return [{"key": s.value, "label": _SEGMENT_LABELS.get(s, s.value)}
+            for s in Segment]
+
+
+@router.get("/sessions")
+def list_sessions(mode: str = "Intraday"):
+    """Trading window per segment in BOTH the exchange's clock and IST.
+
+    Exists because the operator is in India while an instrument may not be: a
+    US square-off at 15:45 New York is 01:15 IST the following morning in
+    summer and 02:15 in winter, and nothing else in the UI would say so.
+    """
+    try:
+        m = Mode(mode)
+    except ValueError:
+        m = Mode.INTRADAY
+    out = []
+    for seg in Segment:
+        w = config.session_windows(seg, m)
+        w["summary_ist"] = config.session_summary_ist(seg, m)
+        w["label"] = _SEGMENT_LABELS.get(seg, seg.value)
+        w["now_local"] = config.now_for_segment(seg).strftime("%Y-%m-%d %H:%M")
+        w["is_open_now"] = config.market_hours_for_segment(seg).is_open(
+            config.now_for_segment(seg).time())
+        out.append(w)
+    return out
 
 
 @router.get("/strategies")
@@ -100,9 +136,10 @@ def list_client_modes():
     client legitimately needs — which phase, how much it trades, and the
     risk/reward they're taking. The authoritative check still happens in
     /bot/start."""
+    import client_run          # on a fleet node: the running broadcast, not admin_config
     out = []
-    for mode_name in admin_config.available_client_modes():
-        mode_cfg = admin_config.get_mode_config(mode_name)
+    for mode_name in client_run.available_modes():
+        mode_cfg = client_run.mode_config(mode_name)
         bound = strategy.resolve_strategy(Mode(mode_name), mode_cfg.strategy_key)
         out.append({
             "key": mode_name,

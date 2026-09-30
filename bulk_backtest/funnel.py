@@ -62,6 +62,32 @@ class FunnelSpec:
     #: per (symbol × strategy × RR rung) minus the rung Round 0 already ran, so
     #: a very large symbol list may want it off.
     baseline_rr_sweep: bool = True
+    #: How an OPEN position is managed after its first target — one of
+    #: config.EXIT_STYLES, held FIXED across the whole funnel. "strategy" (the
+    #: default) is the plain fixed exit for any strategy that declares no
+    #: management, so a funnel left at the default screens a DIFFERENT bot from
+    #: the one the Backtesting tab reports, and its ranking is not transferable.
+    exit_style: str = "strategy"
+    trail_atr_mult: float = 0.0
+    partial_exit_fraction: float = -1.0
+    runner_rr_mult: float = -1.0
+    #: Bounds on the ATR stop, in PERCENT of price. 0 = the strategy's own.
+    max_stop_pct: float = 0.0
+    min_stop_pct: float = 0.0
+
+    def run_shape(self) -> dict:
+        """The kwargs that decide WHAT BOT every round measures.
+
+        Forwarded as one block to every bulk_backtester.run_with_costs call in
+        this module, so a round cannot quietly screen against a different exit
+        rule than the round before it.
+        """
+        return dict(exit_style=self.exit_style,
+                    trail_atr_mult=self.trail_atr_mult,
+                    partial_exit_fraction=self.partial_exit_fraction,
+                    runner_rr_mult=self.runner_rr_mult,
+                    max_stop_pct=self.max_stop_pct,
+                    min_stop_pct=self.min_stop_pct)
 
 
 @dataclass
@@ -143,6 +169,7 @@ def _screen(spec: FunnelSpec,
             sym, spec.start, spec.end, spec.capital, mode,
             strategy_key=sk, risk_reward=max_rr, lot_size=lot,
             ignore_saved_patterns=True,
+            **spec.run_shape(),
         )
         # Attribute the trade log for later rounds
         attr = attribute_trades(result.trades, sk, spec.rr_ladder)
@@ -261,6 +288,7 @@ def _baseline_rr_sweep(candidates: list[FunnelCandidate],
             c.symbol, spec.start, spec.end, spec.capital, mode,
             strategy_key=c.strategy_key, risk_reward=rr, lot_size=lot,
             ignore_saved_patterns=True,
+            **spec.run_shape(),
         )
         return (c.symbol, c.strategy_key), rr, _cell_from_trades(res.trades)
 
@@ -469,6 +497,7 @@ def _round3_patterns(candidates: list[FunnelCandidate],
                     c.symbol, spec.start, spec.end, spec.capital, mode,
                     strategy_key=c.strategy_key, risk_reward=c.best_rr,
                     lot_size=lot, patterns=c.patterns,
+                    **spec.run_shape(),
                 )
                 net_m = vr.net_metrics
                 c.screen_net_pnl = net_m.get("Net Return %", 0.0)
@@ -597,6 +626,7 @@ def _round6_walkforward(candidates: list[FunnelCandidate],
                     strategy_key=c.strategy_key, risk_reward=c.best_rr,
                     lot_size=lot, patterns=c.patterns or None,
                     filters=filters,
+                    **spec.run_shape(),
                 )
                 is_ret = is_res.net_metrics.get("Net Return %", 0.0)
                 is_returns.append(is_ret)
@@ -609,6 +639,7 @@ def _round6_walkforward(candidates: list[FunnelCandidate],
                     strategy_key=c.strategy_key, risk_reward=c.best_rr,
                     lot_size=lot, patterns=c.patterns or None,
                     filters=filters,
+                    **spec.run_shape(),
                 )
                 oos_ret = oos_res.net_metrics.get("Net Return %", 0.0)
                 oos_returns.append(oos_ret)

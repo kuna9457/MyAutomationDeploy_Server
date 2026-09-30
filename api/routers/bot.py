@@ -41,10 +41,48 @@ from api.auth import CurrentUser, get_current_user
 from api.schemas import StartBotRequest
 from config import Broker, Environment, Mode, Segment
 from db_manager import DBManager
+import client_run
+import fleet_registry
+import hub_link
 from engine import TradingEngine
 from fastapi import APIRouter, Depends, HTTPException
 
 router = APIRouter(prefix="/bot", tags=["bot"])
+
+
+# --------------------------------------------------------------------------- #
+#  One client, one server
+# --------------------------------------------------------------------------- #
+_NOT_ASSIGNED = "this server is not assigned to this account"
+
+
+def _fleet_refusal(username: str) -> str:
+    """"" when this process may run `username`'s bot; otherwise why not.
+
+    ON A NODE: only the client the hub assigned to this server. The shared
+    database lets a node see every client account, so without this every node
+    would start every client — duplicate bots, orders from the wrong IP.
+
+    ON THE HUB: never a client that has their own server. Their bot must run on
+    their server, from their static IP. A client with no server (an ordinary
+    single-server deployment, or one made before servers existed) is
+    unaffected."""
+    if hub_link.is_worker():
+        return "" if username in hub_link.link().assigned else _NOT_ASSIGNED
+    node = fleet_registry.node_for_client(username)
+    if node is not None:
+        return f"trades on its own server “{node['name']}”"
+    return ""
+
+
+def _fleet_refusal_message(reason: str) -> str:
+    """The same refusal, worded for the client who pressed Start."""
+    if reason == _NOT_ASSIGNED:
+        return ("This server isn't set up for your account. Log in at the "
+                "address your admin gave you.")
+    return ("Your bot runs on your own server. Log in at the address your "
+            "admin gave you to start or stop it — your trades and P&L show "
+            "here as well.")
 
 # One long-lived manager for this router, matching trades.py/admin_users.py.
 # `reset_environment` below used to construct a throwaway DBManager per request
@@ -86,7 +124,8 @@ def _token_is_live(broker: str, token: str, api_key: str) -> bool:
 def _start_board(owner: str, groups: list, environment: Environment, mode: Mode,
                  broker_choice: Broker, capital: float, access_token: str,
                  broker_api_key: str, square_off_time: str,
-                 square_off_enabled: bool) -> list[TradingEngine]:
+                 square_off_enabled: bool, exit_style: str = "strategy",
+                 trail_atr_mult: float = 0.0) -> list[TradingEngine]:
     """Start ONE engine per strategy group, sharing a capital ledger.
 
     Each engine is the ordinary single-strategy engine — same construction,
@@ -135,7 +174,8 @@ def _start_board(owner: str, groups: list, environment: Environment, mode: Mode,
                 user_id=owner, broker_access_token=access_token,
                 broker_api_key=broker_api_key, risk_reward=g.risk_reward,
                 min_score=g.min_score, square_off_time=square_off_time,
-                square_off_enabled=square_off_enabled, symbol_rules=rules)
+                square_off_enabled=square_off_enabled, symbol_rules=rules,
+                exit_style=exit_style, trail_atr_mult=trail_atr_mult)
             eng.group_key = g.strategy_key
             # Attached BEFORE start so the very first tick already sizes
             # against the shared wallet rather than the full ceiling.
@@ -197,11 +237,14 @@ def _start_one_client(account: dict, environment: Environment) -> str:
         return "account record incomplete"
     if account.get("status") != "active":
         return "account is not active"
+    refusal = _fleet_refusal(username)
+    if refusal:
+        return refusal
 
-    mode_name = admin_config.active_client_mode()
+    mode_name = client_run.active_mode()
     if not mode_name:
         return "no client mode configured"
-    mode_cfg = admin_config.get_mode_config(mode_name)
+    mode_cfg = client_run.mode_config(mode_name)
     selected = [config.INSTRUMENTS_BY_SYMBOL[s] for s in mode_cfg.symbols
                 if s in config.INSTRUMENTS_BY_SYMBOL]
     if not selected:
@@ -237,7 +280,7 @@ def _start_one_client(account: dict, environment: Environment) -> str:
     if existing and existing.state.running:
         return "already running"
 
-    rules = symbol_config.rules_for(mode_name, [i.symbol for i in selected])
+    rules = client_run.rules_for(mode_name, [i.symbol for i in selected])
     try:
         eng = TradingEngine(
             environment, Mode(mode_name), broker_choice, selected, capital,
@@ -247,6 +290,13 @@ def _start_one_client(account: dict, environment: Environment) -> str:
             min_score=mode_cfg.min_score,
             square_off_time=mode_cfg.square_off_time,
             square_off_enabled=mode_cfg.square_off_enabled,
+            # From admin's saved config, never the client's request — same
+            # rule as strategy/instruments/RR. Blank on a config saved before
+            # this field existed, which reads as "strategy".
+            exit_style=mode_cfg.exit_style,
+            trail_atr_mult=mode_cfg.trail_atr_mult,
+            max_stop_pct=mode_cfg.max_stop_pct,
+            min_stop_pct=mode_cfg.min_stop_pct,
             symbol_rules=rules)
         eng.start()
     except Exception as exc:
@@ -290,12 +340,17 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         # ignored outright rather than validated, so the mode cannot be
         # steered from the request body any more than the strategy or the
         # instrument list can. The client's bot only sizes and punches.
-        requested = admin_config.active_client_mode()
+        refusal = _fleet_refusal(user.username)
+        if refusal:
+            raise HTTPException(400, _fleet_refusal_message(refusal))
+        requested = client_run.active_mode()
         if not requested:
             raise HTTPException(
-                400, "Trading hasn't been configured yet — ask your admin to "
+                400, "Trading hasn't been started yet — your admin starts it. "
+                     "Check back once they have." if hub_link.is_worker() else
+                     "Trading hasn't been configured yet — ask your admin to "
                      "set a strategy and instruments before you can start.")
-        mode_cfg = admin_config.get_mode_config(requested)
+        mode_cfg = client_run.mode_config(requested)
         mode = Mode(requested)
         strategy_key = mode_cfg.strategy_key
         symbols = mode_cfg.symbols
@@ -306,6 +361,10 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         min_score = mode_cfg.min_score
         square_off_time = mode_cfg.square_off_time
         square_off_enabled = mode_cfg.square_off_enabled
+        exit_style = mode_cfg.exit_style
+        trail_atr_mult = mode_cfg.trail_atr_mult
+        max_stop_pct = mode_cfg.max_stop_pct
+        min_stop_pct = mode_cfg.min_stop_pct
         if environment == Environment.LIVE:
             if req.broker not in _CLIENT_LIVE_BROKERS:
                 raise HTTPException(
@@ -341,6 +400,16 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         min_score = req.min_score
         square_off_time = req.square_off_time
         square_off_enabled = req.square_off_enabled
+        exit_style = req.exit_style
+        trail_atr_mult = req.trail_atr_mult
+        max_stop_pct = req.max_stop_pct
+        min_stop_pct = req.min_stop_pct
+        if min_stop_pct and max_stop_pct and min_stop_pct > max_stop_pct:
+            raise HTTPException(400, "min_stop_pct cannot exceed max_stop_pct.")
+        if not config.is_valid_exit_style(exit_style):
+            raise HTTPException(
+                400, f"Unknown exit_style {exit_style!r}. Use one of "
+                     f"{', '.join(config.EXIT_STYLES)}.")
         if square_off_time and config.parse_clock(square_off_time) is None:
             raise HTTPException(
                 400, f"square_off_time {square_off_time!r} is not a valid "
@@ -383,7 +452,9 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
     # the request body — the same rule as strategy/instruments, so a client
     # cannot widen their own trading window. Only symbols with settings that
     # actually change something come back; everything else runs untouched.
-    rules = symbol_config.rules_for(mode.value, [i.symbol for i in selected])
+    rules = (client_run.rules_for(mode.value, [i.symbol for i in selected])
+             if user.role == "client"
+             else symbol_config.rules_for(mode.value, [i.symbol for i in selected]))
 
     # STRATEGY BOARD: several strategies, each with its own stocks, running at
     # once (strategy_groups.py). Taken only when a board actually exists for
@@ -395,7 +466,7 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
             engines = _start_board(
                 user.username, groups, environment, mode, broker_choice,
                 req.capital, access_token, broker_api_key, square_off_time,
-                square_off_enabled)
+                square_off_enabled, exit_style, trail_atr_mult)
         except RuntimeError as exc:
             detail = str(exc)
             if user.role == "client":
@@ -413,6 +484,8 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
                         broker_api_key=broker_api_key, risk_reward=risk_reward,
                         min_score=min_score, square_off_time=square_off_time,
                         square_off_enabled=square_off_enabled,
+                        exit_style=exit_style, trail_atr_mult=trail_atr_mult,
+                        max_stop_pct=max_stop_pct, min_stop_pct=min_stop_pct,
                         symbol_rules=rules)
     try:
         eng.start()
@@ -449,7 +522,11 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
             risk_reward=eng.params.risk_reward,
             min_score=eng.params.cs_min_score,
             square_off_time=square_off_time,
-            square_off_enabled=square_off_enabled)
+            square_off_enabled=square_off_enabled,
+            exit_style=eng.exit_style,
+            trail_atr_mult=eng.params.trail_atr_mult,
+            max_stop_pct=eng.params.max_stop_pct,
+            min_stop_pct=eng.params.min_stop_pct)
         if published:
             out["clients"] = _fan_out_to_clients(environment)
     return out
@@ -560,10 +637,10 @@ def _client_runner_key() -> str:
     mirrors exactly what TradingEngine.__init__ computes, so a client who
     then presses Start joins the very runner they were watching.
     """
-    mode_name = admin_config.active_client_mode()
+    mode_name = client_run.active_mode()
     if not mode_name or not strategy_runner.replication_enabled():
         return ""
-    mode_cfg = admin_config.get_mode_config(mode_name)
+    mode_cfg = client_run.mode_config(mode_name)
     mode = Mode(mode_name)
     bound = strategy.resolve_strategy(mode, mode_cfg.strategy_key)
     rr = mode_cfg.risk_reward or bound.params.risk_reward
@@ -605,7 +682,7 @@ def platform_signals(user: CurrentUser = Depends(get_current_user)):
         "running": running,
         "live": runner is not None,
         "mode": runner.mode.value if runner is not None else
-                (admin_config.active_client_mode() if user.role == "client" else ""),
+                (client_run.active_mode() if user.role == "client" else ""),
         "signals": runner.recent_signals() if runner is not None else [],
     }
 

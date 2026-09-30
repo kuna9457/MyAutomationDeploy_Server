@@ -38,6 +38,24 @@ class StartBotRequest(BaseModel):
     #: ADMIN-ONLY. End-of-session flat-out; "" = the segment default.
     square_off_time: str = ""
     square_off_enabled: bool = True
+    #: ADMIN-ONLY. How an OPEN position is managed after its first target —
+    #: one of config.EXIT_STYLES. "strategy" = whatever the strategy declares,
+    #: which is what every request sent before this field existed means.
+    #: Backtest a style (POST /backtest/run takes the same names) before
+    #: running it: the two share exit_manager, so the numbers transfer.
+    #: A client's value is ignored — theirs comes from admin's ModeConfig.
+    exit_style: str = "strategy"
+    #: ADMIN-ONLY. Chandelier trail distance in ATR; 0 = the strategy's own.
+    trail_atr_mult: float = 0.0
+    #: Widest the ATR-derived stop may sit from entry, in PERCENT of price.
+    #: 0 = the strategy's own, unbounded. The target moves with it, so the
+    #: reward:risk is unchanged. NOTE the trade-off before using it: a tighter
+    #: stop converts sideways square-off exits (worth about -Rs65 each) into
+    #: stop-outs (about -Rs1,200 each), so fewer square-offs is NOT
+    #: automatically better. Backtest before switching it on.
+    max_stop_pct: float = 0.0
+    #: Tightest the stop may sit, in PERCENT. 0 = no floor.
+    min_stop_pct: float = 0.0
 
 
 class RiskLimitsRequest(BaseModel):
@@ -82,6 +100,52 @@ class BacktestRequest(BaseModel):
     #: compare a 5m base against the saved 15m before committing the change
     #: to live, the same way risk_reward/min_score already let you.
     timeframe_minutes: int = 0
+    #: How a position is managed AFTER its first target — one of
+    #: config.EXIT_STYLES. "strategy" (the default) measures exactly what the
+    #: strategy declares, so an untouched form is the run it was before this
+    #: existed. The others let the two profit-booking approaches be compared
+    #: on the same symbol and window with one variable moved:
+    #:   "fixed"         — baseline: fixed ATR stop/target, nothing managed
+    #:   "trail_full"    — Approach 1: trail the whole position from entry
+    #:   "partial_trail" — Approach 2: book part at 1R, trail the runner
+    exit_style: str = "strategy"
+    #: Chandelier trail distance in ATR. 0 = the strategy's own. Kept separate
+    #: from atr_sl_mult on purpose: that one also sets the ENTRY stop, so
+    #: sweeping the trail through it would move two things at once.
+    trail_atr_mult: float = 0.0
+    #: Fraction booked at the first target. -1 = whatever the style chose.
+    #: 0 is meaningful (no partial), hence the sentinel.
+    partial_exit_fraction: float = -1.0
+    #: Runner target in multiples of the original risk. -1 = the style's own;
+    #: 0 means no hard runner target, i.e. the trail alone decides the exit.
+    runner_rr_mult: float = -1.0
+    #: Widest the ATR-derived stop may sit from entry, in PERCENT of price.
+    #: 0 = the strategy's own, unbounded. The target moves with it, so the
+    #: reward:risk is unchanged. NOTE the trade-off before using it: a tighter
+    #: stop converts sideways square-off exits (worth about -Rs65 each) into
+    #: stop-outs (about -Rs1,200 each), so fewer square-offs is NOT
+    #: automatically better. Backtest before switching it on.
+    max_stop_pct: float = 0.0
+    #: Tightest the stop may sit, in PERCENT. 0 = no floor.
+    min_stop_pct: float = 0.0
+    #: HOLD PAST THE SESSION. False (the default) = every existing request,
+    #: unchanged: an Intraday/Scalper position is squared off at the segment
+    #: flat-out (15:09 equity) whatever its P&L. True removes that flat-out
+    #: AND the entry cutoff derived from it, so a position closes only on its
+    #: own stop, target, trail or max-hold.
+    #:
+    #: BACKTEST-ONLY, and deliberately absent from AdminConfigRequest: this
+    #: answers "did the signal have edge when given room?", it does not
+    #: configure the live bot. A held-overnight cash position is DELIVERY —
+    #: it cannot be short, and it pays delivery STT/stamp that the backtest's
+    #: INTRADAY_EQUITY cost model does not charge, so a net figure from this
+    #: flag reads better than the same trades would have.
+    hold_overnight: bool = False
+    #: Drop the strategy's late-entry gate (entry_cutoff_before_close — 11:59
+    #: for Candlestick Intraday). SEPARATE from hold_overnight on purpose: this
+    #: changes how many trades are taken, that one changes how they close.
+    #: Setting both in one run moves two variables and attributes neither.
+    ignore_entry_cutoff: bool = False
 
 
 class BulkBacktestRequest(BaseModel):
@@ -103,6 +167,39 @@ class BulkBacktestRequest(BaseModel):
     patterns: list[str] = []
     #: 0 = the mode's own bar size. See BacktestRequest.timeframe_minutes.
     timeframe_minutes: int = 0
+    #: How an OPEN position is managed after its first target — one of
+    #: config.EXIT_STYLES. "strategy" (the default) is the plain fixed exit
+    #: for every strategy that declares no management of its own, so a bulk
+    #: run left at the default measures a DIFFERENT bot from a single-symbol
+    #: run with a style selected. Pass the same style you intend to trade.
+    exit_style: str = "strategy"
+    #: Chandelier trail distance in ATR; 0 = the strategy's own.
+    trail_atr_mult: float = 0.0
+    #: Fraction booked at the first target; -1 = the style's own.
+    partial_exit_fraction: float = -1.0
+    #: Runner target in R; -1 = the style's own, 0 = trail only.
+    runner_rr_mult: float = -1.0
+    #: Bounds on the ATR stop, in PERCENT of price. 0 = the strategy's own.
+    max_stop_pct: float = 0.0
+    min_stop_pct: float = 0.0
+    #: HOLD PAST THE SESSION. False (the default) = every existing request,
+    #: unchanged: an Intraday/Scalper position is squared off at the segment
+    #: flat-out (15:09 equity) whatever its P&L. True removes that flat-out
+    #: AND the entry cutoff derived from it, so a position closes only on its
+    #: own stop, target, trail or max-hold.
+    #:
+    #: BACKTEST-ONLY, and deliberately absent from AdminConfigRequest: this
+    #: answers "did the signal have edge when given room?", it does not
+    #: configure the live bot. A held-overnight cash position is DELIVERY —
+    #: it cannot be short, and it pays delivery STT/stamp that the backtest's
+    #: INTRADAY_EQUITY cost model does not charge, so a net figure from this
+    #: flag reads better than the same trades would have.
+    hold_overnight: bool = False
+    #: Drop the strategy's late-entry gate (entry_cutoff_before_close — 11:59
+    #: for Candlestick Intraday). SEPARATE from hold_overnight on purpose: this
+    #: changes how many trades are taken, that one changes how they close.
+    #: Setting both in one run moves two variables and attributes neither.
+    ignore_entry_cutoff: bool = False
 
 
 class RRSweepRequest(BaseModel):
@@ -131,6 +228,39 @@ class RRSweepRequest(BaseModel):
     patterns: list[str] = []
     #: 0 = the mode's own bar size. See BacktestRequest.timeframe_minutes.
     timeframe_minutes: int = 0
+    #: How an OPEN position is managed after its first target — one of
+    #: config.EXIT_STYLES. "strategy" (the default) is the plain fixed exit
+    #: for every strategy that declares no management of its own, so a bulk
+    #: run left at the default measures a DIFFERENT bot from a single-symbol
+    #: run with a style selected. Pass the same style you intend to trade.
+    exit_style: str = "strategy"
+    #: Chandelier trail distance in ATR; 0 = the strategy's own.
+    trail_atr_mult: float = 0.0
+    #: Fraction booked at the first target; -1 = the style's own.
+    partial_exit_fraction: float = -1.0
+    #: Runner target in R; -1 = the style's own, 0 = trail only.
+    runner_rr_mult: float = -1.0
+    #: Bounds on the ATR stop, in PERCENT of price. 0 = the strategy's own.
+    max_stop_pct: float = 0.0
+    min_stop_pct: float = 0.0
+    #: HOLD PAST THE SESSION. False (the default) = every existing request,
+    #: unchanged: an Intraday/Scalper position is squared off at the segment
+    #: flat-out (15:09 equity) whatever its P&L. True removes that flat-out
+    #: AND the entry cutoff derived from it, so a position closes only on its
+    #: own stop, target, trail or max-hold.
+    #:
+    #: BACKTEST-ONLY, and deliberately absent from AdminConfigRequest: this
+    #: answers "did the signal have edge when given room?", it does not
+    #: configure the live bot. A held-overnight cash position is DELIVERY —
+    #: it cannot be short, and it pays delivery STT/stamp that the backtest's
+    #: INTRADAY_EQUITY cost model does not charge, so a net figure from this
+    #: flag reads better than the same trades would have.
+    hold_overnight: bool = False
+    #: Drop the strategy's late-entry gate (entry_cutoff_before_close — 11:59
+    #: for Candlestick Intraday). SEPARATE from hold_overnight on purpose: this
+    #: changes how many trades are taken, that one changes how they close.
+    #: Setting both in one run moves two variables and attributes neither.
+    ignore_entry_cutoff: bool = False
 
 
 class WatchlistSaveRequest(BaseModel):
@@ -217,6 +347,22 @@ class AdminConfigRequest(BaseModel):
     #: End-of-session flat-out. "" = the segment default (15:09 equity).
     square_off_time: str = ""
     square_off_enabled: bool = True
+    #: How an OPEN position is managed after its first target, for this mode —
+    #: one of config.EXIT_STYLES, validated in the route. "strategy" = inherit
+    #: whatever the chosen strategy declares, which is what every config saved
+    #: before this field existed reads as.
+    exit_style: str = "strategy"
+    #: Chandelier trail distance in ATR. 0 = the strategy's own.
+    trail_atr_mult: float = 0.0
+    #: Widest the ATR-derived stop may sit from entry, in PERCENT of price.
+    #: 0 = the strategy's own, unbounded. The target moves with it, so the
+    #: reward:risk is unchanged. NOTE the trade-off before using it: a tighter
+    #: stop converts sideways square-off exits (worth about -Rs65 each) into
+    #: stop-outs (about -Rs1,200 each), so fewer square-offs is NOT
+    #: automatically better. Backtest before switching it on.
+    max_stop_pct: float = 0.0
+    #: Tightest the stop may sit, in PERCENT. 0 = no floor.
+    min_stop_pct: float = 0.0
 
 
 class RangeResetRequest(BaseModel):

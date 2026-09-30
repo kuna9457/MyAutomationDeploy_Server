@@ -26,6 +26,7 @@ from typing import Optional
 import time as _time
 
 import config
+import exit_manager
 import risk_manager
 import strategy_runner
 import symbol_config
@@ -153,6 +154,10 @@ class TradingEngine:
         broker_api_key: str = "",
         risk_reward: float = 0.0,
         min_score: float = 0.0,
+        exit_style: str = "strategy",
+        trail_atr_mult: float = 0.0,
+        max_stop_pct: float = 0.0,
+        min_stop_pct: float = 0.0,
         square_off_time: str = "",
         square_off_enabled: bool = True,
         symbol_rules: Optional[dict[str, "symbol_config.SymbolRules"]] = None,
@@ -205,6 +210,27 @@ class TradingEngine:
         # position size is risk_budget / stop_distance and never reads it.
         if min_score and min_score > 0:
             params = replace(params, cs_min_score=float(min_score))
+        # ...and how the position is managed AFTER its first target, by the
+        # same mechanism again (config.EXIT_STYLES). "strategy" — the default
+        # — leaves whatever the strategy declares untouched, so this is a
+        # no-op for every existing run.
+        #
+        # It moves the TARGET and the STOP of an OPEN position only. Sizing is
+        # never consulted: quantity is fixed at entry and the trail can only
+        # ratchet the stop toward price, so Immutable Rule #1 holds by
+        # construction — this can shrink risk per trade, never widen it.
+        self.exit_style = (exit_style or "strategy").strip().lower()
+        params = config.apply_exit_style(params, self.exit_style,
+                                         trail_atr_mult=trail_atr_mult)
+        # ...and the bounds on the ATR stop distance. These move the ENTRY
+        # levels (stop and, with the RR preserved, the target), so unlike the
+        # exit style they change which trades resolve and where — see
+        # strategy.clamp_signal_risk. 0 leaves the strategy's own stop alone,
+        # which is what every run that does not set them gets.
+        if max_stop_pct and max_stop_pct > 0:
+            params = replace(params, max_stop_pct=float(max_stop_pct))
+        if min_stop_pct and min_stop_pct > 0:
+            params = replace(params, min_stop_pct=float(min_stop_pct))
         self.params = params
         # Rebind the strategy to the overridden params so the SIGNAL FUNCTION
         # sees them too. run_strategy() evaluates against `sd.params`, not
@@ -294,12 +320,17 @@ class TradingEngine:
             strategy_runner.runner_key(mode, self.strategy.key, instruments,
                                        self.params.risk_reward, self._feed_token,
                                        self.params.cs_min_score,
-                                       f"{self.square_off_time}|{self.square_off_enabled}")
+                                       f"{self.square_off_time}|{self.square_off_enabled}",
+                                       # Two accounts on different exit styles
+                                       # are not one decision — see runner_key.
+                                       f"{self.exit_style}|{self.params.trail_atr_mult:g}"
+                                       f"|{self.params.max_stop_pct:g}"
+                                       f"|{self.params.min_stop_pct:g}")
             if strategy_runner.replication_enabled()
             else f"solo:{user_id}:{id(self)}")
         self._runner = strategy_runner.acquire(
             self._runner_key,
-            lambda: strategy_runner.StrategyRunner(
+            lambda: strategy_runner.runner_class()(
                 key=self._runner_key, mode=mode, strategy=self.strategy,
                 params=self.params, instruments=instruments,
                 feed_token=self._feed_token, poll_seconds=self.poll_seconds,
@@ -521,6 +552,18 @@ class TradingEngine:
             "atr_sl_mult": float(p.atr_sl_mult),
             "atr_period": int(p.atr_period),
             "min_score": float(p.cs_min_score),
+            # What manages an OPEN position after its first target. Part of
+            # the snapshot because it is exactly the kind of setting an admin
+            # can change mid-run without the running engine noticing: this
+            # records what THIS run is actually exiting on.
+            "exit_style": self.exit_style,
+            "max_stop_pct": float(p.max_stop_pct),
+            "min_stop_pct": float(p.min_stop_pct),
+            "partial_exit_fraction": float(p.partial_exit_fraction),
+            "trail_atr_mult": float(p.trail_atr_mult or p.atr_sl_mult)
+                              if (p.trail_remainder or p.trail_from_entry)
+                              else 0.0,
+            "runner_rr_mult": float(p.runner_rr_mult),
             "max_hold_minutes": int(p.max_hold_minutes),
             "entry_skip_minutes": int(p.entry_skip_minutes),
             "allow_short": bool(p.allow_short),
@@ -1274,11 +1317,17 @@ class TradingEngine:
         # short) so rounding never tightens the stop below the intended risk, then
         # recompute the target from the rounded distance so the RR contract (1:1
         # scalp / 1:2 intraday / 1:3 swing) stays exact.
+        # Snapped with exit_manager's helpers, not a bare math.floor: x / tick
+        # is binary floating point, and a level that is ALREADY on the grid
+        # lands a hair below the integer (100.05 / 0.05 = 2000.9999999999998),
+        # so a bare floor silently drops a whole tick. That widened the stop,
+        # and — because the target is recomputed from the rounded distance
+        # below — moved TP1 and TP2 with it.
         tick = inst.tick_size or 0.05
         if sig.side == "BUY":
-            stop = round(math.floor((fill - risk_dist) / tick) * tick, 2)
+            stop = exit_manager.floor_tick(fill - risk_dist, tick)
         else:
-            stop = round(math.ceil((fill + risk_dist) / tick) * tick, 2)
+            stop = exit_manager.ceil_tick(fill + risk_dist, tick)
         risk_dist = abs(fill - stop)
         if risk_dist <= 0:                      # degenerate: tick wider than stop
             self.state.push_log(
@@ -1354,6 +1403,15 @@ class TradingEngine:
             eff_lev = lev if lev is not None else config.max_leverage_for(
                 inst.segment, self.params)
             trade["_margin"] = notional / eff_lev if eff_lev > 0 else notional
+        # The exit state-machine's view of this position. Local-only (leading
+        # underscore = never persisted): every field it needs to survive a
+        # restart is already in the document — stop_loss, target, quantity,
+        # partial_done — and _exit_state() rebuilds it from those. It is built
+        # HERE, off the real fill, so risk_dist is the exact distance the
+        # position was sized against rather than anything re-derived later.
+        trade["_exit_state"] = exit_manager.ExitState(
+            side=sig.side, entry=fill, qty=qty, stop=stop, target=target,
+            risk_dist=risk_dist)
         with self.state.lock:
             self.state.open_positions[inst.symbol] = trade
         self._trades_today += 1
@@ -1418,25 +1476,102 @@ class TradingEngine:
         self.state.push_log(
             f"{inst.symbol}: broker-side stop moved to {stop:.2f}.")
 
-    def _maybe_scale_out(self, inst: Instrument, trade: dict,
-                         live_price: float) -> None:
-        """Book PART of a multi-lot position at its first target, move the rest
-        to break-even-plus-friction, and hand it to the trail. Commodity.md
-        §9.2-9.5.
+    # ------------------------------------------------------------------ #
+    #  Exit management — DECIDED by exit_manager, EXECUTED here.
+    #
+    #  Everything that used to live in _maybe_scale_out / _apply_trail (when
+    #  to book a partial, where the break-even stop goes, where the runner
+    #  target goes, how far the chandelier trails) now lives in
+    #  exit_manager.py, because backtester.py has to run the IDENTICAL logic
+    #  or a backtest of a trailing/scaling approach measures a bot that does
+    #  not exist. What is left below is only the side-effects a simulator has
+    #  no equivalent of: broker orders, trade documents, margin, logs.
+    # ------------------------------------------------------------------ #
+    def _exit_params(self, inst: Instrument) -> exit_manager.ExitParams:
+        """This symbol's exit configuration, resolved most-specific-first.
 
-        A NO-OP for every strategy that does not set partial_exit_fraction —
-        which today is all of them except CRUDEOIL — so this cannot change how
-        anything else exits.
+        The trail distance resolves symbol rule -> params.trail_atr_mult ->
+        params.atr_sl_mult, which reproduces the pre-refactor engine exactly:
 
-            ONE LOT NEVER SCALES OUT.
-            A single lot is indivisible: "half" of it is all of it, so a
-            partial would just be an ordinary target exit wearing a different
-            name, and the position would give up the runner it was never able
-            to have. So qty <= 1 returns immediately and the position runs to
-            its FULL target on the normal path below. Only 2+ lots split.
+          * symbol has a saved rule with the trail ON  -> its multiple (or the
+            strategy's, when it saved none), trailing FROM ENTRY.
+          * symbol has a saved rule with the trail OFF -> 0, i.e. no trail at
+            all, not even for a scaled-out runner. That was `_apply_trail`'s
+            behaviour (SymbolRules.trail_mult returns 0.0 when disabled) and
+            it is preserved deliberately: an admin who switched a symbol's
+            trail off must not have it switched back on by a partial.
+          * no saved rule -> the strategy's multiple, trailing only once a
+            partial has armed it (or from entry if `trail_from_entry`).
+        """
+        p = self.params
+        rules = self.symbol_rules.get(inst.symbol)
+        mult = from_entry = None
+        if rules is not None:
+            base = float(getattr(p, "trail_atr_mult", 0.0) or 0.0) or p.atr_sl_mult
+            mult = rules.trail_mult(base)
+            from_entry = bool(rules.trail_enabled)
+        return exit_manager.params_from_strategy(
+            p, inst.tick_size, inst.contract_multiplier,
+            trail_mult=mult, trail_from_entry=from_entry)
 
-        Booked as a SEPARATE CLOSED trade document rather than by mutating this
-        one, because realized PnL, the day's PnL, the Excel log and every
+    def _exit_state(self, inst: Instrument,
+                    trade: dict) -> exit_manager.ExitState:
+        """The live exit state for `trade`, rebuilt from the document if this
+        process has never seen the position (i.e. after a restart).
+
+        `risk_dist` is reconstructed from the TARGET, not from the current
+        stop: the stop may already have been trailed or moved to break-even,
+        while entry->target is fixed at `rr x risk_dist` by _enter and stays
+        put. Same derivation the old _maybe_scale_out used.
+        """
+        st = trade.get("_exit_state")
+        if st is not None:
+            return st
+        entry = float(trade["entry_price"])
+        stop = float(trade["stop_loss"])
+        target = float(trade["target"])
+        partial_done = bool(trade.get("partial_done")
+                            or trade.get("_partial_done"))
+        if partial_done:
+            runner = float(getattr(self.params, "runner_rr_mult", 0.0) or 0.0)
+            risk_dist = (abs(target - entry) / runner if runner > 0
+                         else abs(entry - stop))
+        else:
+            rr = max(self._rr_for(inst.symbol), 1e-9)
+            risk_dist = abs(target - entry) / rr
+        if risk_dist <= 0:
+            risk_dist = max(abs(entry - stop), inst.tick_size or 0.05)
+        # TP1, for a position that had already scaled out before this process
+        # started. Without it a restart would silently drop the lock_first_target
+        # floor and let a runner give back the 1R it had banked — the one thing
+        # that rule exists to prevent. Re-derived rather than persisted: it is
+        # `entry +/- rr x risk_dist` by construction in _enter, and both of
+        # those are already recoverable from the document.
+        first_target = 0.0
+        if partial_done:
+            sign = 1 if trade["side"] == "BUY" else -1
+            first_target = round(
+                entry + sign * max(self._rr_for(inst.symbol), 1e-9) * risk_dist, 2)
+        st = exit_manager.ExitState(
+            side=trade["side"], entry=entry, qty=int(trade["quantity"]),
+            stop=stop, target=target, risk_dist=risk_dist,
+            first_target_done=partial_done, partial_taken=partial_done,
+            trail_active=partial_done and bool(
+                getattr(self.params, "trail_remainder", False)),
+            peak=float(trade.get("_trail_peak") or entry),
+            first_target=first_target,
+        )
+        trade["_exit_state"] = st
+        return st
+
+    def _book_partial(self, inst: Instrument, trade: dict,
+                      st: exit_manager.ExitState,
+                      act: exit_manager.Action) -> None:
+        """Execute a PARTIAL decision: square off `act.qty` at `act.price`,
+        write it as its OWN closed trade, and shrink the parent to the runner.
+
+        Booked as a SEPARATE CLOSED trade document rather than by mutating
+        this one, because realized PnL, the day's PnL, the Excel log and every
         analytic read `quantity` off the document at close time. A child doc
         makes the partial a real, first-class exit that all of them already
         understand, instead of a special case each would have to learn.
@@ -1444,194 +1579,105 @@ class TradingEngine:
         Not counted against max_trades_per_day: it is an exit of a position
         already opened, not a new entry, and counting it would let a scale-out
         consume the day's trade budget.
+
+        `st` has ALREADY been advanced by exit_manager — st.stop is the
+        break-even stop and st.target the runner target — so all four changed
+        fields are persisted in ONE write, exactly as before the refactor.
         """
-        frac = getattr(self.params, "partial_exit_fraction", 0.0)
-        # Both spellings: the local flag for this process, and the PERSISTED one
-        # so a restart cannot scale the same position out a second time (the
-        # runner target would otherwise look like a fresh first target).
-        if frac <= 0 or trade.get("_partial_done") or trade.get("partial_done"):
-            return
-        qty = int(trade["quantity"])
-        if qty <= 1:
-            return                    # indivisible — runs to the full target
-
         side = trade["side"]
-        target = float(trade["target"])
-        if side == "BUY":
-            if live_price < target:
-                return
-        elif live_price > target:
-            return
-
-        exit_qty = max(1, int(math.floor(qty * frac)))
-        exit_qty = min(exit_qty, qty - 1)      # always leave a runner behind
-        remaining = qty - exit_qty
         entry = float(trade["entry_price"])
-        tick = inst.tick_size or 0.05
+        qty = int(trade["quantity"])
+        exit_qty = int(act.qty)
+        remaining = qty - exit_qty
+        price = float(act.price)
         mult = max(inst.contract_multiplier, 1)
 
-        res = self.broker.square_off(inst, side, exit_qty, target)
+        res = self.broker.square_off(inst, side, exit_qty, price)
 
-        # The booked half, as its own closed trade. Same entry, same strategy,
-        # so analytics group it with its parent; the reason names it a partial.
+        # Same entry, same strategy, so analytics group it with its parent;
+        # the reason names it a partial. stop_loss is the parent's stop as it
+        # stood WHILE this half was open — the break-even move below belongs
+        # to the runner, not to the lots just booked.
         child = self.db.new_trade(
             mode=self.mode.value, environment=self.environment.value,
             user_id=self.user_id, broker=self.broker.name, ticker=inst.symbol,
             side=side, entry_price=entry, stop_loss=float(trade["stop_loss"]),
-            target=target, quantity=exit_qty,
+            target=price, quantity=exit_qty,
             risk_amount=float(trade.get("risk_amount", 0.0)) * exit_qty / qty,
             segment=inst.segment.value, contract_multiplier=mult,
             strategy=self.strategy.key,
             entry_reason=trade.get("entry_reason", ""),
         )
         self.db.insert_trade(child, self.environment)
-        self.db.close_trade(child["trade_id"], target, self.environment,
-                            exit_reason="PARTIAL-TARGET")
+        self.db.close_trade(child["trade_id"], price, self.environment,
+                            exit_reason=act.reason or "PARTIAL-TARGET")
 
-        # Break-even plus the friction buffer: far enough past entry that the
-        # runner is genuinely free after ROUND-TRIP costs, not merely level
-        # before them. Rounded the same direction _enter and _apply_trail round
-        # a stop — always to the looser side, never a hair tighter.
-        buf = getattr(self.params, "breakeven_buffer_ticks", 0.0) * tick
-        if side == "BUY":
-            new_stop = round(math.floor((entry + buf) / tick) * tick, 2)
-        else:
-            new_stop = round(math.ceil((entry - buf) / tick) * tick, 2)
-
-        # Runner target, as a multiple of the ORIGINAL risk distance. Derived
-        # from the target and the RR actually used rather than from the current
-        # stop, which the trail may already have moved.
-        rr = max(self._rr_for(inst.symbol), 1e-9)
-        risk_dist = abs(target - entry) / rr
-        runner_mult = getattr(self.params, "runner_rr_mult", 0.0) or (rr * 2.0)
-        if side == "BUY":
-            new_target = round(entry + runner_mult * risk_dist, 2)
-        else:
-            new_target = round(entry - runner_mult * risk_dist, 2)
-
+        new_stop = round(float(st.stop), 2)
         trade["quantity"] = remaining
         trade["stop_loss"] = new_stop
-        trade["target"] = new_target
+        if math.isfinite(st.target):
+            trade["target"] = round(float(st.target), 2)
+        else:
+            # runner_rr_mult = 0: no hard target, the trail alone exits. The
+            # DOCUMENT keeps a finite number (infinity is not storable, and
+            # every reader of `target` expects a price), so it is parked far
+            # enough away that it can never bind before the trail does. The
+            # DECISION still uses st.target, which stays infinite.
+            trade["target"] = round(entry + (1 if side == "BUY" else -1)
+                                    * st.risk_dist * 100.0, 2)
+        # Legacy flags, still read by _rehydrate and by anything outside this
+        # class that inspects an open trade.
         trade["_partial_done"] = True
         trade["partial_done"] = True
-        # Turns the trail on for THIS position only. _apply_trail is otherwise
-        # opt-in per symbol, and the runner must trail whether or not the
-        # symbol opted in — that is the whole point of leaving it on.
-        trade["_trail_active"] = bool(getattr(self.params, "trail_remainder", False))
-        trade["_trail_peak"] = live_price
+        trade["_trail_active"] = bool(st.trail_active)
+        trade["_trail_peak"] = st.peak
         # Free the margin the booked lots were holding, so available capital
         # reflects the smaller position immediately.
         if trade.get("_margin"):
             trade["_margin"] = float(trade["_margin"]) * remaining / qty
         self.db.update_trade_fields(trade["trade_id"], self.environment, {
-            "quantity": remaining, "stop_loss": new_stop, "target": new_target,
-            "partial_done": True,
+            "quantity": remaining, "stop_loss": new_stop,
+            "target": float(trade["target"]), "partial_done": True,
         })
 
-        pnl = (target - entry) * exit_qty * mult * (1 if side == "BUY" else -1)
+        pnl = (price - entry) * exit_qty * mult * (1 if side == "BUY" else -1)
         today_real = self.db.today_realized(self.environment,
                                             user_id=self.user_id)
         with self.state.lock:
             self.state.realized_pnl = today_real
         self._refresh_daily()
         self.state.push_log(
-            f"PARTIAL {inst.symbol} {side} {exit_qty}/{qty} @ {target:.2f} "
+            f"PARTIAL {inst.symbol} {side} {exit_qty}/{qty} @ {price:.2f} "
             f"[TARGET] PnL ₹{pnl:,.2f} (order {res.order_id}) | "
-            f"{remaining} left, stop → {new_stop:.2f} (break-even + "
-            f"{getattr(self.params, 'breakeven_buffer_ticks', 0):g} ticks), "
-            f"runner target {new_target:.2f}"
-            f"{', trailing' if trade['_trail_active'] else ''}.")
+            f"{remaining} left, stop → {new_stop:.2f} "
+            f"(break-even + {(new_stop - entry) * (1 if side == 'BUY' else -1):+.2f}"
+            f" = {1e4 * abs(new_stop - entry) / max(entry, 1e-9):.0f} bps), "
+            f"runner target {trade['target']:.2f}"
+            f"{', trailing' if st.trail_active else ''}.")
         self._recompute_unrealized()
 
-    def _apply_trail(self, inst: Instrument, trade: dict, live_price: float,
-                     atr: float) -> None:
-        """ATR chandelier trailing stop — OPT-IN PER SYMBOL, default off.
+    def _persist_stop(self, inst: Instrument, trade: dict, new_stop: float,
+                      why: str) -> None:
+        """Execute a MOVE_STOP decision — a trail or the break-even move.
 
-            LONG : stop = max(stop, peak   - mult × ATR)
-            SHORT: stop = min(stop, trough + mult × ATR)
+        Persisted IMMEDIATELY, and independently of whether the broker-side
+        re-arm that follows succeeds: this is the stop the bot now manages to,
+        and a restart must rehydrate against it rather than the entry stop.
 
-        `peak`/`trough` is the best price this position has SEEN, tracked from
-        the live price (the same price the stop is actually fired against —
-        see _manage_open), not from candle highs, so the trail cannot lag the
-        exit check that follows it.
-
-        Four invariants, each one load-bearing:
-
-        1. RATCHET ONLY. The stop moves toward the price and never away, so a
-           trail can only ever shrink the distance still at risk. Quantity was
-           fixed at entry and is never revisited, so this cannot widen risk
-           per trade — Immutable Rule #1 holds by construction, not by check.
-        2. NEVER *MOVED* PAST THE LIVE PRICE. A stop dragged above the current
-           price (for a long) would be "hit" instantly by the check below and
-           book an exit at a price the market never traded — a fictitious
-           profit — so a move is clamped one tick to the safe side. Reachable
-           mainly when ATR CONTRACTS, which lifts the chandelier faster than
-           price. Note this bounds where the trail may MOVE a stop to, not
-           where a stop may end up: if price GAPS through an
-           already-ratcheted stop, that stop is correctly left where it is and
-           the ordinary stop-out fires. Lowering it to chase the gap would
-           loosen a stop the position had already earned, which is worse.
-        3. NEVER PAST THE TARGET. Beyond it the target closes the trade first,
-           so moving the stop there only risks the two crossing.
-        4. TICK-SNAPPED THE SAFE WAY — floor for a long, ceil for a short, the
-           same direction _enter rounds its entry stop. Rounding always lands
-           on the looser side of the computed level, never a hair tighter.
-
-        A no-op unless the symbol opted in AND the runner supplied a usable
-        ATR, so an unconfigured symbol keeps its fixed entry stop exactly as
-        before this existed.
+        A no-op when the stop is already there, which is what makes the
+        break-even MOVE_STOP that follows a PARTIAL free — _book_partial has
+        already written it as part of its single four-field update.
         """
-        if atr <= 0:
+        new_stop = round(float(new_stop), 2)
+        if abs(float(trade["stop_loss"]) - new_stop) < 1e-9:
             return
-        rules = self.symbol_rules.get(inst.symbol)
-        if trade.get("_trail_active"):
-            # A scaled-out runner trails regardless of the per-symbol opt-in —
-            # _maybe_scale_out already decided this position trails, and the
-            # symbol's setting must not be able to countermand it. Falls back
-            # to the strategy's own ATR multiple when the symbol has no rule.
-            mult = (rules.trail_mult(self.params.atr_sl_mult)
-                    if rules is not None else self.params.atr_sl_mult)
-        elif rules is None:
-            return
-        else:
-            mult = rules.trail_mult(self.params.atr_sl_mult)
-        if mult <= 0:
-            return
-
-        side = trade["side"]
-        tick = inst.tick_size or 0.05
-        stop = float(trade["stop_loss"])
-        target = float(trade["target"])
-        # Seeded from the entry, so a position that has only ever gone against
-        # us trails from where it started rather than from a worse price.
-        peak = float(trade.get("_trail_peak", trade["entry_price"]))
-
-        if side == "BUY":
-            peak = max(peak, live_price)
-            trade["_trail_peak"] = peak
-            new_stop = math.floor((peak - mult * atr) / tick) * tick
-            new_stop = min(new_stop, live_price - tick, target - tick)
-            if new_stop <= stop + tick / 2:          # not a real improvement
-                return
-        else:
-            peak = min(peak, live_price)
-            trade["_trail_peak"] = peak
-            new_stop = math.ceil((peak + mult * atr) / tick) * tick
-            new_stop = max(new_stop, live_price + tick, target + tick)
-            if new_stop >= stop - tick / 2:
-                return
-
-        new_stop = round(new_stop, 2)
         trade["stop_loss"] = new_stop
-        # Persist immediately, and independently of whether the broker-side
-        # re-arm below succeeds: this is the stop the bot now manages to, and a
-        # restart must rehydrate against it rather than the original entry stop.
         self.db.update_trade_fields(
             trade["trade_id"], self.environment, {"stop_loss": new_stop})
-        locked = (new_stop - float(trade["entry_price"])) * (1 if side == "BUY" else -1)
+        locked = ((new_stop - float(trade["entry_price"]))
+                  * (1 if trade["side"] == "BUY" else -1))
         self.state.push_log(
-            f"🔒 {inst.symbol}: trailing stop → {new_stop:.2f} "
-            f"({mult:g}×ATR behind {peak:.2f}"
+            f"🔒 {inst.symbol}: stop → {new_stop:.2f} ({why}"
             f"{', now risk-free' if locked >= 0 else ''}).")
 
     def _manage_open(self, inst: Instrument, live_price: float,
@@ -1643,33 +1689,34 @@ class TradingEngine:
         if trade is None:
             return False
         trade["_live_price"] = live_price
-        # Scale-out FIRST, before anything reads stop/target/quantity on this
-        # tick. A multi-lot position touching its first target books part of
-        # itself here and rewrites all three; running this after the exit check
-        # below would instead close the WHOLE position at that target and the
-        # runner would never exist. A no-op for every strategy that does not
-        # set partial_exit_fraction, and for any position of one lot.
-        self._maybe_scale_out(inst, trade, live_price)
-        # Order matters: move the stop FIRST, then let _resync_protection push
-        # it to the broker on this same tick, then check the exits against the
-        # stop we just set. Trailing after the exit check would leave the
-        # broker armed one tick behind the engine for no reason.
-        self._apply_trail(inst, trade, live_price, atr)
-        self._resync_protection(inst, trade)
+        # ONE decision function, shared with the backtester (exit_manager.py):
+        # the partial scale-out at the first target, the break-even move, the
+        # runner target and the ATR trail are all decided there, and the only
+        # thing that happens here is turning those decisions into broker
+        # orders, trade documents and logs.
+        #
+        # The ORDER of the returned actions is load-bearing and mirrors what
+        # this method did inline before:
+        #   PARTIAL   -> books part of a multi-lot position at its first
+        #                target and rewrites qty/stop/target. Must run before
+        #                anything reads them, or the WHOLE position would close
+        #                at that target and the runner would never exist.
+        #   MOVE_STOP -> break-even / trail. Applied (and pushed to the broker
+        #                by _resync_protection below) BEFORE the exit check, so
+        #                a tick that both improves and then breaches resolves
+        #                against the updated stop, never a stale one.
+        #   EXIT      -> stop or target hit; closes whatever remains.
+        st = self._exit_state(inst, trade)
         exit_price, reason = None, ""
-
-        # Direction-aware by necessity: a SHORT's stop sits ABOVE its entry and its
-        # target BELOW. Long-only comparisons would stop out every short instantly.
-        if trade["side"] == "BUY":
-            if live_price <= trade["stop_loss"]:
-                exit_price, reason = trade["stop_loss"], "STOP-LOSS"
-            elif live_price >= trade["target"]:
-                exit_price, reason = trade["target"], "TARGET"
-        else:
-            if live_price >= trade["stop_loss"]:
-                exit_price, reason = trade["stop_loss"], "STOP-LOSS"
-            elif live_price <= trade["target"]:
-                exit_price, reason = trade["target"], "TARGET"
+        for act in exit_manager.step_tick(st, live_price, atr,
+                                          self._exit_params(inst)):
+            if act.kind == exit_manager.ActionType.PARTIAL:
+                self._book_partial(inst, trade, st, act)
+            elif act.kind == exit_manager.ActionType.MOVE_STOP:
+                self._persist_stop(inst, trade, act.new_stop, act.reason)
+            else:
+                exit_price, reason = float(act.price), act.reason
+        self._resync_protection(inst, trade)
 
         # Time exit (scalping.md §4): a scalp that hasn't resolved has lost its
         # edge — close it at market rather than let it drift.

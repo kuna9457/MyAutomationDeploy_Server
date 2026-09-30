@@ -66,6 +66,27 @@ class SearchSpec:
     strategy_key: str = "candlestick_engine"
     risk_reward: float = 0.0        # 0 = the strategy's own
     min_score: float = 0.0          # 0 = the strategy's own
+    #: How an OPEN position is managed after its first target — one of
+    #: config.EXIT_STYLES. Held FIXED like RR and score: the search answers
+    #: "given this configuration, which symbol and which pattern", so the
+    #: exit rule has to be part of the configuration rather than left at a
+    #: default that measures a different bot from the one being screened for.
+    exit_style: str = "strategy"
+    trail_atr_mult: float = 0.0
+    partial_exit_fraction: float = -1.0
+    runner_rr_mult: float = -1.0
+    max_stop_pct: float = 0.0
+    min_stop_pct: float = 0.0
+
+    def run_shape(self) -> dict:
+        """The kwargs that decide WHAT BOT is measured, for run_backtest."""
+        return dict(exit_style=self.exit_style,
+                    trail_atr_mult=self.trail_atr_mult,
+                    partial_exit_fraction=self.partial_exit_fraction,
+                    runner_rr_mult=self.runner_rr_mult,
+                    max_stop_pct=self.max_stop_pct,
+                    min_stop_pct=self.min_stop_pct)
+
     split: float = DEFAULT_SPLIT
     verify_top: int = DEFAULT_VERIFY_TOP
 
@@ -132,7 +153,7 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
         risk_reward=spec.risk_reward, min_score=spec.min_score,
         # THE WHOLE POINT of the screen: look at every pattern, not just the
         # ones the dashboard filter currently allows.
-        ignore_saved_patterns=True)
+        ignore_saved_patterns=True, **spec.run_shape())
 
     # The comparison that makes the whole table meaningful: this symbol with NO
     # pattern filter, over the very window the combinations are scored on. The
@@ -145,7 +166,7 @@ def screen_symbol(spec: SearchSpec, symbol: str) -> tuple[list[Combo], dict]:
             symbol, spec.split_date(), spec.end, spec.capital, spec.mode,
             lot_size=lot, strategy_key=spec.strategy_key,
             risk_reward=spec.risk_reward, min_score=spec.min_score,
-            ignore_saved_patterns=True)
+            ignore_saved_patterns=True, **spec.run_shape())
         baseline_oos = oos.metrics.get("Total Return %", 0.0)
     except Exception:
         pass                       # a missing baseline must not lose the screen
@@ -205,7 +226,8 @@ def verify_combo(spec: SearchSpec, combo: Combo) -> Combo:
         return backtester.run_backtest(
             combo.symbol, a, b, spec.capital, spec.mode, lot_size=lot,
             strategy_key=spec.strategy_key, risk_reward=spec.risk_reward,
-            min_score=spec.min_score, patterns=[combo.pattern])
+            min_score=spec.min_score, patterns=[combo.pattern],
+            **spec.run_shape())
 
     try:
         ins = run(spec.start, boundary)

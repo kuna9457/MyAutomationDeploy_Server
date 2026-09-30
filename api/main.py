@@ -39,9 +39,28 @@ from api.auth import (CurrentUser, TokenResponse, authenticate,  # noqa: E402
 from api.routers import (account, admin_users, advanced_backtest,  # noqa: E402
                          auditor, backtest, bot, broker, bulk_backtest,
                          chart, config_router, crudeoil_pipeline_api,
-                         risk, trades)
+                         fleet, risk, trades)
+import hub_link  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
 
-app = FastAPI(title="Trading Bot API")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Fleet startup. On a client NODE (NODE_MODE=worker) dial the hub; on the
+    HUB resume a broadcast the admin left running across a restart. Both are
+    no-ops on an ordinary single-server deployment, so nothing changes there.
+    Resuming opens a market-data socket, so it runs off the event loop."""
+    import threading
+    if hub_link.start_if_worker():
+        pass
+    else:
+        from fleet_broadcast import hub
+        threading.Thread(target=hub.resume_if_active, daemon=True,
+                         name="fleet-resume").start()
+    yield
+
+
+app = FastAPI(title="Trading Bot API", lifespan=_lifespan)
 
 _origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
 app.add_middleware(
@@ -95,3 +114,8 @@ app.include_router(advanced_backtest.router)
 app.include_router(crudeoil_pipeline_api.router)
 # Multi-axis optimizer: separate funnel search (bulk_backtest/).
 app.include_router(bulk_backtest.router)
+# Fleet BROADCAST (hub only): its own runner and state, sharing nothing with the
+# admin's own bot but the market-data socket. A client node never serves this —
+# it only dials OUT to a hub — so the routes are not even mounted there.
+if not hub_link.is_worker():
+    app.include_router(fleet.router)

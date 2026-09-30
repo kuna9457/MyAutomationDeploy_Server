@@ -290,6 +290,14 @@ def run_with_costs(
     ignore_saved_patterns: bool = False,
     cost_model: Optional[CostModel] = None,
     timeframe_minutes: int = 0,
+    exit_style: str = "strategy",
+    trail_atr_mult: float = 0.0,
+    partial_exit_fraction: float = -1.0,
+    runner_rr_mult: float = -1.0,
+    max_stop_pct: float = 0.0,
+    min_stop_pct: float = 0.0,
+    hold_overnight: bool = False,
+    ignore_entry_cutoff: bool = False,
 ) -> BulkBacktestResult:
     """Run an existing backtest and post-process with costs + enrichment.
 
@@ -306,6 +314,23 @@ def run_with_costs(
         filters=filters, patterns=patterns,
         ignore_saved_patterns=ignore_saved_patterns,
         timeframe_minutes=timeframe_minutes,
+        # The exit style decides WHAT BOT this is measuring. Left at
+        # "strategy" a bulk screen ranks symbols on the plain fixed exit while
+        # the single-symbol tab reports a managed one, and the two tabs then
+        # disagree about the same symbol.
+        exit_style=exit_style, trail_atr_mult=trail_atr_mult,
+        partial_exit_fraction=partial_exit_fraction,
+        runner_rr_mult=runner_rr_mult,
+        max_stop_pct=max_stop_pct, min_stop_pct=min_stop_pct,
+        # Removes the end-of-session flat-out, so a position runs to its own
+        # stop/target/trail across sessions. Off by default; see
+        # backtester.run_backtest's docstring for what the resulting number
+        # does and does not mean (in particular: costs below are still priced
+        # as INTRADAY, and a held-overnight position is delivery).
+        hold_overnight=hold_overnight,
+        # Independent of the flag above: this one changes how many trades are
+        # taken, that one changes how they close. See run_backtest's docstring.
+        ignore_entry_cutoff=ignore_entry_cutoff,
     )
 
     # 2. Determine cost model and contract multiplier
@@ -376,6 +401,12 @@ def run_bulk_with_costs(
     progress_cb=None,
     max_workers: int = BULK_MAX_WORKERS,
     timeframe_minutes: int = 0,
+    exit_style: str = "strategy",
+    trail_atr_mult: float = 0.0,
+    partial_exit_fraction: float = -1.0,
+    runner_rr_mult: float = -1.0,
+    max_stop_pct: float = 0.0,
+    min_stop_pct: float = 0.0,
 ) -> dict[str, BulkBacktestResult]:
     """Run cost-aware backtests across multiple symbols concurrently.
 
@@ -395,6 +426,10 @@ def run_bulk_with_costs(
                 filters=filters, patterns=patterns,
                 ignore_saved_patterns=ignore_saved_patterns,
                 cost_model=cost_model, timeframe_minutes=timeframe_minutes,
+                exit_style=exit_style, trail_atr_mult=trail_atr_mult,
+                partial_exit_fraction=partial_exit_fraction,
+                runner_rr_mult=runner_rr_mult,
+                max_stop_pct=max_stop_pct, min_stop_pct=min_stop_pct,
             )
         except Exception as exc:
             print(f"[bulk_backtester] {ticker} failed ({exc}).")

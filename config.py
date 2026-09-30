@@ -9,8 +9,9 @@ rest of the system can stay decoupled (Immutable Rule #3).
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from enum import Enum
 from typing import Optional
 
@@ -50,6 +51,10 @@ class Segment(str, Enum):
     #: TOTAL mapping from day one. Adding real crypto instruments later is then
     #: purely a config change — no reporting, storage or UI work follows it.
     CRYPTO = "CRYPTO"
+    #: US cash equities (NYSE/NASDAQ), traded through Alpaca. Its bars and its
+    #: clock are EXCHANGE-LOCAL (America/New_York), not IST — see US_TZ below
+    #: for why that choice is forced rather than stylistic.
+    US_EQUITY = "US_EQUITY"
 
 
 class Category(str, Enum):
@@ -69,7 +74,26 @@ SEGMENT_CATEGORY: dict[Segment, Category] = {
     Segment.EQUITY: Category.EQUITY,
     Segment.MCX: Category.COMMODITY,
     Segment.CRYPTO: Category.CRYPTO,
+    # A US share is still equity for P&L reporting; the venue differs, the
+    # asset class does not. (Currency does differ — see US_CURRENCY.)
+    Segment.US_EQUITY: Category.EQUITY,
 }
+
+
+#: Currency each segment is denominated in. NEVER aggregate across two of
+#: these — a ₹ P&L and a $ P&L summed into one number is silently wrong.
+SEGMENT_CURRENCY: dict[Segment, str] = {
+    Segment.EQUITY: "INR", Segment.MCX: "INR", Segment.CRYPTO: "INR",
+    Segment.US_EQUITY: "USD",
+}
+
+
+def currency_for_segment(segment) -> str:
+    """Currency code for a Segment or its raw string value."""
+    try:
+        return SEGMENT_CURRENCY.get(Segment(segment), "INR")
+    except Exception:
+        return "INR"
 
 
 def category_for_segment(segment) -> str:
@@ -287,7 +311,18 @@ except Exception:  # generated module absent — keep the bot runnable
         Instrument("SILVERMIC",   Segment.MCX, "MCX_FO|488788", 1,    1.0,  223320.0,  1,    expiry="2026-08-31"),   # 1 kg, quoted ₹/kg
     ]
 
-ALL_INSTRUMENTS = EQUITY_INSTRUMENTS + MCX_INSTRUMENTS
+# US equities (Alpaca) ------------------------------------------------------- #
+# A US instrument_key is simply its ticker — there is no ISIN-style lookup and
+# nothing expires, so unlike MCX this list does not rot. Regenerate with
+# tools/refresh_us.py when you want a different universe; it is NOT required to
+# get started. Absent module => empty list, and every US code path below is
+# then simply unreachable, leaving the Indian bot byte-identical.
+try:
+    from us_instruments import US_INSTRUMENTS
+except Exception:
+    US_INSTRUMENTS = []
+
+ALL_INSTRUMENTS = EQUITY_INSTRUMENTS + MCX_INSTRUMENTS + US_INSTRUMENTS
 INSTRUMENTS_BY_SYMBOL = {i.symbol: i for i in ALL_INSTRUMENTS}
 
 
@@ -394,6 +429,44 @@ def now_ist() -> datetime:
 
 
 # --------------------------------------------------------------------------- #
+#  Exchange-local clocks.
+#
+#  Every Indian segment is quoted, stored and reasoned about in IST, so one
+#  global now_ist() sufficed. A US session cannot join that scheme: 09:30-16:00
+#  New York is roughly 19:00-02:30 IST, which CROSSES MIDNIGHT, and
+#  MarketHours.is_open() is a plain `open <= now <= close` comparison that is
+#  false for every minute of a wrapping session. US DST makes it worse — the
+#  IST offset moves by an hour twice a year while India never shifts.
+#
+#  So each segment keeps its OWN wall clock, and its bars are stored in that
+#  same local time. In New York terms the session is 09:30-16:00 on one
+#  calendar day, which means:
+#     * is_open() works unchanged, with no wrap-around special case,
+#     * the square-off comparison works unchanged,
+#     * strategy.vwap()'s per-calendar-day reset lands on the real session
+#       boundary instead of splitting it at IST midnight.
+#  Nothing about the Indian path changes: now_for_segment() returns exactly
+#  now_ist() for every pre-existing segment.
+# --------------------------------------------------------------------------- #
+US_TZ = ZoneInfo("America/New_York")
+
+#: Trades in this segment are denominated in this currency. Reporting and any
+#: cross-account aggregation must not mix them — see the US_EQUITY note in
+#: cost_model / the integration guide.
+
+
+def now_for_segment(segment) -> datetime:
+    """Current NAIVE wall-clock time at the segment's own exchange.
+
+    IST for every Indian segment (identical to now_ist(), so existing callers
+    are unaffected); New York local time for US equities.
+    """
+    if segment == Segment.US_EQUITY:
+        return datetime.now(US_TZ).replace(tzinfo=None)
+    return now_ist()
+
+
+# --------------------------------------------------------------------------- #
 #  Market hours (IST). MCX stays open into the night — this is the whole point
 #  of the commodity addition, so the engine must respect the later close.
 # --------------------------------------------------------------------------- #
@@ -412,8 +485,18 @@ EQUITY_HOURS = MarketHours(time(9, 15), time(15, 30))
 MCX_HOURS = MarketHours(time(9, 0), time(23, 30))
 
 
+# US regular session: 09:30 - 16:00 America/New_York. Expressed in NEW YORK
+# local time, which is what now_for_segment(US_EQUITY) returns — so DST is
+# handled by the zoneinfo database rather than by arithmetic here.
+US_EQUITY_HOURS = MarketHours(time(9, 30), time(16, 0))
+
+
 def market_hours_for_segment(segment: Segment) -> MarketHours:
-    return MCX_HOURS if segment == Segment.MCX else EQUITY_HOURS
+    if segment == Segment.MCX:
+        return MCX_HOURS
+    if segment == Segment.US_EQUITY:
+        return US_EQUITY_HOURS
+    return EQUITY_HOURS
 
 
 # --------------------------------------------------------------------------- #
@@ -440,6 +523,15 @@ def market_hours_for_segment(segment: Segment) -> MarketHours:
 DEFAULT_SQUARE_OFF = {
     Segment.EQUITY: time(15, 9),
     Segment.MCX: time(23, 15),
+    # 15:45 New York. Chosen to mirror NSE's semantics EXACTLY rather than to
+    # match its clock: 15:09 IST is passed by NSE's final 15-minute bar (which
+    # starts 15:15), so the square-off always fires on the last bar. The US
+    # session's final 15-minute bar starts at 15:45, so a 15:50 cutoff would be
+    # passed by NO bar at all and the square-off would silently never run,
+    # letting intraday positions drift out of the session. 15:45 restores the
+    # "closed on the final bar" behaviour, and live it still leaves 15 minutes
+    # before the 16:00 close.
+    Segment.US_EQUITY: time(15, 45),
 }
 
 #: Modes whose positions must be flat by the end of the session. Swing is NOT
@@ -464,6 +556,81 @@ def parse_clock(value: str) -> Optional[time]:
         return None
 
 
+# --------------------------------------------------------------------------- #
+#  "When is this session, in MY time?"
+#
+#  The engine reasons entirely in exchange-local time (see now_for_segment), and
+#  it should: that is what makes is_open(), the square-off and the VWAP day
+#  reset correct without special cases. But the OPERATOR is in India, and for a
+#  US instrument the exchange clock tells them nothing useful — 15:45 New York
+#  is the middle of the night in Mumbai, and WHICH night-time hour it is moves
+#  by one when US daylight saving flips (India has no DST, so the offset is
+#  4h30 in US summer and 5h30... no: 9h30 and 10h30 behind IST respectively).
+#
+#  These helpers exist purely to answer that, and are display-only — nothing in
+#  the trading path reads them.
+# --------------------------------------------------------------------------- #
+def _to_ist(t: time, tz, on: Optional["date_cls"] = None) -> tuple[time, int]:
+    """`t` in timezone `tz` -> (IST time, day offset).
+
+    The day offset is 0 when the moment lands on the same IST calendar day and
+    1 when it spills past midnight — which is the normal case for a US close
+    seen from India, and exactly the fact a trader needs to know.
+    """
+    from datetime import date as _date, datetime as _dt
+    day = on or _date.today()
+    local = _dt.combine(day, t, tz)
+    ist = local.astimezone(IST)
+    return ist.time(), (ist.date() - local.date()).days
+
+
+def session_windows(segment: Segment, mode: Mode = Mode.INTRADAY,
+                    override: str = "", on=None) -> dict:
+    """Open / close / square-off for a segment, in BOTH clocks.
+
+    DST-aware: it converts on a real DATE, so a US session correctly reads
+    19:00 IST in summer and 20:00 IST in winter rather than a fixed guess.
+    """
+    hours = market_hours_for_segment(segment)
+    tz = US_TZ if segment == Segment.US_EQUITY else IST
+    sq = square_off_time_for(segment, mode, override)
+
+    def pair(t):
+        if t is None:
+            return None
+        ist_t, off = _to_ist(t, tz, on)
+        return {"local": t.strftime("%H:%M"),
+                "ist": ist_t.strftime("%H:%M"),
+                "ist_next_day": bool(off)}
+
+    return {
+        "segment": segment.value,
+        "timezone": "America/New_York" if segment == Segment.US_EQUITY
+                    else "Asia/Kolkata",
+        "open": pair(hours.open_t),
+        "close": pair(hours.close_t),
+        "square_off": pair(sq),
+        "currency": currency_for_segment(segment),
+    }
+
+
+def session_summary_ist(segment: Segment, mode: Mode = Mode.INTRADAY,
+                        override: str = "") -> str:
+    """One line an Indian operator can act on, e.g.
+    "US Equity 19:00-01:30 IST (next day), square-off 01:15 IST"."""
+    w = session_windows(segment, mode, override)
+    if segment != Segment.US_EQUITY:
+        sq = f", square-off {w['square_off']['ist']}" if w["square_off"] else ""
+        return f"{w['open']['ist']}-{w['close']['ist']} IST{sq}"
+    nxt = " (next day)" if w["close"]["ist_next_day"] else ""
+    sq = ""
+    if w["square_off"]:
+        sq_nxt = " next day" if w["square_off"]["ist_next_day"] else ""
+        sq = f", square-off {w['square_off']['ist']} IST{sq_nxt}"
+    return (f"{w['open']['ist']}-{w['close']['ist']} IST{nxt}{sq} "
+            f"({w['open']['local']}-{w['close']['local']} New York)")
+
+
 def square_off_time_for(segment: Segment, mode: Mode,
                         override: str = "") -> Optional[time]:
     """When positions in this instrument must be flat, or None if the mode
@@ -471,6 +638,33 @@ def square_off_time_for(segment: Segment, mode: Mode,
     if mode not in SQUARE_OFF_MODES:
         return None
     return parse_clock(override) or default_square_off(segment)
+
+
+def entry_cutoff_for(segment: Segment, mode: Mode, params,
+                     square_off_override: str = "") -> Optional[time]:
+    """Latest wall-clock time at which a NEW position may be opened, or None
+    when the strategy sets no cutoff (`entry_cutoff_before_close = 0`, the
+    default) or the mode holds overnight.
+
+    DERIVED FROM THE FLAT-OUT, not configured as a clock, because the thing it
+    protects against is a trade with no runway: an entry taken twenty minutes
+    before everything is squared off cannot reach its target, so it is a
+    brokerage donation with a chart attached. Measured on a real Intraday log,
+    every position opened on the last tradeable bar lost money — six for six —
+    on a combined +Rs24 of gross movement.
+
+    Because it is derived, moving the square-off time moves this with it, which
+    is the correct coupling: the runway a trade needs does not change just
+    because the day was shortened.
+    """
+    minutes = int(getattr(params, "entry_cutoff_before_close", 0) or 0)
+    if minutes <= 0:
+        return None
+    flat_by = square_off_time_for(segment, mode, square_off_override)
+    if flat_by is None:                       # Swing holds overnight
+        return None
+    return (datetime.combine(datetime(2000, 1, 1).date(), flat_by)
+            - timedelta(minutes=minutes)).time()
 
 
 # Notional leverage a segment realistically supports, i.e. 1 / margin_rate.
@@ -489,7 +683,9 @@ def square_off_time_for(segment: Segment, mode: Mode,
 #
 # ⚠️ VERIFY THESE AGAINST YOUR BROKER BEFORE LIVE TRADING. They bound how large a
 # position the bot will take; setting them too high invites margin calls.
-SEGMENT_MAX_LEVERAGE = {Segment.EQUITY: 1.0, Segment.MCX: 15.0}
+SEGMENT_MAX_LEVERAGE = {Segment.EQUITY: 1.0, Segment.MCX: 15.0,
+                        # Same deliberate no-leverage choice as NSE cash.
+                        Segment.US_EQUITY: 1.0}
 
 
 def max_leverage_for(segment: Segment, params: "StrategyParams") -> float:
@@ -609,6 +805,32 @@ class StrategyParams:
     vol_sma: int = 20
     atr_period: int = 14
     atr_sl_mult: float = 1.5   # volatility stop distance = atr_sl_mult * ATR
+    # -- Stop-distance band (percent of ENTRY price) ------------------------ #
+    #  The stop is still derived from ATR exactly as before; these only BOUND
+    #  the answer. Both default to 0.0 = no bound, so every existing strategy
+    #  takes the identical code path it did before this existed.
+    #
+    #  WHY A BAND. ATR is a volatility reading, not a tradeability check. On a
+    #  quiet day it can put the stop 0.2% away, inside the spread and the
+    #  noise; on an event day it can put it 4% away, which pushes a 1:1 target
+    #  4% away too — a move the session usually will not deliver, so the trade
+    #  resolves neither way and dies at the square-off. Measured on a real
+    #  Intraday log, risk distances ran from 0.64% to 3.9% of price on ONE
+    #  symbol.
+    #
+    #  THE RR IS PRESERVED. Clamping moves the stop and the target together,
+    #  so a 1:1 setup stays 1:1 — see strategy.clamp_signal_risk.
+    #
+    #  SIZING FOLLOWS, AS IT ALWAYS DOES. qty = risk_budget / stop_distance,
+    #  so a clamped-tighter stop buys a BIGGER position for the same rupee
+    #  risk. Immutable Rule #1 is untouched — risk per trade is unchanged —
+    #  but notional, and therefore cost, rises. That is the trade being made,
+    #  and it is why this is measured rather than assumed.
+    #: Widest the stop may sit from entry, in PERCENT. 0.0 = no cap.
+    max_stop_pct: float = 0.0
+    #: Tightest the stop may sit from entry, in PERCENT. 0.0 = no floor.
+    #: Guards the other end: a stop inside the spread is a guaranteed stop-out.
+    min_stop_pct: float = 0.0
 
     # -- Hybrid stop-loss + fixed-cash risk (Scalper) ------------------------ #
     # A fixed CASH amount to risk per trade (e.g. ₹2000). Kept as a CEILING, not
@@ -726,7 +948,20 @@ class StrategyParams:
     #: this many ticks (long; minus for a short) — the friction buffer that
     #: makes the runner genuinely risk-free after ROUND-TRIP costs rather than
     #: merely break-even before them.
+    #:
+    #: ONLY MEANINGFUL PER INSTRUMENT. Round-trip cost is mostly proportional
+    #: to turnover, so the tick count that covers it depends entirely on the
+    #: price and the tick grid: measured against cost_model, a ~Rs1L intraday
+    #: equity round trip is 7 ticks of a Rs250 share and 92 ticks of a Rs3,200
+    #: one. Set this only when a fixed grid distance is genuinely what is
+    #: meant (CRUDEOIL does); otherwise set the bps field below.
     breakeven_buffer_ticks: float = 0.0
+    #: The same buffer in BASIS POINTS OF ENTRY PRICE, added to the tick term.
+    #: This is the portable unit — ~14.3 bps covers an intraday equity round
+    #: trip and ~12.5 bps an MCX crude one, near enough the same number that
+    #: one setting serves every book. 0.0 (the default) = no proportional
+    #: term, i.e. exactly the behaviour before this field existed.
+    breakeven_buffer_bps: float = 0.0
     #: Runner target, as a multiple of the ORIGINAL risk distance. The
     #: remainder is managed by the trail; this is the backstop beyond it.
     runner_rr_mult: float = 0.0
@@ -734,15 +969,86 @@ class StrategyParams:
     #: opt-in trail. False = the remainder simply holds to its break-even stop
     #: or the runner target.
     trail_remainder: bool = False
+    #: LOCK THE FIRST TARGET. After the partial, the runner's stop is floored
+    #: at TP1 instead of at break-even, so the 1R the trade already earned can
+    #: never be handed back: price going above TP1 and returning to it squares
+    #: the runner off there, and only a move on to TP2 pays more.
+    #:
+    #: Strictly tighter than the break-even buffer — it does not compete with
+    #: it, it supersedes it, because TP1 is always the further of the two into
+    #: profit. Default False, so this is inert for every existing strategy.
+    #:
+    #: NOT OBVIOUSLY BETTER, which is why it is a knob: a runner floored at
+    #: TP1 books ~1R reliably but dies on any pullback, while one floored at
+    #: break-even risks that 1R for the chance of 2R+. Measure it.
+    lock_first_target: bool = False
+    #: WHEN the runner's stop is promoted to the first target, as a fraction
+    #: of the way from TP1 to TP2. 0.0 = at once (Approach 2b); 0.5 = only
+    #: once price reaches the midpoint of TP1..TP2 (Approach 2c), leaving the
+    #: runner on break-even + friction until then so it is allowed to breathe.
+    #: Inert unless lock_first_target is on, and superseded by the ATR trigger
+    #: below whenever that is set.
+    lock_trigger_frac: float = 0.0
+    #: The same trigger in ATR: promote once price is this many ATR past TP1.
+    #: 0.0 = use the fraction instead. A fraction is a share of a distance the
+    #: strategy picked; ATR is a reading of what the instrument is actually
+    #: doing today, so it means the same thing across symbols and regimes.
+    #: See exit_manager.ExitParams.lock_trigger_atr_mult for the multiple
+    #: that is worth choosing and the one that quietly disables the lock.
+    lock_trigger_atr_mult: float = 0.0
+    #: Trail the FULL position from ENTRY, with no partial at all — the other
+    #: profit-booking approach ("Approach 1": let the whole size run behind an
+    #: ATR chandelier instead of banking half at 1R).
+    #:
+    #: Default False, so this is inert for every existing strategy: with it off
+    #: and `partial_exit_fraction = 0`, a position is the plain fixed-RR trade
+    #: it has always been. The trail distance is `atr_sl_mult` — the same
+    #: multiple the entry stop was built from — unless the symbol overrides it
+    #: (symbol_config.SymbolRules.trail_mult).
+    trail_from_entry: bool = False
+    #: Chandelier trail distance, in ATR. 0.0 (the default) = INHERIT
+    #: `atr_sl_mult`, which is what the trail used before this field existed,
+    #: so nothing changes for a strategy that leaves it alone.
+    #:
+    #: It is a SEPARATE field because `atr_sl_mult` also sets the ENTRY stop:
+    #: sweeping the trail distance through `atr_sl_mult` would move the entry
+    #: stop with it, and the sweep would then be measuring two changes at once
+    #: instead of one. Per-symbol rules still win over both.
+    trail_atr_mult: float = 0.0
 
 
+# --------------------------------------------------------------------------- #
+#  INTRADAY_CAPITAL_CAP_NOTE — the 20%-of-account notional cap was DISABLED on
+#  2026-08-29 (owner's call). Every Intraday StrategyParams below now sets
+#  max_capital_per_trade_pct=0.0, which strategy.position_size reads as "no
+#  capital cap"; the limit was previously 0.20.
+#
+#  WHY: measured on real fills, the cap — not risk_per_trade — was what sized
+#  every equity trade. On a Rs1L account it allowed ~17 shares of a Rs1,140
+#  stock, so realised risk was 0.04-0.12% against the 1% budget, and the flat
+#  Rs20/order brokerage made the round trip cost 0.34% of notional instead of
+#  0.14%. Removing the cap restores full-capital sizing and cuts that drag ~2.4x.
+#
+#  WHAT DID NOT CHANGE — Immutable Rule #1 is untouched. position_size still
+#  takes the MIN of three limits, and both survivors still bind:
+#    * risk_per_trade (1%, ceiling 2%) — with a wide stop this binds first
+#      (measured: 86 shares, Rs993 = 0.99% of a Rs1L account).
+#    * the notional/leverage limit — equity is pinned to 1x by
+#      SEGMENT_MAX_LEVERAGE, so a position can never exceed the account.
+#
+#  THE REAL TRADE-OFF — the cap was what let several positions run at once
+#  (5 symbols x 20% = 100%). With it off, the first signal of the day can take
+#  the whole account at 1x and later symbols size to qty=0 and are skipped.
+#  This concentrates the book by design. Backtests already ignored this cap
+#  (backtester.py drops it), so live sizing and backtest sizing now agree.
+# --------------------------------------------------------------------------- #
 INTRADAY_PARAMS = StrategyParams(
     mode=Mode.INTRADAY, timeframe="15m",
     # 1% max loss per trade (₹1,000 on a ₹1L account). Scales with capital, and
     # stays well inside the 2% ceiling Immutable Rule #1 forbids exceeding.
     risk_per_trade=0.01, risk_reward=1.0,   # 1:1 — see INTRADAY_RR_NOTE
     max_leverage=15.0,                      # defer to the segment's real cap
-    max_capital_per_trade_pct=0.20,         # <=20% of the account per trade
+    max_capital_per_trade_pct=0.0,          # cap OFF - see INTRADAY_CAPITAL_CAP_NOTE
 )
 SWING_PARAMS = StrategyParams(
     mode=Mode.SWING, timeframe="1d",
@@ -831,16 +1137,38 @@ CANDLE_INTRADAY_PARAMS = StrategyParams(
     mode=Mode.INTRADAY, timeframe="15m",
     # 1% max loss per trade (₹1,000 on a ₹1L account), inside the 2% ceiling.
     risk_per_trade=0.01, risk_reward=1.0,   # 1:1 — see INTRADAY_RR_NOTE
-    max_capital_per_trade_pct=0.20,         # <=20% of the account per trade
+    max_capital_per_trade_pct=0.0,          # cap OFF - see INTRADAY_CAPITAL_CAP_NOTE
     atr_period=14,
     allow_short=True,           # MIS permits shorting, and half of the pattern
     max_leverage=15.0,          # library is bearish — long-only would discard it
-    # Raised from 3.0 (the bare "one high-strength single-candle pattern"
-    # floor) to 6.0 on request — now needs roughly two agreeing patterns (e.g.
-    # a high 2-candle + a medium 2-candle, 3.75+2.5=6.25) rather than one
-    # marginal single-candle hit, to cut down on low-conviction entries.
-    cs_min_score=3.0,
+    # -- MEASURED SETTINGS (2026-09-02) ------------------------------------ #
+    #  Backtested over 8 Nifty names, Jan-Aug 2026, Rs2L, net of costs. The
+    #  strategy ran at -30.53% with the old defaults and -0.38% with these,
+    #  and the entire difference is trade COUNT: 2,890 positions cost
+    #  Rs615,246 in brokerage and slippage, 173 positions cost Rs40,526.
+    #  Gross was positive throughout; the strategy was being eaten by its own
+    #  turnover, not by its direction.
+    #
+    #  Evidence per setting is in the CLAUDE.md changelog. None of these
+    #  touches Immutable Rule #1 — risk per trade is still 1%.
+
+    #: Pattern evidence needed to trade. 3.0 was one marginal single-candle
+    #: hit; 7.0 needs roughly two agreeing patterns. This is the whole fix —
+    #: it alone is +29 of the 30 points, because gross profit per position
+    #: rises from Rs28 to Rs203 while the cost of taking a trade stays ~Rs216.
+    #: Below ~7 the edge per trade is smaller than the cost of capturing it.
+    cs_min_score=7.0,
     cs_trend_lookback=10,
+    #: No new entries after 11:59 (15:09 flat-out minus 190 minutes). Winners
+    #: resolve in a median of 4 bars; a position opened late cannot reach its
+    #: target and is squared off flat having paid a full round trip. Worth
+    #: +0.96pp, and it also halves the position count.
+    entry_cutoff_before_close=190,
+    #: Floor the ATR stop at 0.8% of price. COUNTER-INTUITIVE and measured
+    #: both ways: WIDENING stops pays (+0.19pp) because it converts -Rs1,205
+    #: stop-outs into -Rs65 sideways exits. Capping them does the reverse and
+    #: costs ~2pp, which is why max_stop_pct is deliberately left at 0.
+    min_stop_pct=0.8,
 )
 CANDLE_SWING_PARAMS = StrategyParams(
     mode=Mode.SWING, timeframe="1d",
@@ -932,6 +1260,261 @@ CRUDEOIL_PIPELINE_PARAMS = StrategyParams(
     max_leverage=25.0,
     reentry_cooldown_bars=3,
 )
+
+
+# --------------------------------------------------------------------------- #
+#  EXIT STYLES — the two profit-booking approaches, as CONFIGURATION.
+#
+#  Both are the same lifecycle (exit_manager.py): the strategy's ATR stop and
+#  target are untouched, and everything AFTER the first target is what these
+#  select. Nothing here is on by default — `params_for_mode` and every
+#  StrategyParams below keep the plain fixed-RR exit unless a caller asks for
+#  one of these by name (the backtest form, or an admin per-mode override).
+#
+#      "strategy"      whatever the strategy itself declares. The default, and
+#                      the only style that can leave CRUDEOIL's own scale-out
+#                      in place.
+#      "fixed"         the BASELINE to measure against: no partial, no trail,
+#                      exit strictly on the ATR stop / target / time.
+#      "trail_full"    Approach 1 — no partial; trail the WHOLE position from
+#                      entry behind `trail_atr_mult` x ATR.
+#      "partial_trail" Approach 2 — book `partial_exit_fraction` at the first
+#                      target, move the stop to break-even + buffer, trail the
+#                      runner. `runner_rr_mult = 0` means the trail alone
+#                      decides the runner's exit.
+#      "partial_lock"  Approach 2b — the same partial, but the runner's stop is
+#                      floored at TP1 rather than break-even, and it holds for
+#                      a hard TP2 instead of trailing. Above TP1 and back to
+#                      TP1 = out with the 1R kept; through to TP2 = out at 2R.
+#                      Books more of its winners at exactly 1R and gives back
+#                      nothing; the cost is every runner that would have gone
+#                      to 2R+ after dipping through TP1 on the way.
+#      "partial_ladder" Approach 2c — the same partial and the same TP2, but a
+#                      TWO-STAGE stop. The runner starts on break-even +
+#                      friction and is promoted to TP1 only once price reaches
+#                      the MIDPOINT of TP1..TP2. It buys back exactly what 2b
+#                      gives away — the runner that dips and recovers — and
+#                      pays for it with the 1R that 2b would have banked on
+#                      the ones that simply stall.
+#
+#  Which one is right is an EMPIRICAL question per instrument (see the MFE
+#  study in the implementation brief) — that is exactly why they are runtime
+#  options rather than an edit to a strategy file.
+# --------------------------------------------------------------------------- #
+EXIT_STYLES: tuple[str, ...] = ("strategy", "fixed", "trail_full",
+                                "partial_trail", "partial_lock",
+                                "partial_ladder")
+
+#: Break-even buffer used by the managed styles, in basis points of entry.
+#:
+#: MEASURED, not chosen, and measured against the RUNNER rather than the whole
+#: position — the runner is what this stop protects, and it is the smaller
+#: half, so the flat per-order brokerage is spread over fewer shares. Against
+#: cost_model, a half-size intraday equity runner's own round trip costs
+#: ~19 bps at every price from Rs120 to Rs5,000 (the percentage heads are
+#: price-invariant and the flat Rs20/order is ~8 bps of a Rs50k leg); an MCX
+#: crude runner's costs ~12.5. 20 bps clears both, so a runner handed this stop
+#: is genuinely free after costs rather than merely level before them — which
+#: is the entire purpose of the buffer.
+#:
+#: The one place it can still fall marginally short is a very cheap share,
+#: where the 0.05 tick grid is too coarse to express the level: the stop is
+#: floored onto the grid (looser side, the convention everywhere here), which
+#: on a Rs120 share can give back ~4 bps. Rounding it the other way would
+#: protect more but contradicts the rounding rule the initial stop and the
+#: trail both follow, and 4 bps of a typical 60 bps stop is not worth the
+#: inconsistency.
+#:
+#: NOTE WHAT THIS COSTS: 20 bps against a typical 0.6% intraday stop is a third
+#: of R. Protecting the runner properly is not free, and that is a reason to
+#: MEASURE Approach 2 against the baseline rather than assume it wins.
+#:
+#: Re-derive it if the cost model's rates change.
+BREAKEVEN_BUFFER_BPS = 20.0
+
+#: TP2 for the locked-runner style, as a multiple of the original risk.
+#:
+#: MEASURED, like the buffer: analysis/mfe_study.py over 8 Nifty names puts
+#: 30-47% of Intraday winners past 2R and only 6-24% past 3R, and the median
+#: winner's excursion at ~1.6R. A 2R second target is therefore reachable by a
+#: real share of runners; a 3R one mostly is not, and a runner held for a level
+#: it never reaches just rides back down into its own stop.
+RUNNER_TARGET_RR = 2.0
+
+#: Where the runner must reach before its stop is promoted to TP1, as a
+#: fraction of the TP1..TP2 span. Now only the FALLBACK for when no ATR is
+#: available — LOCK_TRIGGER_ATR below is what normally decides.
+LOCK_TRIGGER_FRAC = 0.5
+
+#: The promotion trigger in ATR: the runner must travel this many ATR past TP1
+#: before its stop is moved up to TP1.
+#:
+#: 1.5 IS AT THE EDGE OF THE SPAN, AND THAT IS THE POINT. The stop is itself
+#: ATR-derived (`atr_sl_mult = 1.5`), so with a 1:1 target the whole TP1..TP2
+#: span is about 1.5 x ATR — a 1.5 multiple therefore puts the trigger on TP2,
+#: and the lock almost never fires before the target does.
+#:
+#: MEASURED, and it inverts the reason this setting was added. Over 8 Nifty
+#: names, Jan-Aug 2026, 173 positions, mean net:
+#:
+#:     0.25 x ATR  -0.38%   lock fires on 60% of runners
+#:     0.50 x ATR  -0.39%                  44%
+#:     0.75 x ATR  -0.31%                  37%
+#:     1.00 x ATR  -0.28%                  23%
+#:     1.50 x ATR  -0.19%                  10%     <- shipped
+#:     3.00 x ATR  -0.19%                   0%
+#:     no lock     -0.19%                   0%
+#:
+#: Monotonic: the MORE the lock fires, the worse the result, and 1.5 scores
+#: exactly what switching the lock off entirely scores. Locking the runner at
+#: TP1 does not protect a gain on this strategy, it truncates the 25% of
+#: runners that would have reached TP2. The value is kept as a trigger rather
+#: than turned into `lock_first_target = False` so the machinery stays
+#: available for a strategy whose runners behave differently — but on this one
+#: it is deliberately set where it does nothing.
+LOCK_TRIGGER_ATR = 1.5
+
+#: Fraction of the position booked at the first target for the ladder style.
+#:
+#: 0.30 rather than a half, and measured: on the same 173 positions, booking
+#: 30% nets -0.28% against -0.42% for 50%. Two reasons, both real — a bigger
+#: runner is what the two-stage stop exists to carry, and the larger remainder
+#: spreads the flat per-order fee over more shares (on a 100-share position
+#: the runner's round trip falls from ~Rs1.04 to ~Rs0.77 a share).
+LADDER_PARTIAL_FRACTION = 0.30
+
+#: Style -> the StrategyParams fields it pins. Absent fields are left alone.
+_EXIT_STYLE_FIELDS: dict[str, dict] = {
+    "strategy": {},
+    "fixed": dict(partial_exit_fraction=0.0, trail_remainder=False,
+                  trail_from_entry=False),
+    # Both managed styles pin the break-even buffer in BPS, not ticks. A tick
+    # count only ever describes the one instrument it was tuned on (see
+    # StrategyParams.breakeven_buffer_ticks); 15 bps clears a round trip on
+    # intraday equity (~14.3) and on MCX crude (~12.5) alike, so the same
+    # style means the same thing on every symbol these run against.
+    "trail_full": dict(partial_exit_fraction=0.0, breakeven_buffer_ticks=0.0,
+                       breakeven_buffer_bps=BREAKEVEN_BUFFER_BPS,
+                       runner_rr_mult=0.0, trail_remainder=False,
+                       trail_from_entry=True),
+    "partial_trail": dict(partial_exit_fraction=0.5,
+                          breakeven_buffer_ticks=0.0,
+                          breakeven_buffer_bps=BREAKEVEN_BUFFER_BPS,
+                          runner_rr_mult=0.0, lock_first_target=False,
+                          trail_remainder=True, trail_from_entry=False),
+    # Approach 2b. The buffer is still declared even though the TP1 floor
+    # always supersedes it: it is what the runner falls back to if a future
+    # change ever makes TP1 unreachable, and leaving it at 0 would look like a
+    # decision to run the runner at bare break-even.
+    #
+    # runner_rr_mult = 2.0, not 3.0: measured on the MFE study, ~30-47% of
+    # Intraday winners that reach 1R go on to 2R but only ~6-24% reach 3R, so
+    # a 3R second target is a level most runners would simply never see.
+    "partial_lock": dict(partial_exit_fraction=0.5,
+                         breakeven_buffer_ticks=0.0,
+                         breakeven_buffer_bps=BREAKEVEN_BUFFER_BPS,
+                         runner_rr_mult=RUNNER_TARGET_RR,
+                         lock_first_target=True, lock_trigger_frac=0.0,
+                         trail_remainder=False, trail_from_entry=False),
+    # Approach 2c. Identical to 2b except WHEN the stop is promoted: at the
+    # midpoint of TP1..TP2 rather than at TP1 itself.
+    "partial_ladder": dict(partial_exit_fraction=LADDER_PARTIAL_FRACTION,
+                           breakeven_buffer_ticks=0.0,
+                           breakeven_buffer_bps=BREAKEVEN_BUFFER_BPS,
+                           runner_rr_mult=RUNNER_TARGET_RR,
+                           lock_first_target=True,
+                           lock_trigger_atr_mult=LOCK_TRIGGER_ATR,
+                           lock_trigger_frac=LOCK_TRIGGER_FRAC,
+                           trail_remainder=False, trail_from_entry=False),
+}
+
+
+def is_valid_exit_style(style: str) -> bool:
+    """Whether `style` names one of EXIT_STYLES. Blank counts as valid and
+    means "strategy" — an unset field must never be an error."""
+    return (style or "strategy").strip().lower() in _EXIT_STYLE_FIELDS
+
+
+def apply_exit_style(params: StrategyParams, style: str,
+                     trail_atr_mult: float = 0.0,
+                     partial_exit_fraction: float = -1.0,
+                     runner_rr_mult: float = -1.0) -> StrategyParams:
+    """Return `params` with one of EXIT_STYLES applied. Never mutates.
+
+    Only the exit knobs move. `atr_sl_mult`, `risk_reward`, `risk_per_trade`
+    and every sizing input are passed through untouched, so a style change can
+    never alter the entry, the initial stop/target, or the position size
+    (Immutable Rule #1).
+
+    The three numeric arguments are the sweep handles: -1.0 (and 0.0 for the
+    trail) means "leave whatever the style chose". They are applied AFTER the
+    style so a walk-forward can move one knob at a time.
+    """
+    style = (style or "strategy").strip().lower()
+    if style not in _EXIT_STYLE_FIELDS:
+        raise ValueError(
+            f"Unknown exit style {style!r}; use one of {', '.join(EXIT_STYLES)}.")
+    fields = dict(_EXIT_STYLE_FIELDS[style])
+    if trail_atr_mult and trail_atr_mult > 0:
+        fields["trail_atr_mult"] = float(trail_atr_mult)
+    if partial_exit_fraction is not None and partial_exit_fraction >= 0:
+        # 0.0 is a MEANINGFUL value here (no partial), hence the -1 sentinel.
+        if not 0.0 <= partial_exit_fraction < 1.0:
+            raise ValueError("partial_exit_fraction must be in [0, 1).")
+        fields["partial_exit_fraction"] = float(partial_exit_fraction)
+    if runner_rr_mult is not None and runner_rr_mult >= 0:
+        fields["runner_rr_mult"] = float(runner_rr_mult)
+    if not fields:
+        return params
+    return replace(params, **fields)
+
+
+# --------------------------------------------------------------------------- #
+#  INTRADAY, under each of the two profit-booking approaches.
+#
+#  Written out as constants rather than left implicit in EXIT_STYLES so the
+#  exact settings Intraday runs under each approach are readable in one place —
+#  and so a test can assert on them, which is what stops the styles drifting
+#  away from what was measured.
+#
+#  NOTHING HERE IS A DEFAULT. `params_for_mode(Mode.INTRADAY)` still returns
+#  INTRADAY_PARAMS, i.e. the plain fixed 1:1 exit, and these are reached only
+#  when a run or a mode explicitly selects the style by name. That is
+#  deliberate: which approach is right is an empirical question per book (see
+#  analysis/mfe_study.py), and the baseline is what they must beat NET of the
+#  costs the extra exit adds.
+#
+#  What is Intraday-specific about them:
+#    * The break-even buffer is in BPS, not ticks. Intraday trades equity
+#      across a 10x price range, where a tick count that is right for a Rs250
+#      share is off by 13x on a Rs3,200 one.
+#    * `runner_rr_mult = 0` — the trail alone exits the runner, with no hard
+#      second target. Measured on the MFE study, only ~30% of Intraday winners
+#      that reach 1R go on to 2R and ~6% to 3R, so a fixed 3R runner target is
+#      a level most runners will simply never reach; the trail books what the
+#      move actually gave.
+#    * The trail distance is `atr_sl_mult` (1.5xATR(14) on 15m bars) — the same
+#      multiple the entry stop was built from, so the trail starts out exactly
+#      as far from price as the risk the trade was sized against.
+# --------------------------------------------------------------------------- #
+
+#: Approach 1 — no partial; trail the WHOLE position from entry.
+INTRADAY_TRAIL_FULL_PARAMS = apply_exit_style(INTRADAY_PARAMS, "trail_full")
+
+#: Approach 2 — book half at the first target, trail the runner from
+#: break-even + friction.
+INTRADAY_PARTIAL_TRAIL_PARAMS = apply_exit_style(INTRADAY_PARAMS,
+                                                 "partial_trail")
+
+#: Approach 2b — book half at TP1, floor the runner's stop AT TP1, and hold it
+#: for TP2 (2R). The variant that refuses to give back the 1R it earned.
+INTRADAY_PARTIAL_LOCK_PARAMS = apply_exit_style(INTRADAY_PARAMS,
+                                                "partial_lock")
+
+#: Approach 2c — the same, but the runner sits on break-even + friction until
+#: it reaches the midpoint of TP1..TP2, and only then is promoted to TP1.
+INTRADAY_PARTIAL_LADDER_PARAMS = apply_exit_style(INTRADAY_PARAMS,
+                                                  "partial_ladder")
 
 
 def params_for_mode(mode: Mode) -> StrategyParams:

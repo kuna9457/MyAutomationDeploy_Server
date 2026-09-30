@@ -71,6 +71,29 @@ class ModeConfig:
     #: prints, or becomes an unfunded delivery. Turning this off means taking
     #: that on yourself.
     square_off_enabled: bool = True
+    #: How this mode manages a position AFTER its first target — one of
+    #: config.EXIT_STYLES. "strategy" (the default, and what every
+    #: pre-existing saved config reads as) leaves the chosen strategy's own
+    #: settings alone, so adding this field changes nothing until an admin
+    #: picks something else.
+    #:
+    #: Moves the TARGET and the STOP of an already-open position only. It
+    #: never touches entry selection or position size: quantity is fixed at
+    #: entry (Immutable Rule #1) and the trail only ever ratchets the stop
+    #: toward price, so risk per trade can shrink under this and never grow.
+    #: Backtest it first — backtester.run_backtest takes the same styles.
+    exit_style: str = "strategy"
+    #: Chandelier trail distance in ATR for this mode. 0.0 = the strategy's
+    #: own (its `trail_atr_mult`, else the `atr_sl_mult` the entry stop was
+    #: built from). Inert unless the style actually trails.
+    trail_atr_mult: float = 0.0
+    #: Bounds on the ATR stop distance, in PERCENT of price. 0 = unbounded,
+    #: which is what every config saved before these existed reads as. Unlike
+    #: exit_style these move the ENTRY stop and target, so they change which
+    #: trades resolve — backtest them first (POST /backtest/run takes the
+    #: identical fields).
+    max_stop_pct: float = 0.0
+    min_stop_pct: float = 0.0
 
 
 @dataclass

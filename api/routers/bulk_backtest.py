@@ -44,6 +44,18 @@ class FunnelRequest(BaseModel):
     #: On by default; an admin sweeping a very large symbol list can switch it
     #: off to save one simulation per (pair × rung).
     baseline_rr_sweep: bool = True
+    #: How an OPEN position is managed after its first target — one of
+    #: config.EXIT_STYLES, held FIXED across the whole funnel. "strategy" (the
+    #: default) is the plain fixed exit for any strategy that declares no
+    #: management, so a funnel left at the default screens a DIFFERENT bot from
+    #: the one the Backtesting tab reports, and its ranking is not transferable.
+    exit_style: str = "strategy"
+    trail_atr_mult: float = 0.0
+    partial_exit_fraction: float = -1.0
+    runner_rr_mult: float = -1.0
+    #: Bounds on the ATR stop, in PERCENT of price. 0 = the strategy's own.
+    max_stop_pct: float = 0.0
+    min_stop_pct: float = 0.0
 
     @field_validator("rr_ladder")
     @classmethod
@@ -97,6 +109,12 @@ def start(req: FunnelRequest):
         min_trades=req.min_trades,
         turnover_cap_pct=req.turnover_cap_pct,
         baseline_rr_sweep=req.baseline_rr_sweep,
+        exit_style=req.exit_style,
+        trail_atr_mult=req.trail_atr_mult,
+        partial_exit_fraction=req.partial_exit_fraction,
+        runner_rr_mult=req.runner_rr_mult,
+        max_stop_pct=req.max_stop_pct,
+        min_stop_pct=req.min_stop_pct,
     )
     try:
         return {"job_id": jobs.start(spec)}

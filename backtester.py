@@ -28,9 +28,13 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import alpaca_data
 import config
+import exit_manager
 from config import Mode, Segment, params_for_mode
-from strategy import enrich, position_size, resolve_strategy
+from cost_model import INTRADAY_EQUITY, MCX_COMMODITY, US_EQUITY
+from strategy import (clamp_signal_risk, enrich, position_size,
+                      resolve_strategy)
 
 
 TRADING_DAYS = 252
@@ -187,6 +191,8 @@ BARS_PER_YEAR = {"1d": TRADING_DAYS, "15m": TRADING_DAYS * 25,
 # by the size of the mismatch (3x too few periods/year for a 5m run) without
 # ever raising an error.
 EQUITY_SESSION_MINUTES = 6.25 * 60
+#: US regular session is 09:30-16:00 = 6.5h, slightly longer than NSE's 6.25h.
+US_SESSION_MINUTES = 6.5 * 60
 
 
 def _bars_per_year(interval: str) -> float:
@@ -227,6 +233,13 @@ def _yf_symbol(ticker: str) -> str:
     }
     if ticker in mapping:
         return mapping[ticker]
+    # A US ticker IS its Yahoo symbol — appending ".NS" (the old unconditional
+    # behaviour) asked Yahoo for a non-existent NSE listing and got nothing, so
+    # every US backtest silently fell through to synthetic data.
+    inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)
+    if inst is not None and inst.segment == Segment.US_EQUITY:
+        # Yahoo writes class shares with a dash (BRK-B), Alpaca with a dot.
+        return ticker.replace(".", "-")
     return ticker if ticker.endswith(".NS") else f"{ticker}.NS"
 
 
@@ -351,9 +364,48 @@ def fetch_history(
         _merge_into_superset(ticker, interval, df, source)
         return df, source
 
+    # 0c) ALPACA — the good path for US equities, and only for them. Tried
+    #     ahead of Upstox because an Upstox instrument_key is never valid for a
+    #     US ticker, and ahead of yfinance because Alpaca serves years of
+    #     intraday history where yfinance caps out at 60 days. Silently skipped
+    #     when unconfigured, so a US backtest still works on yfinance daily
+    #     bars with no credentials at all.
+    _inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)
+    if _inst is not None and _inst.segment == Segment.US_EQUITY:
+        if alpaca_data.is_configured():
+            df = alpaca_data.fetch_bars(ticker, start, end, interval)
+            if len(df) > 30:
+                print(f"[backtester] {ticker}: {len(df)} Alpaca bars "
+                      f"({alpaca_data.data_feed_name()} feed).")
+                _save_cached_history(ticker, interval, start, end, df, "alpaca")
+                _merge_into_superset(ticker, interval, df, "alpaca")
+                return df, "alpaca"
+            print(f"[backtester] {ticker}: Alpaca returned {len(df)} bars; "
+                  "falling back to yfinance.")
+        elif interval == "1d":
+            print(f"[backtester] {ticker}: ALPACA_API_KEY/SECRET not set — "
+                  "using yfinance daily bars (deep history, no key needed).")
+        else:
+            # The trap this guards: yfinance serves only ~60 days of intraday
+            # history, so an out-of-range US intraday request falls all the way
+            # through to the SYNTHETIC random walk and returns a full set of
+            # plausible-looking trades that mean nothing. The source is still
+            # reported as "synthetic" downstream, but by then you have already
+            # read the numbers.
+            # ASCII only: this goes to a console that may be cp1252 (Windows),
+            # where an emoji raises UnicodeEncodeError and kills the backtest.
+            print(f"[backtester] WARNING {ticker}: US INTRADAY without Alpaca keys. "
+                  f"yfinance serves only ~60 days at {interval}; anything older "
+                  "cannot be fetched and will fall back to SYNTHETIC data. "
+                  "Set ALPACA_API_KEY/ALPACA_API_SECRET for real intraday "
+                  "history, or use Swing (daily) which needs no key.")
+
     # 1) REAL Upstox historical data — the good path. Ticker-specific & real, so
-    #    every instrument gives genuinely different results.
-    if instrument_key and token:
+    #    every instrument gives genuinely different results. Skipped for US
+    #    symbols: an Upstox key is an "NSE_EQ|INE..." string, so passing "AAPL"
+    #    just earns a UDAPI1021 "invalid format" round trip before failing over.
+    _is_us = _inst is not None and _inst.segment == Segment.US_EQUITY
+    if instrument_key and token and not _is_us:
         try:
             df = _fetch_upstox_hist(instrument_key, start, end, interval, token)
             if len(df) > 30:
@@ -374,7 +426,24 @@ def fetch_history(
                          interval=interval, progress=False, auto_adjust=True,
                          timeout=20)
         if df is not None and not df.empty:
+            # yfinance >= 0.2.5x returns MultiIndex columns — ("Close", "AAPL")
+            # — even for a single ticker. Left alone, the rename+select below
+            # yields a frame whose "close" is itself a one-column FRAME, and
+            # the first strategy call dies on "truth value of a Series is
+            # ambiguous". Flatten to the field name first.
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
+            # An intraday yfinance frame is tz-aware UTC while a daily one is
+            # naive. Everything downstream assumes naive exchange-local time,
+            # so convert rather than carry a mixed convention.
+            idx = pd.to_datetime(df.index)
+            if getattr(idx, "tz", None) is not None:
+                tzname = ("America/New_York"
+                          if _inst is not None
+                          and _inst.segment == Segment.US_EQUITY else "Asia/Kolkata")
+                idx = idx.tz_convert(tzname).tz_localize(None)
+            df.index = idx
             df.index = pd.to_datetime(df.index)
             df = df.dropna()
             _save_cached_history(ticker, interval, start, end, df, "yfinance")
@@ -513,6 +582,24 @@ def parse_filters(days=None, hours=None, side: str = "BOTH"
 # --------------------------------------------------------------------------- #
 #  Core simulation
 # --------------------------------------------------------------------------- #
+def interval_for(mode: Mode, timeframe_minutes: int = 0) -> str:
+    """The bar size a run uses. ONE definition, shared.
+
+    timeframe_minutes ONLY overrides Intraday's bar size (0 = its default, 15).
+    Swing (daily, by design) and Scalper (native 1m, by design) are not this
+    knob's business — an override passed under either mode is silently ignored
+    rather than raising, matching how risk_reward=0 / min_score=0 already mean
+    "don't override" everywhere else here.
+
+    Public because api/routers/backtest.py's chart endpoint has to fetch the
+    SAME candles the simulation walked: a chart drawn on 15m bars for a run
+    that happened on 5m ones would put every marker on the wrong candle.
+    """
+    if mode == Mode.INTRADAY and timeframe_minutes and timeframe_minutes > 0:
+        return f"{int(timeframe_minutes)}m"
+    return {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
+
+
 def run_backtest(
     ticker: str,
     start: str,
@@ -527,7 +614,62 @@ def run_backtest(
     patterns: Optional[list[str]] = None,
     ignore_saved_patterns: bool = False,
     timeframe_minutes: int = 0,
+    include_costs: bool = False,
+    max_stop_pct: float = 0.0,
+    min_stop_pct: float = 0.0,
+    exit_style: str = "strategy",
+    trail_atr_mult: float = 0.0,
+    partial_exit_fraction: float = -1.0,
+    runner_rr_mult: float = -1.0,
+    hold_overnight: bool = False,
+    ignore_entry_cutoff: bool = False,
 ) -> BacktestResult:
+    """Simulate one strategy over one instrument.
+
+    `hold_overnight` — LET INTRADAY POSITIONS LIVE PAST THE SESSION.
+
+    Off by default, so every existing caller measures exactly what it measured
+    before. With it on, the end-of-session flat-out is removed and a position
+    closes on ONE of its own rules: stop, target, trail, or the strategy's own
+    max_hold_minutes.
+
+    `ignore_entry_cutoff` — DROP THE LATE-ENTRY GATE (params.
+    entry_cutoff_before_close, 11:59 for Candlestick Intraday). A separate flag
+    from hold_overnight on purpose: it changes how many trades are TAKEN, where
+    hold_overnight changes how they are CLOSED. Setting both at once moves two
+    variables and the result cannot be attributed to either.
+
+    THIS IS A DIFFERENT BOT, NOT A LOOSER BACKTEST. Three consequences follow,
+    and reading the result without them will mislead:
+
+      1. IT IS NO LONGER INTRADAY. A position held past 15:30 in the NSE cash
+         segment is DELIVERY. That means full cash funding (equity is already
+         pinned to 1x by config.SEGMENT_MAX_LEVERAGE, so sizing does not
+         change) and it means SHORTS ARE NOT POSSIBLE — you cannot take
+         delivery of a short. Candlestick Intraday sets allow_short=True, so a
+         run with this flag on will contain short trades that the cash segment
+         could not have held overnight. Judge the long side separately, or
+         re-run with a long-only params set, before believing the total.
+
+      2. COSTS ARE STILL PRICED AS INTRADAY. bulk_backtester picks
+         cost_model.INTRADAY_EQUITY for every non-MCX symbol and never looks at
+         the mode. Delivery pays STT of 0.1% on BOTH legs against intraday's
+         0.025% sell-only, plus 0.015% stamp against 0.003% — roughly 28 bps of
+         notional against 10. A net figure from this flag is therefore
+         OPTIMISTIC by that difference. Pass an explicit delivery CostModel to
+         bulk_backtester.run_with_costs to price it honestly.
+
+      3. GAPS FILL AT THE STOP. exit_manager.step_bar hands back price=st.stop
+         on a stop hit, never the bar's open. Within a session that is
+         accurate (15m bars do not gap); across sessions it is not, and every
+         overnight gap through the stop is credited a fill the market never
+         offered. This biases the result in the flattering direction and the
+         bias grows with holding period.
+
+    None of the above is a reason not to run it — the question "does this
+    signal have edge when it is given room?" is worth a real answer. They are
+    the reasons the answer is a starting point rather than a P&L forecast.
+    """
     # Same resolution the engine uses, so a backtest measures exactly the
     # strategy the bot would trade — parameters included. That has to include
     # the RR override (engine.TradingEngine applies the identical replace), or
@@ -555,20 +697,33 @@ def run_backtest(
     # whatever was already allowed on the dashboard.
     elif ignore_saved_patterns:
         params = replace(params, ignore_pattern_filter=True)
+    # ...and the EXIT STYLE, for the same reason as all of the above: what
+    # happens after the first target is part of the strategy, and it is the
+    # one part that could not be measured at all until exit_manager existed.
+    # "strategy" (the default) changes nothing, so every existing caller keeps
+    # the result it had. The other styles let one run be compared against
+    # another with a single variable moved:
+    #     "fixed"         — the baseline: fixed ATR stop/target, no management
+    #     "trail_full"    — Approach 1: trail the whole position from entry
+    #     "partial_trail" — Approach 2: book part at 1R, trail the runner
+    # None of them touch the entry, the initial stop/target or the sizing.
+    params = config.apply_exit_style(
+        params, exit_style, trail_atr_mult=trail_atr_mult,
+        partial_exit_fraction=partial_exit_fraction,
+        runner_rr_mult=runner_rr_mult)
+    # ...and the stop-distance band, for the same reason as everything above:
+    # it decides WHERE the stop and target sit, so a run at a different band
+    # is measuring a different strategy. 0 leaves the ATR stop entirely alone.
+    if max_stop_pct and max_stop_pct > 0:
+        params = replace(params, max_stop_pct=float(max_stop_pct))
+    if min_stop_pct and min_stop_pct > 0:
+        params = replace(params, min_stop_pct=float(min_stop_pct))
     # NOTE: this local `params` is what actually reaches the strategy — both
     # enrich() and sd.fn() below are called with it explicitly rather than
     # through run_strategy(), so the overrides take effect without rebinding
     # `sd`. (The live engine DOES rebind, because its runner goes through
     # run_strategy(sd, ...) and would otherwise read the strategy's own.)
-    # timeframe_minutes ONLY overrides Intraday's bar size (0 = its default,
-    # 15). Swing (daily bars, by design) and Scalper (native 1m, by design)
-    # are not this knob's business — an override passed under either mode is
-    # silently ignored rather than raising, matching how risk_reward=0 /
-    # min_score=0 already mean "don't override" everywhere else here.
-    if mode == Mode.INTRADAY and timeframe_minutes and timeframe_minutes > 0:
-        interval = f"{int(timeframe_minutes)}m"
-    else:
-        interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
+    interval = interval_for(mode, timeframe_minutes)
     # Resolve the Upstox instrument key + live token so we backtest on REAL data.
     inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)
     instrument_key = inst.instrument_key if inst else ""
@@ -585,6 +740,30 @@ def run_backtest(
     # overnight by design) and when the instrument is unknown.
     square_off_cutoff = (config.square_off_time_for(inst.segment, mode)
                          if inst else None)
+    # ...UNLESS this run is explicitly asking the other question: what would
+    # this signal have earned if the position were simply left alone until its
+    # stop, its target or its trail closed it? See the hold_overnight docstring
+    # above for what that measures and what it does NOT.
+    if hold_overnight:
+        square_off_cutoff = None
+    # Latest bar on which a NEW position may open. None for every strategy
+    # that sets no cutoff, which is all of them bar Candlestick Intraday and
+    # CRUDEOIL — so this is inert unless asked for. Enforced HERE as well as
+    # in the live runner because a cutoff that only one of them honours would
+    # make the backtest describe a bot that does not exist.
+    #
+    # A SEPARATE KNOB FROM hold_overnight, deliberately, even though the two
+    # are related: config.entry_cutoff_for derives the cutoff from the flat-out
+    # ("a trade opened near the close has no runway"), so removing the flat-out
+    # does weaken its justification. But the cutoff was measured to be worth
+    # +0.96pp on its own and it halves the position count, and this book's
+    # dominant failure mode is turnover — so whether it still pays once
+    # positions can run is an EMPIRICAL question, not a corollary.
+    #
+    # Tying the two together would move two variables per run and make that
+    # question unanswerable. They are independent flags so the 2x2 can be read.
+    entry_cutoff = (config.entry_cutoff_for(inst.segment, mode, params)
+                    if inst and not ignore_entry_cutoff else None)
     # Same notional cap the live engine applies, so backtest quantities are ones
     # the account could actually have funded.
     max_leverage = (config.max_leverage_for(inst.segment, params) if inst
@@ -606,6 +785,44 @@ def run_backtest(
     # CRUDEOIL lot's ~₹7.5L notional busts the leverage/capital caps) and the
     # backtest silently takes NO trades — the "no result" bug for MCX symbols.
     is_mcx = inst is not None and inst.segment == Segment.MCX
+    # COSTS (include_costs=True). OFF by default so every existing caller keeps
+    # the byte-identical gross result it had before this existed — bulk_backtester
+    # and advanced_backtest both deduct their OWN costs from the gross `pnl`
+    # column below, and switching this on by default would double-charge them.
+    # `pnl` therefore STAYS GROSS whatever this flag says; costs are carried in
+    # the separate `cost` / `net_pnl` columns, and only the CAPITAL the
+    # simulation compounds (and so the equity curve and every metric derived
+    # from it) is reduced by them.
+    is_us = inst is not None and inst.segment == Segment.US_EQUITY
+    if not include_costs:
+        cost_model = None
+    elif is_mcx:
+        cost_model = MCX_COMMODITY
+    elif is_us:
+        # USD, and a completely different fee structure — no STT, no stamp, no
+        # GST. Figures from a US run are therefore in DOLLARS; do not add them
+        # to a rupee book (config.SEGMENT_CURRENCY).
+        cost_model = US_EQUITY
+    else:
+        cost_model = INTRADAY_EQUITY
+    # The SAME exit state-machine the live engine runs (engine._manage_open).
+    # Everything after the first target — the partial, the break-even move,
+    # the runner target, the ATR chandelier — is decided by exit_manager here
+    # too, which is the whole point: before this, the backtest exited on the
+    # fixed entry stop/target only, so no trailing or scaling result it
+    # produced described the bot that would actually trade.
+    #
+    # Inert at the defaults. With partial_exit_fraction=0, trail_remainder=
+    # False and trail_from_entry=False, step_bar exits on exactly the stop /
+    # target the old inline check used, so an unconfigured strategy's
+    # backtest is unchanged.
+    #
+    # Built by the SAME function engine._exit_params calls, so the two cannot
+    # drift apart. The only argument the engine passes and this does not is
+    # the per-symbol trail override: that is a LIVE admin control, and a
+    # backtest measures the strategy rather than one admin's symbol settings.
+    exit_params = exit_manager.params_from_strategy(
+        params, (inst.tick_size if inst else 0.05), contract_multiplier)
     mcx_lots_per_trade = 1                       # same default as the live engine
     mcx_margin_per_lot = config.mcx_margin_per_lot(ticker) if is_mcx else 0.0
     token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
@@ -625,12 +842,86 @@ def run_backtest(
     def signal_fn(w):
         # `w` is already enriched, so call the strategy fn directly — going via
         # run_strategy would re-enrich a growing window every bar (O(n^2)).
-        return sd.fn(w, params, session_open)
+        # The stop-distance clamp still has to run, and through the SAME
+        # function run_strategy uses, or a capped stop would be a live-only
+        # behaviour the backtest never modelled.
+        return clamp_signal_risk(sd.fn(w, params, session_open), params)
 
     capital = initial_capital
     equity = []
     trades = []
-    position = None  # dict: side, entry, stop, target, qty
+    position = None  # dict: side, entry, stop, target, qty, exit_state
+
+    def _leg(pos: dict, qty: int, exit_price: float, exit_reason: str,
+             ts) -> float:
+        """Book ONE exit leg — a partial or the final close — as its own trade
+        row, and return the change in capital.
+
+        A trade with a scale-out produces TWO rows sharing an entry, exactly
+        as the live engine writes a child trade document for the partial. Both
+        carry `position_id` so the legs of one trade can be re-grouped, and
+        `leg` numbers them; summing `qty` over a position_id returns the entry
+        quantity, which is the quantity-conservation check.
+
+        COSTS: each leg pays a FULL round trip on its own quantity. That is
+        deliberately a shade conservative — a two-leg trade is really three
+        orders (one entry, two exits), not four, so a flat per-order brokerage
+        is over-charged once. Being wrong in the direction that makes scaling
+        out look WORSE is the correct way to be wrong here: the point of
+        testing the partial at all is that its extra exit is a real cost, and
+        an optimistic model would be the one thing that could make a bad
+        scale-out look good.
+        """
+        nonlocal trades
+        qty = int(qty)
+        if qty <= 0:
+            return 0.0
+        direction = 1 if pos["side"] == "BUY" else -1
+        pnl = ((exit_price - pos["entry"]) * qty * direction
+               * contract_multiplier)
+        cost = (cost_model.round_trip_cost(pos["entry"], exit_price, qty,
+                                           contract_multiplier)
+                if cost_model is not None else 0.0)
+        pos["leg"] = pos.get("leg", 0) + 1
+        if pos["leg"] > 1 and cost_model is not None:
+            # A scaled-out position is ONE entry and TWO exits — three orders,
+            # not four. Every turnover-based head already sums correctly across
+            # the legs; only the flat per-order brokerage (and its GST) would
+            # be counted twice, so it comes off here. See
+            # CostModel.duplicate_entry_charge.
+            cost = max(cost - cost_model.duplicate_entry_charge(), 0.0)
+        row = {
+            "entry_time": pos["time"], "exit_time": ts,
+            "side": pos["side"],
+            "entry": pos["entry"], "exit": exit_price,
+            "qty": qty, "pnl": pnl,
+            # `win` follows the money that reached the account, so a
+            # cost-aware run cannot report a win rate the P&L denies.
+            "rr": params.risk_reward, "win": (pnl - cost) > 0,
+            # WHY the trade was taken and WHY it closed — mirrors the live
+            # log so a backtest row explains itself, not just its numbers.
+            "entry_reason": pos["reason"], "exit_reason": exit_reason,
+            # Which trade this leg belongs to, and its order within it. A
+            # single-leg trade (every strategy that does not scale out) is
+            # position_id=n, leg=1 — additive columns, nothing else reads them.
+            "position_id": pos["id"], "leg": pos["leg"],
+            # |entry - initial stop|, i.e. 1R for this trade. Written out
+            # rather than left to be reconstructed from entry/exit/rr, which
+            # only works for rows that exited exactly on the stop or the
+            # target — a trailed or squared-off row cannot be reversed, and
+            # the MFE study (analysis/mfe_study.py) needs 1R for every trade.
+            "risk_dist": round(pos["exit_state"].risk_dist, 4),
+        }
+        # Present ONLY on a cost-aware run — their absence is what tells
+        # _metrics (and any caller) that `pnl` is the whole story.
+        if cost_model is not None:
+            row["cost"] = round(cost, 2)
+            row["net_pnl"] = pnl - cost
+        trades.append(row)
+        # Deduct from the COMPOUNDING capital, not from `pnl`: a cost paid on
+        # trade n really does shrink the account that sizes trade n+1, which
+        # post-hoc subtraction cannot reproduce.
+        return pnl - cost
     # Bar index of the last entry/exit. The live engine refuses to re-trade a bar
     # it has already acted on (reentry_cooldown_bars); the backtest must model the
     # same guard or it measures a bot that doesn't exist.
@@ -683,20 +974,38 @@ def run_backtest(
 
         # manage an open position first
         if position is not None:
-            is_long = position["side"] == "BUY"
-            # Direction-aware: a short is stopped out by a HIGH above its stop and
-            # targeted by a LOW below its target — the mirror of a long.
-            if is_long:
-                hit_sl = bar["low"] <= position["stop"]
-                hit_tp = bar["high"] >= position["target"]
-            else:
-                hit_sl = bar["high"] >= position["stop"]
-                hit_tp = bar["low"] <= position["target"]
+            st = position["exit_state"]
+            # ATR from the PREVIOUS bar, never this one. Live, the trail reads
+            # an ATR computed off completed candles while it manages the price
+            # inside the forming bar (strategy_runner._trail_atr); reading
+            # bar i's own ATR here would let the trail see the very high/low
+            # it is about to be measured against — look-ahead, and the exact
+            # kind that flatters a trailing system.
+            prev_atr = float(data["atr"].iloc[i - 1]) if i > 0 else 0.0
+            if not np.isfinite(prev_atr) or prev_atr <= 0:
+                prev_atr = 0.0
             exit_price, exit_reason = None, ""
-            if hit_sl:
-                exit_price, exit_reason = position["stop"], "STOP-LOSS"  # worst case when both hit
-            elif hit_tp:
-                exit_price, exit_reason = position["target"], "TARGET"
+            # ONE decision function, shared with the live engine. step_bar
+            # assumes the ADVERSE intrabar path (the stop is tested at the
+            # bar's worst price before any favourable move is credited), so
+            # OHLC's hidden path cannot flatter a trail or a scale-out.
+            for act in exit_manager.step_bar(
+                    st, float(bar["open"]), float(bar["high"]),
+                    float(bar["low"]), float(bar["close"]),
+                    prev_atr, exit_params):
+                if act.kind == exit_manager.ActionType.PARTIAL:
+                    # A partial is a REAL exit leg with its OWN row, mirroring
+                    # the child trade document the live engine writes, so
+                    # `quantity` reads correctly everywhere and the leg is
+                    # charged its own costs (see _leg below).
+                    capital += _leg(position, act.qty, float(act.price),
+                                    act.reason or "PARTIAL-TARGET", bar.name)
+                    position["qty"] -= int(act.qty)
+                elif act.kind == exit_manager.ActionType.MOVE_STOP:
+                    position["stop"] = float(act.new_stop)
+                    position["target"] = float(st.target)
+                else:
+                    exit_price, exit_reason = float(act.price), act.reason
             # Time exit (Scalper): bars_held is exact because bars are fixed-width.
             if exit_price is None and params.max_hold_minutes > 0:
                 held_bars = i - position["bar"]
@@ -711,20 +1020,8 @@ def run_backtest(
                 exit_price = float(bar["close"])
                 exit_reason = f"SQUARE-OFF ({square_off_cutoff.strftime('%H:%M')})"
             if exit_price is not None:
-                direction = 1 if is_long else -1
-                pnl = ((exit_price - position["entry"]) * position["qty"]
-                       * direction * contract_multiplier)
-                capital += pnl
-                trades.append({
-                    "entry_time": position["time"], "exit_time": bar.name,
-                    "side": position["side"],
-                    "entry": position["entry"], "exit": exit_price,
-                    "qty": position["qty"], "pnl": pnl,
-                    "rr": params.risk_reward, "win": pnl > 0,
-                    # WHY the trade was taken and WHY it closed — mirrors the live
-                    # log so a backtest row explains itself, not just its numbers.
-                    "entry_reason": position["reason"], "exit_reason": exit_reason,
-                })
+                capital += _leg(position, position["qty"], exit_price,
+                                exit_reason, bar.name)
                 position = None
                 last_action_i = i
 
@@ -740,7 +1037,9 @@ def run_backtest(
         # `not past_cutoff` mirrors the live runner: past the square-off time
         # nothing new may be opened, whatever the setup looks like.
         bar_allowed = ((filters is None or filters.allows_bar(bar.name))
-                       and not past_cutoff)
+                       and not past_cutoff
+                       and (entry_cutoff is None
+                            or bar.name.time() < entry_cutoff))
         if position is None and not cooling and bar_allowed:
             sig = signal_fn(window)
             if sig is not None and filters is not None \
@@ -772,6 +1071,17 @@ def run_backtest(
                         "entry": sig.entry_price, "stop": sig.stop_loss,
                         "target": sig.target, "qty": qty, "time": bar.name,
                         "bar": i, "reason": sig.reason,
+                        "id": len(trades) + 1, "leg": 0,
+                        # Seeded from the SIGNAL's own levels, so risk_dist is
+                        # the distance the position was sized against and the
+                        # runner target the exit manager derives from it is
+                        # the same one the live engine would derive.
+                        "exit_state": exit_manager.ExitState(
+                            side=sig.side, entry=float(sig.entry_price),
+                            qty=int(qty), stop=float(sig.stop_loss),
+                            target=float(sig.target),
+                            risk_dist=abs(float(sig.entry_price)
+                                          - float(sig.stop_loss))),
                     }
                     last_action_i = i
 
@@ -1003,6 +1313,22 @@ def run_rr_sweep(
     min_score: float = 0.0,
     patterns: Optional[list[str]] = None,
     timeframe_minutes: int = 0,
+    exit_style: str = "strategy",
+    trail_atr_mult: float = 0.0,
+    partial_exit_fraction: float = -1.0,
+    runner_rr_mult: float = -1.0,
+    max_stop_pct: float = 0.0,
+    min_stop_pct: float = 0.0,
+    #: Remove the end-of-session flat-out so positions run to their own
+    #: stop/target/trail across sessions. Forwarded verbatim to run_backtest,
+    #: where the caveats are documented. False = unchanged behaviour.
+    hold_overnight: bool = False,
+    ignore_entry_cutoff: bool = False,
+    #: Deduct costs from the compounding capital, exactly as run_backtest
+    #: does. FALSE by default so no existing caller silently flips from gross
+    #: to net; the API routes pass True, which is what makes a bulk ranking
+    #: comparable with the single-symbol tab beside it.
+    include_costs: bool = False,
 ) -> list[dict]:
     """Run the same backtest once per RR and return one summary row each.
 
@@ -1034,7 +1360,16 @@ def run_rr_sweep(
                                strategy_key=strategy_key,
                                risk_reward=rr, min_score=min_score,
                                patterns=patterns,
-                               timeframe_minutes=timeframe_minutes)
+                               timeframe_minutes=timeframe_minutes,
+                               exit_style=exit_style,
+                               trail_atr_mult=trail_atr_mult,
+                               partial_exit_fraction=partial_exit_fraction,
+                               runner_rr_mult=runner_rr_mult,
+                               max_stop_pct=max_stop_pct,
+                               min_stop_pct=min_stop_pct,
+                               hold_overnight=hold_overnight,
+                               ignore_entry_cutoff=ignore_entry_cutoff,
+                               include_costs=include_costs)
             m = res.metrics
             rows.append({
                 "risk_reward": rr,
@@ -1073,6 +1408,22 @@ def run_bulk_backtest(
     filters: Optional["TradeFilters"] = None,
     patterns: Optional[list[str]] = None,
     timeframe_minutes: int = 0,
+    exit_style: str = "strategy",
+    trail_atr_mult: float = 0.0,
+    partial_exit_fraction: float = -1.0,
+    runner_rr_mult: float = -1.0,
+    max_stop_pct: float = 0.0,
+    min_stop_pct: float = 0.0,
+    #: Remove the end-of-session flat-out so positions run to their own
+    #: stop/target/trail across sessions. Forwarded verbatim to run_backtest,
+    #: where the caveats are documented. False = unchanged behaviour.
+    hold_overnight: bool = False,
+    ignore_entry_cutoff: bool = False,
+    #: Deduct costs from the compounding capital, exactly as run_backtest
+    #: does. FALSE by default so no existing caller silently flips from gross
+    #: to net; the API routes pass True, which is what makes a bulk ranking
+    #: comparable with the single-symbol tab beside it.
+    include_costs: bool = False,
 ) -> dict[str, BacktestResult]:
     """Run the SAME strategy with the SAME parameters over every ticker in the
     bucket and return {ticker: BacktestResult}. Each instrument is simulated
@@ -1105,7 +1456,14 @@ def run_bulk_backtest(
                 lot_size=lot_size, strategy_key=strategy_key,
                 risk_reward=risk_reward, min_score=min_score,
                 filters=filters, patterns=patterns,
-                timeframe_minutes=timeframe_minutes)
+                timeframe_minutes=timeframe_minutes,
+                exit_style=exit_style, trail_atr_mult=trail_atr_mult,
+                partial_exit_fraction=partial_exit_fraction,
+                runner_rr_mult=runner_rr_mult,
+                max_stop_pct=max_stop_pct, min_stop_pct=min_stop_pct,
+                hold_overnight=hold_overnight,
+                ignore_entry_cutoff=ignore_entry_cutoff,
+                include_costs=include_costs)
         except Exception as exc:
             # One bad symbol must not sink the whole bucket — record an empty
             # result so the UI can show it failed rather than aborting the run.
@@ -1188,7 +1546,7 @@ def _metrics(equity: pd.Series, trades: pd.DataFrame,
 
     win_rate = (100 * trades["win"].mean()) if not trades.empty else 0.0
 
-    return {
+    out = {
         "Total Return %": round(total_return, 2),
         "Max Drawdown %": round(max_dd, 2),
         "Sharpe": round(float(sharpe), 2),
@@ -1198,3 +1556,31 @@ def _metrics(equity: pd.Series, trades: pd.DataFrame,
         "Final Equity": round(float(equity.iloc[-1]), 2),
         "Data Source": source,
     }
+    # Cost-aware run (run_backtest(include_costs=True)). Everything above is
+    # already NET, because costs were taken out of the compounding capital the
+    # equity curve is built from. What is added here is the gross counterpart,
+    # so the two are readable side by side and the size of the drag is explicit
+    # rather than inferred.
+    if not trades.empty and "cost" in trades.columns:
+        total_cost = float(trades["cost"].sum())
+        gross_pnl = float(trades["pnl"].sum())
+        n = len(trades)
+        out["Costs Applied"] = True
+        out["Total Costs"] = round(total_cost, 2)
+        out["Cost per Trade"] = round(total_cost / n, 2) if n else 0.0
+        out["Gross P&L"] = round(gross_pnl, 2)
+        out["Gross Return %"] = round(100.0 * gross_pnl / initial_capital, 2)
+        out["Gross Win Rate %"] = round(100.0 * float((trades["pnl"] > 0).mean()), 2)
+    else:
+        out["Costs Applied"] = False
+    # A scaled-out trade closes in TWO legs and therefore writes TWO rows (the
+    # live engine writes two documents for the same reason), so "Total Trades"
+    # above counts EXIT LEGS. That is the right denominator for cost-per-trade
+    # and for win rate — a partial really is a separately-won or separately-
+    # lost booking — but it is not the number of positions the strategy took,
+    # so both are reported. They are equal for every strategy that does not
+    # scale out, which is all of them at their defaults.
+    if not trades.empty and "position_id" in trades.columns:
+        out["Total Positions"] = int(trades["position_id"].nunique())
+        out["Exit Legs"] = int(len(trades))
+    return out

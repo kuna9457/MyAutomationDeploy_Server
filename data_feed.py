@@ -722,6 +722,162 @@ class UpstoxRestFeed(MarketDataFeed):
 
 
 # --------------------------------------------------------------------------- #
+#  Alpaca — US equities (REST poll).
+#
+#  WHY REST AND NOT A SOCKET. Alpaca does stream, but a socket would add a
+#  dependency and, more importantly, would recreate a bug this project already
+#  has: UpstoxWebSocketFeed appends a still-FORMING bar to get_candles(), so the
+#  live bot signals mid-candle while the backtester signals on closed bars —
+#  measured at 171 live trades against 115 backtested ones on the same data.
+#
+#  This feed serves COMPLETED BARS ONLY. The runner therefore acts once per
+#  closed bar, which is exactly what the backtester simulates, so the US path
+#  starts life with backtest/live parity instead of having to be fixed into it
+#  later. Live PRICE still comes from a real quote (get_quote below), so open
+#  positions are marked against the tape, not against a stale bar close.
+#
+#  Bars and quotes are both naive America/New_York, matching alpaca_data and
+#  config.now_for_segment(US_EQUITY).
+# --------------------------------------------------------------------------- #
+class AlpacaRestFeed(MarketDataFeed):
+    def __init__(self, mode: Mode, refresh_seconds: float = 0.0,
+                 history_days: int = 0):
+        self.mode = mode
+        # Quotes are polled every cycle; BARS only every _bar_refresh seconds,
+        # because a 15-minute bar cannot change more often than that and the
+        # bars endpoint is the expensive one.
+        default_refresh = {Mode.SWING: 60.0, Mode.INTRADAY: 5.0, Mode.SCALPER: 2.0}
+        default_bars = {Mode.SWING: 900.0, Mode.INTRADAY: 60.0, Mode.SCALPER: 20.0}
+        default_days = {Mode.SWING: 1100, Mode.INTRADAY: 10, Mode.SCALPER: 3}
+        self.refresh_seconds = refresh_seconds or default_refresh.get(mode, 5.0)
+        self.bar_refresh_seconds = default_bars.get(mode, 60.0)
+        self.history_days = history_days or default_days.get(mode, 10)
+        self._interval = {1: "1m", 15: "15m"}.get(TF_MINUTES.get(mode, 15), "1d")
+        self._data: dict[str, pd.DataFrame] = {}
+        self._quotes: dict[str, LiveQuote] = {}
+        self._instruments: list[Instrument] = []
+        self._missing: list[tuple[str, str]] = []
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._running = False
+        self._last_bars = 0.0
+
+    # -- history ------------------------------------------------------------ #
+    def _window(self) -> tuple[str, str]:
+        """Date range to request, in the EXCHANGE's own calendar. Padded by a
+        few days so a long weekend or a market holiday cannot leave the window
+        empty and strand the strategy with no bars."""
+        import alpaca_data
+        end = datetime.now(alpaca_data.US_TZ).replace(tzinfo=None)
+        start = end - timedelta(days=self.history_days + 5)
+        return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+    def _refresh_bars(self) -> int:
+        import alpaca_data
+        start, end = self._window()
+        ok = 0
+        for inst in self._instruments:
+            if not self._running and ok:
+                break
+            try:
+                df = alpaca_data.fetch_bars(inst.symbol, start, end, self._interval)
+                if not df.empty:
+                    with self._lock:
+                        self._data[inst.symbol] = df
+                    ok += 1
+            except Exception as exc:
+                print(f"[AlpacaRestFeed] {inst.symbol} bars failed: {exc}")
+        self._last_bars = _time.monotonic()
+        return ok
+
+    def _refresh_quotes(self) -> None:
+        import alpaca_data
+        syms = [i.symbol for i in self._instruments]
+        data = alpaca_data.fetch_latest_quotes(syms)
+        if not data:
+            return
+        now = _time.monotonic()
+        with self._lock:
+            for sym, q in data.items():
+                px = float(q.get("last") or 0.0)
+                if px <= 0:
+                    continue
+                self._quotes[sym] = LiveQuote(
+                    ltp=px, ts=q.get("ts") or datetime.now(),
+                    received_at=now, bid=float(q.get("bid") or 0.0),
+                    ask=float(q.get("ask") or 0.0), source="rest")
+
+    # -- lifecycle ---------------------------------------------------------- #
+    def start(self, instruments: list[Instrument]) -> None:
+        import alpaca_data
+        if not alpaca_data.is_configured():
+            raise RuntimeError(
+                "AlpacaRestFeed: ALPACA_API_KEY / ALPACA_API_SECRET are not set")
+        self._instruments = [i for i in instruments
+                             if i.segment == Segment.US_EQUITY]
+        if not self._instruments:
+            raise RuntimeError("AlpacaRestFeed: no US_EQUITY instruments")
+
+        ok = self._refresh_bars()
+        with self._lock:
+            self._missing = [(i.symbol, "no bars returned by Alpaca")
+                             for i in self._instruments
+                             if i.symbol not in self._data]
+        if ok == 0:
+            # Same contract as the Upstox feeds: raising lets the caller fall
+            # back to simulation rather than run blind on empty candles.
+            raise RuntimeError("AlpacaRestFeed: no instruments returned data")
+        self._refresh_quotes()
+
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                self._refresh_quotes()
+                if _time.monotonic() - self._last_bars >= self.bar_refresh_seconds:
+                    self._refresh_bars()
+            except Exception:
+                pass          # a transient HTTP error must not kill the feed
+            _time.sleep(self.refresh_seconds)
+
+    def stop(self) -> None:
+        self._running = False
+
+    # -- consumption -------------------------------------------------------- #
+    def get_candles(self, instrument: Instrument, lookback: int = 250) -> pd.DataFrame:
+        with self._lock:
+            df = self._data.get(instrument.symbol)
+            return (df.tail(lookback).copy() if df is not None
+                    else pd.DataFrame(columns=CANDLE_COLUMNS))
+
+    def get_quote(self, instrument: Instrument) -> Optional[LiveQuote]:
+        with self._lock:
+            return self._quotes.get(instrument.symbol)
+
+    def data_problems(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return list(self._missing)
+
+    def status(self) -> str:
+        if not self._running:
+            return "🔴 Disconnected"
+        import alpaca_data
+        # The IST window is appended because the operator is in India: a status
+        # line saying only "connected" leaves them working out for themselves
+        # whether 15:45 New York has already happened tonight.
+        try:
+            from config import Segment, session_summary_ist
+            when = session_summary_ist(Segment.US_EQUITY, self.mode)
+        except Exception:
+            when = ""
+        return (f"🟢 Alpaca US ({alpaca_data.data_feed_name()} feed, REST poll "
+                f"— completed bars only)" + (f" · {when}" if when else ""))
+
+
+# --------------------------------------------------------------------------- #
 #  Factory
 # --------------------------------------------------------------------------- #
 def make_feed(prefer_real: bool, access_token: str = "",
