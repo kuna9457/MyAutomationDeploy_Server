@@ -1,6 +1,9 @@
 # Core runtime. The UI is the React app in frontend/ — this process serves the
 # API only, so no Streamlit/plotly here (removed; charting is Recharts client-side).
-pandas>=2.0
+# Capped below 3: pandas 3 changes default semantics (copy-on-write, string
+# dtype) and every backtest/strategy number here was produced and tested on 2.x.
+# A fresh server otherwise pulls 3.x and trades on untested behaviour.
+pandas>=2.0,<3
 numpy>=1.24
 pymongo>=4.5
 openpyxl>=3.1          # Excel export in db_manager.export_*
