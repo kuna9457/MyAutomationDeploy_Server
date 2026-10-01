@@ -226,6 +226,57 @@ def test_client_modes_on_a_node_offer_the_running_broadcast(worker, monkeypatch)
 
 
 # --------------------------------------------------------------------------- #
+#  The REAL start path — nothing stubbed between the session and the engine
+# --------------------------------------------------------------------------- #
+def test_a_session_really_starts_the_assigned_client_through_the_real_path(
+        worker, monkeypatch):
+    """The unit tests above replace _start_assigned, which is exactly how a
+    live-only bug got through: _on_session marked the session active AFTER
+    starting the client, so _start_one_client read 'no run' and refused with
+    'no client mode configured'. This drives the real chain end to end and
+    stops only at the broker/engine boundary."""
+    import risk_manager
+    import user_manager
+    from api import engine_registry
+    from api.routers import bot
+
+    built = []
+
+    class FakeEngine:
+        def __init__(self, environment, mode, broker_choice, instruments, capital,
+                     **kw):
+            built.append({"env": environment, "mode": mode, "capital": capital,
+                          "symbols": [i.symbol for i in instruments], **kw})
+            self.state = type("S", (), {"running": False})()
+
+        def start(self):
+            self.state.running = True
+
+    monkeypatch.setattr(bot, "TradingEngine", FakeEngine)
+    monkeypatch.setattr(engine_registry, "get_engine", lambda u: None)
+    monkeypatch.setattr(engine_registry, "set_engine", lambda u, e: None)
+    monkeypatch.setattr(risk_manager, "get_limits",
+                        lambda u: type("L", (), {"capital_allocated": 0.0})())
+    monkeypatch.setattr(user_manager, "list_users", lambda role=None: [
+        {"user_id": "id1", "username": "c1", "status": "active"},
+        {"user_id": "id2", "username": "c2", "status": "active"}])
+
+    worker._on_session(_session(
+        clients=["c1"], cfg=_cfg(risk_reward=2.0, exit_style="partial_trail",
+                                 min_score=6.0)))
+
+    assert worker.last_summary["skipped"] == [], worker.last_summary
+    assert worker.last_summary["started"] == ["c1"]
+    assert len(built) == 1                         # c2 is not this server's client
+    eng = built[0]
+    assert eng["user_id"] == "c1" and eng["symbols"] == SYMBOLS
+    assert eng["env"] == Environment.PAPER and eng["capital"] > 0
+    # The run's settings reached the engine, from memory.
+    assert (eng["risk_reward"], eng["exit_style"], eng["min_score"]) == (
+        2.0, "partial_trail", 6.0)
+
+
+# --------------------------------------------------------------------------- #
 #  Whichever address a client logs in at, their bot runs only on their server
 # --------------------------------------------------------------------------- #
 def test_the_hub_refuses_to_run_a_client_that_has_a_server(monkeypatch):

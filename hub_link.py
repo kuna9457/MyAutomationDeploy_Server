@@ -533,9 +533,15 @@ class HubLink:
                 # _start_one_client says "already running" for a live engine, so
                 # without this the old engine would keep trading the old config.
                 self._stop_clients("the hub changed the broadcast")
-            self._apply(cfg, new["symbols"])
+            # Active BEFORE _apply, not after: _apply starts the client through
+            # bot._start_one_client, which reads the run via client_run ->
+            # current_run(), and that answers "none" until session_active is
+            # set. Setting it afterwards made every broadcast start fail with
+            # "no client mode configured" (found on the first live run; the
+            # unit tests stubbed _start_assigned out, so they never saw it).
             self._applied = new
             self.session_active = True
+            self._apply(cfg, new["symbols"])
 
     def _apply(self, cfg: BroadcastConfig, symbol_settings: dict) -> None:
         """Hold the hub's run IN MEMORY (client_run reads it from here), then
