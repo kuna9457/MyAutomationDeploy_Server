@@ -34,7 +34,8 @@ from fastapi import Depends, FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.security import OAuth2PasswordRequestForm  # noqa: E402
 
-from api.auth import (CurrentUser, TokenResponse, authenticate,  # noqa: E402
+from api.auth import (ADMIN_ON_CLIENT_SERVER, CurrentUser,  # noqa: E402
+                      TokenResponse, admin_refused_here, authenticate,
                       create_access_token, get_current_user)
 from api.routers import (account, admin_users, advanced_backtest,  # noqa: E402
                          auditor, backtest, bot, broker, bulk_backtest,
@@ -77,6 +78,9 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
     user = authenticate(form.username, form.password)
     if user is None:
         raise HTTPException(401, "Invalid username or password.")
+    if admin_refused_here(user.role):
+        # 403, not 401: the password WAS right — this is just the wrong server.
+        raise HTTPException(403, ADMIN_ON_CLIENT_SERVER)
     token = create_access_token(user)
     return TokenResponse(access_token=token, role=user.role, username=user.username,
                          user_id=user.user_id)
