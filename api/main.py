@@ -87,6 +87,30 @@ def me(user: CurrentUser = Depends(get_current_user)):
     return user
 
 
+@app.get("/auth/home")
+def auth_home(user: CurrentUser = Depends(get_current_user)):
+    """Is THIS server the caller's home — where their bot is allowed to run?
+
+    One client UI (e.g. algo.welthwest.com) can front several servers, and
+    with a shared database a client's login succeeds on ALL of them. The UI
+    logs in everywhere, asks each server this, and keeps the one that says yes.
+
+    Answered from the shared server registry, not the live hub link, so a
+    server that has not (yet) reached its hub still knows whom it serves:
+      * client node: home only for the client it is bound to;
+      * hub / single server: home for the admin, and for any client WITHOUT
+        a server of their own (a client with one must use it — its static IP).
+    """
+    import fleet_registry
+    if hub_link.is_worker():
+        node_id = (os.getenv("NODE_ID", "") or "").strip()
+        return {"home": user.role == "client"
+                and user.username in fleet_registry.clients_of(node_id)}
+    if user.role != "client":
+        return {"home": True}
+    return {"home": fleet_registry.node_for_client(user.username) is None}
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
