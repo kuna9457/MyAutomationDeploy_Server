@@ -5,13 +5,14 @@ address reset codes go to, and the two UNAUTHENTICATED forgot-password steps.
 
 The reset endpoints are deliberately the only routes in the app outside
 /auth/login that require no token — that is the whole point of a forgot-password
-flow, and it is why they are written to give away nothing:
+flow:
 
-  * The request step returns the SAME response whether the account exists, is
-    disabled, has no address on file, or is being throttled. Anything else
-    turns it into a "does this person bank here" oracle.
-  * The confirm step returns one message for every failure mode, so a wrong
-    code and a wrong username are indistinguishable.
+  * The request step VALIDATES the username and says plainly when it is
+    unknown, disabled, has no email on file, or was just requested. Only a
+    valid account gets a code, mailed to the address on file (shown masked).
+    This is a deliberate product choice: it tells a caller whether a username
+    exists. The throttle and attempt cap below limit how fast it can be probed.
+  * The confirm step returns one message for every failure mode.
 
 Nothing here touches trading. No engine, strategy, broker or market-data
 import — a bug in this file cannot affect a running bot.
@@ -28,14 +29,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from security import verify_password
 
 router = APIRouter(prefix="/account", tags=["account"])
-
-#: Identical for every outcome of a reset request — see the module docstring.
-_GENERIC_REQUEST_REPLY = {
-    "ok": True,
-    "message": ("If that account exists and has an email on file, a reset "
-                "code has been sent. It expires in "
-                f"{password_reset.OTP_TTL_MINUTES} minutes."),
-}
 
 
 # -- signed-in -------------------------------------------------------------- #
@@ -107,23 +100,20 @@ def reset_available():
 
 @router.post("/password-reset/request")
 def request_reset(req: PasswordResetRequest):
-    """Step 1: mail a one-time code to the address on file.
-
-    Always answers with _GENERIC_REQUEST_REPLY. The only errors that surface
-    are server-side ones (mail not configured / the send itself failing),
-    because those are true regardless of which account was named and are
-    actionable for the person reading them.
-    """
+    """Step 1: validate the username, then mail a one-time code to the address
+    on file. Account problems come back as 400 with a specific message; mail
+    server problems as 503."""
     try:
-        sent, detail = password_reset.request_code(req.username)
+        _, masked = password_reset.request_code(req.username)
+    except password_reset.AccountError as exc:
+        raise HTTPException(400, str(exc))
     except password_reset.ResetError as exc:
         raise HTTPException(503, str(exc))
-    if not sent:
-        # Logged for the operator, never returned: `detail` distinguishes
-        # "no such account" from "no email on file", which the caller must
-        # not be able to tell apart.
-        print(f"[account] reset request for {req.username!r} not sent: {detail}")
-    return _GENERIC_REQUEST_REPLY
+    return {
+        "ok": True,
+        "message": (f"A reset code has been sent to {masked}. It expires in "
+                    f"{password_reset.OTP_TTL_MINUTES} minutes."),
+    }
 
 
 @router.post("/password-reset/confirm")

@@ -77,7 +77,8 @@ def test_live_square_off_is_untouched_by_the_research_flags():
     past the flat-out."""
     assert Mode.INTRADAY in config.SQUARE_OFF_MODES
     assert config.square_off_time_for(Segment.EQUITY, Mode.INTRADAY) == time(15, 9)
-    assert config.entry_cutoff_for(Segment.EQUITY, Mode.INTRADAY, P) == time(11, 59)
+    # Candlestick Intraday's cutoff was removed 2026-10-07 — none to derive.
+    assert config.entry_cutoff_for(Segment.EQUITY, Mode.INTRADAY, P) is None
     for fn in (config.square_off_time_for, config.entry_cutoff_for):
         params = set(inspect.signature(fn).parameters)
         assert not params & {"hold_overnight", "ignore_entry_cutoff"}, (

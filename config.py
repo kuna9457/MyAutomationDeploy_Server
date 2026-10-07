@@ -1152,18 +1152,18 @@ CANDLE_INTRADAY_PARAMS = StrategyParams(
     #  Evidence per setting is in the CLAUDE.md changelog. None of these
     #  touches Immutable Rule #1 — risk per trade is still 1%.
 
-    #: Pattern evidence needed to trade. 3.0 was one marginal single-candle
-    #: hit; 7.0 needs roughly two agreeing patterns. This is the whole fix —
-    #: it alone is +29 of the 30 points, because gross profit per position
-    #: rises from Rs28 to Rs203 while the cost of taking a trade stays ~Rs216.
-    #: Below ~7 the edge per trade is smaller than the cost of capturing it.
-    cs_min_score=7.0,
+    #: Pattern evidence needed to trade. BASE FLOOR ONLY (2026-10-07, owner's
+    #: request): the admin selects the real threshold per run from the panel's
+    #: Min score control (ModeConfig.min_score / the Broadcast tab), which
+    #: overrides this. 3.0 = one high-strength single-candle pattern; the
+    #: measured 7.0 (two agreeing patterns, +29 of the 30 points in the
+    #: 2026-09-02 backtest) is now a panel choice, not the default.
+    cs_min_score=3.0,
     cs_trend_lookback=10,
-    #: No new entries after 11:59 (15:09 flat-out minus 190 minutes). Winners
-    #: resolve in a median of 4 bars; a position opened late cannot reach its
-    #: target and is squared off flat having paid a full round trip. Worth
-    #: +0.96pp, and it also halves the position count.
-    entry_cutoff_before_close=190,
+    #: Entry cutoff REMOVED (2026-10-07, owner's request) — was 190 (= no new
+    #: entries after 11:59, measured +0.96pp). Entries now run to the normal
+    #: session end; the 15:09 square-off still flattens everything.
+    entry_cutoff_before_close=0,
     #: Floor the ATR stop at 0.8% of price. COUNTER-INTUITIVE and measured
     #: both ways: WIDENING stops pays (+0.19pp) because it converts -Rs1,205
     #: stop-outs into -Rs65 sideways exits. Capping them does the reverse and

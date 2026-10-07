@@ -299,8 +299,8 @@ def test_the_shipped_exit_styles_are_untouched():
 
 
 def test_the_candlestick_strategies_are_untouched():
-    assert config.CANDLE_INTRADAY_PARAMS.cs_min_score == 7.0
-    assert config.CANDLE_INTRADAY_PARAMS.entry_cutoff_before_close == 190
+    assert config.CANDLE_INTRADAY_PARAMS.cs_min_score == 3.0
+    assert config.CANDLE_INTRADAY_PARAMS.entry_cutoff_before_close == 0
     assert config.CANDLE_INTRADAY_PARAMS.min_stop_pct == 0.8
     assert config.CANDLE_INTRADAY_PARAMS.partial_exit_fraction == 0.0
     assert config.CANDLE_SWING_PARAMS.allow_short is False

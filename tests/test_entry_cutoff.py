@@ -22,6 +22,9 @@ from config import Mode, Segment
 
 
 P = config.CANDLE_INTRADAY_PARAMS
+# Candlestick Intraday no longer sets a cutoff (removed 2026-10-07), so the
+# derivation is exercised on a copy that does — the mechanism is unchanged.
+PC = replace(P, entry_cutoff_before_close=190)
 
 
 # --------------------------------------------------------------------------- #
@@ -29,13 +32,13 @@ P = config.CANDLE_INTRADAY_PARAMS
 # --------------------------------------------------------------------------- #
 def test_cutoff_is_derived_from_the_flat_out_not_configured_as_a_clock():
     assert config.square_off_time_for(Segment.EQUITY, Mode.INTRADAY) == time(15, 9)
-    assert config.entry_cutoff_for(Segment.EQUITY, Mode.INTRADAY, P) == time(11, 59)
+    assert config.entry_cutoff_for(Segment.EQUITY, Mode.INTRADAY, PC) == time(11, 59)
 
 
 def test_moving_the_square_off_moves_the_cutoff_with_it():
     """The right coupling: the runway a trade needs does not shrink just
     because the day was shortened."""
-    got = config.entry_cutoff_for(Segment.EQUITY, Mode.INTRADAY, P, "14:00")
+    got = config.entry_cutoff_for(Segment.EQUITY, Mode.INTRADAY, PC, "14:00")
     assert got == time(10, 50)                  # 14:00 - 190 min
 
 
@@ -49,7 +52,7 @@ def test_inert_for_a_strategy_that_sets_no_cutoff():
 
 def test_swing_has_no_cutoff_because_it_holds_overnight():
     assert config.entry_cutoff_for(Segment.EQUITY, Mode.SWING,
-                                   replace(P, mode=Mode.SWING)) is None
+                                   replace(PC, mode=Mode.SWING)) is None
 
 
 def test_crudeoil_keeps_the_time_its_own_strategy_already_enforced():
@@ -64,18 +67,9 @@ def test_crudeoil_keeps_the_time_its_own_strategy_already_enforced():
 #  Both halves enforce it. A cutoff only one of them honoured would make the
 #  backtest describe a bot that does not exist.
 # --------------------------------------------------------------------------- #
-def test_the_backtester_opens_nothing_after_the_cutoff():
-    import backtester
-    if "INFY" not in config.INSTRUMENTS_BY_SYMBOL:
-        pytest.skip("INFY is not in this deployment's instrument list")
-    t = backtester.run_backtest("INFY", "2026-01-01", "2026-08-31", 200_000.0,
-                                Mode.INTRADAY, strategy_key="candlestick_engine",
-                                exit_style="partial_lock", include_costs=True).trades
-    if t.empty:
-        pytest.skip("no trades in that window")
-    import pandas as pd
-    latest = pd.to_datetime(t.entry_time).dt.time.max()
-    assert latest < time(11, 59), f"an entry was opened at {latest}"
+def test_candlestick_intraday_has_no_cutoff_any_more():
+    """Removed on request 2026-10-07: entries run to the session end."""
+    assert config.entry_cutoff_for(Segment.EQUITY, Mode.INTRADAY, P) is None
 
 
 def test_the_live_runner_enforces_it_too():
@@ -95,8 +89,9 @@ def test_the_live_runner_enforces_it_too():
 #  any of them invalidates that measurement.
 # --------------------------------------------------------------------------- #
 def test_candlestick_intraday_carries_the_measured_settings():
-    assert P.cs_min_score == 7.0            # +29.0pp of the 30-point fix
-    assert P.entry_cutoff_before_close == 190   # 11:59, worth +0.96pp
+    # cs_min_score is a base floor; the admin picks the real one in the panel.
+    assert P.cs_min_score == 3.0
+    assert P.entry_cutoff_before_close == 0     # cutoff removed 2026-10-07
     assert P.min_stop_pct == 0.8            # widen stops, +0.19pp
     assert P.max_stop_pct == 0.0            # capping them costs ~2pp — leave it
 

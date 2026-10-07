@@ -61,6 +61,11 @@ class ResetError(Exception):
     distinguishes 'no such account' from 'no address on file'."""
 
 
+class AccountError(ResetError):
+    """The request names an account that can't be mailed (unknown, disabled,
+    no email, throttled). Shown verbatim so the user knows what to fix."""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -107,25 +112,31 @@ def request_code(username: str) -> tuple[bool, str]:
             "Password reset by email isn't available right now. Please ask "
             "your admin to reset it for you.")
 
-    user = user_manager.get_user(str(username or "").strip())
+    name = str(username or "").strip()
+    if not name:
+        raise AccountError("Enter your username.")
+    user = user_manager.get_user(name)
     if user is None:
-        return False, "no such account"
+        raise AccountError(
+            f"No account found with the username '{name}'. Check the spelling.")
     if user.get("status") != "active":
-        return False, "account disabled"
+        raise AccountError(
+            "This account is disabled. Please contact your admin.")
 
     to_addr = mailer.optional_recipient(user.get("email"))
     if not to_addr:
-        return False, "no email on file"
+        raise AccountError(
+            "There is no email address on file for this account. "
+            "Please ask your admin to add one or reset your password.")
 
     existing = user_manager.get_reset_challenge(user["user_id"])
     sent_at = _parse(existing.get("sent_at", ""))
     if sent_at is not None:
         elapsed = (_now() - sent_at).total_seconds()
         if elapsed < RESEND_COOLDOWN_SECONDS:
-            # Throttled, but still reported to the caller as a normal success
-            # by the router — a "you're being throttled" response would confirm
-            # the account exists.
-            return False, "throttled"
+            wait = int(RESEND_COOLDOWN_SECONDS - elapsed) + 1
+            raise AccountError(
+                f"A code was just sent. Wait {wait} seconds before requesting another.")
 
     code = _generate_code()
     challenge = {
