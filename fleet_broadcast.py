@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import config
+import mcx_rollover
 import config_store
 import fleet_registry
 import mongo_client
@@ -291,6 +292,9 @@ def resolve_run(cfg: BroadcastConfig):
         strategy = replace(strategy, params=params)
     instruments = [config.INSTRUMENTS_BY_SYMBOL[s] for s in cfg.symbols
                    if s in config.INSTRUMENTS_BY_SYMBOL]
+    # Same MCX roll TradingEngine.__init__ applies, so hub and node resolve
+    # the same contract for the same symbol.
+    instruments = mcx_rollover.current(instruments)
     rules = symbol_config.rules_for(mode.value, [i.symbol for i in instruments])
     poll = 0.5 if mode == Mode.SCALPER else 3.0
     return strategy, params, instruments, rules, poll

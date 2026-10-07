@@ -27,6 +27,7 @@ import time as _time
 
 import config
 import exit_manager
+import mcx_rollover
 import risk_manager
 import strategy_runner
 import symbol_config
@@ -165,6 +166,10 @@ class TradingEngine:
         self.environment = environment
         self.mode = mode
         self.broker_choice = broker_choice
+        # Roll any MCX contract that is about to expire, then trade the one
+        # that is current NOW — not whatever the caller looked up earlier.
+        # A no-op for equity and when nothing is due (mcx_rollover.py).
+        instruments = mcx_rollover.current(instruments)
         self.instruments = instruments
         self.total_capital = total_capital
         # Multi-tenancy (frontend_migration_plan.md §3, Phase 2): whose trades/
@@ -371,15 +376,17 @@ class TradingEngine:
             if days < 0:
                 self.state.push_log(
                     f"⛔ {inst.symbol} expired on {inst.expiry} — its key is "
-                    f"dead. Run tools/refresh_mcx.py to roll it.")
+                    f"dead. It rolls automatically once no bot or open position "
+                    f"holds it — Stop the bot while flat, then Start.")
             elif days == 0:
                 self.state.push_log(
-                    f"⚠️ {inst.symbol} expires TODAY ({inst.expiry}). Roll it "
-                    f"before the next session — run tools/refresh_mcx.py.")
+                    f"⚠️ {inst.symbol} expires TODAY ({inst.expiry}). It rolls "
+                    f"automatically once flat — Stop and Start the bot to switch.")
             else:
                 self.state.push_log(
                     f"⏳ {inst.symbol} expires in {days} day(s) on "
-                    f"{inst.expiry} — run tools/refresh_mcx.py to roll it.")
+                    f"{inst.expiry} — it rolls automatically {mcx_rollover.ROLL_DAYS} "
+                    f"days before expiry.")
 
     # -- the shared decider -------------------------------------------------- #
     @property

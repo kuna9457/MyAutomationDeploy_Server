@@ -52,6 +52,9 @@ async def _lifespan(_app: FastAPI):
     no-ops on an ordinary single-server deployment, so nothing changes there.
     Resuming opens a market-data socket, so it runs off the event loop."""
     import threading
+    import mcx_rollover
+    # Roll MCX futures before they expire — now, then every few hours.
+    mcx_rollover.start_background()
     if hub_link.start_if_worker():
         pass
     else:

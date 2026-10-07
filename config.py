@@ -311,6 +311,40 @@ except Exception:  # generated module absent — keep the bot runnable
         Instrument("SILVERMIC",   Segment.MCX, "MCX_FO|488788", 1,    1.0,  223320.0,  1,    expiry="2026-08-31"),   # 1 kg, quoted ₹/kg
     ]
 
+# Contracts the server rolled by itself (mcx_rollover.py). Kept in the
+# gitignored data/ folder so the server never dirties a tracked file; applied
+# here per symbol only where the saved contract expires LATER than the one
+# above, so a newer committed mcx_instruments.py still takes precedence.
+MCX_ROLLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "mcx_rolls.json")
+
+
+def _apply_saved_mcx_rolls(insts: list[Instrument]) -> list[Instrument]:
+    import json
+    try:
+        with open(MCX_ROLLS_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except Exception:
+        return list(insts)
+    out = []
+    for inst in insts:
+        s = saved.get(inst.symbol) if isinstance(saved, dict) else None
+        try:
+            if s and str(s.get("expiry", "")) > (inst.expiry or ""):
+                inst = replace(inst,
+                               instrument_key=str(s["instrument_key"]),
+                               lot_size=int(s["lot_size"]),
+                               tick_size=float(s["tick_size"]),
+                               contract_multiplier=int(s["contract_multiplier"]),
+                               expiry=str(s["expiry"]))
+        except (KeyError, TypeError, ValueError):
+            pass   # a malformed entry keeps the committed contract
+        out.append(inst)
+    return out
+
+
+MCX_INSTRUMENTS = _apply_saved_mcx_rolls(MCX_INSTRUMENTS)
+
 # US equities (Alpaca) ------------------------------------------------------- #
 # A US instrument_key is simply its ticker — there is no ISIN-style lookup and
 # nothing expires, so unlike MCX this list does not rot. Regenerate with
