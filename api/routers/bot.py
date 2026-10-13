@@ -54,9 +54,11 @@ router = APIRouter(prefix="/bot", tags=["bot"])
 #  One client, one server
 # --------------------------------------------------------------------------- #
 _NOT_ASSIGNED = "this server is not assigned to this account"
+_RUNNING_ON_SERVER = "is already running on its own server"
 
 
-def _fleet_refusal(username: str) -> str:
+def _fleet_refusal(username: str,
+                   environment: Environment | None = None) -> str:
     """"" when this process may run `username`'s bot; otherwise why not.
 
     ON A NODE: only the client the hub assigned to this server. The shared
@@ -66,13 +68,26 @@ def _fleet_refusal(username: str) -> str:
     ON THE HUB: never a client that has their own server. Their bot must run on
     their server, from their static IP. A client with no server (an ordinary
     single-server deployment, or one made before servers existed) is
-    unaffected."""
+    unaffected.
+
+    PAPER IS THE EXCEPTION, and only when the caller says so by passing the
+    environment (the client's own Start does; the admin's start-everyone
+    fan-out does not, so it still never runs a server's client here). Paper
+    sends no order to any broker, so the static IP that ties a client to their
+    server does not matter — a client can paper trade from the hub the moment
+    their account exists, before their server is ever set up. Refused only
+    while their server is already running their bot: two engines under one
+    account would book every paper trade twice."""
     if hub_link.is_worker():
         return "" if username in hub_link.link().assigned else _NOT_ASSIGNED
     node = fleet_registry.node_for_client(username)
-    if node is not None:
-        return f"trades on its own server “{node['name']}”"
-    return ""
+    if node is None:
+        return ""
+    if environment == Environment.PAPER:
+        from fleet_broadcast import hub as fleet_hub
+        live = fleet_hub.client_live(username)
+        return _RUNNING_ON_SERVER if live and live["running"] else ""
+    return f"trades on its own server “{node['name']}”"
 
 
 def _fleet_refusal_message(reason: str) -> str:
@@ -80,9 +95,12 @@ def _fleet_refusal_message(reason: str) -> str:
     if reason == _NOT_ASSIGNED:
         return ("This server isn't set up for your account. Log in at the "
                 "address your admin gave you.")
-    return ("Your bot runs on your own server. Log in at the address your "
-            "admin gave you to start or stop it — your trades and P&L show "
-            "here as well.")
+    if reason == _RUNNING_ON_SERVER:
+        return ("Your bot is already running on your own server. Stop it "
+                "there before starting it here.")
+    return ("Live trading runs on your own server. Log in at the address "
+            "your admin gave you to start or stop it — your trades and P&L "
+            "show here as well. Paper trading can be started from here.")
 
 # One long-lived manager for this router, matching trades.py/admin_users.py.
 # `reset_environment` below used to construct a throwaway DBManager per request
@@ -340,7 +358,7 @@ def start_bot(req: StartBotRequest, user: CurrentUser = Depends(get_current_user
         # ignored outright rather than validated, so the mode cannot be
         # steered from the request body any more than the strategy or the
         # instrument list can. The client's bot only sizes and punches.
-        refusal = _fleet_refusal(user.username)
+        refusal = _fleet_refusal(user.username, environment)
         if refusal:
             raise HTTPException(400, _fleet_refusal_message(refusal))
         requested = client_run.active_mode()

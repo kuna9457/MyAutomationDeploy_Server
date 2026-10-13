@@ -200,6 +200,14 @@ def token_version(user: dict) -> int:
         return 0
 
 
+# -- commission ----------------------------------------------------------------- #
+def set_commission(user_id: str, pct: float, effective_from: str) -> Optional[dict]:
+    """The share of weekly profit this client pays, and the Monday billing
+    starts from. Validation and every rule about it live in commission.py."""
+    return _public(_update(user_id, {"commission_pct": float(pct),
+                                     "commission_from": effective_from}))
+
+
 # -- email ---------------------------------------------------------------------- #
 def set_email(user_id: str, email: str) -> Optional[dict]:
     """Set (or clear, with "") the address reset codes are sent to."""

@@ -3,9 +3,10 @@ api/routers/fleet.py
 The admin's BROADCAST surface, and the socket client nodes dial into.
 
 Deliberately its own router and its own state (fleet_broadcast.hub): nothing
-here is reachable from /bot, reads engine_registry or shares a Start/Stop with
-the admin's own bot. Starting or stopping a broadcast does not touch it, and
-the reverse.
+here is reachable from /bot or shares a Start/Stop with the admin's own bot.
+Starting or stopping a broadcast does not touch it, and the reverse. The one
+read of engine_registry is `_paper_bot_to_yield`: a client's paper bot started
+here stops when their own server takes over.
 
     admin  ──HTTP──>  /fleet/nodes, /fleet/broadcast/*   (role=admin only)
     node   ──WS────>  /fleet/ws                          (node secret, not a JWT)
@@ -22,8 +23,9 @@ from typing import Optional
 
 import fleet_registry
 import user_manager
+from api import engine_registry
 from api.auth import CurrentUser, require_admin
-from config import Environment
+from config import Environment, now_ist
 from db_manager import DBManager
 from fastapi import (APIRouter, Depends, HTTPException, WebSocket,
                      WebSocketDisconnect)
@@ -196,6 +198,36 @@ def _node_from_handshake(ws: WebSocket) -> Optional[dict]:
     return fleet_registry.authenticate(node_id, secret)
 
 
+def _paper_bot_to_yield(conn: NodeConnection, msg: dict) -> str:
+    """The client whose bot on THIS machine must stop, or "".
+
+    A client with a server may paper trade from the hub until that server is
+    set up (bot._fleet_refusal). The moment their server reports it is running
+    their bot, the hub's copy has to go: two engines under one account would
+    book every trade twice. This is the one place the fleet reads
+    engine_registry, and it only ever stops that one client's engine — never
+    the admin's bot, never the broadcast."""
+    if msg.get("t") != "report":
+        return ""
+    owner = conn.node.get("username") or ""
+    if not owner or not any(
+            c.get("username") == owner and c.get("running")
+            for c in (msg.get("clients") or []) if isinstance(c, dict)):
+        return ""
+    eng = engine_registry.get_engine(owner)
+    return owner if eng is not None and eng.state.running else ""
+
+
+def _yield_to_server(conn: NodeConnection, owner: str) -> None:
+    try:
+        engine_registry.stop_engine(owner)
+        hub.log.appendleft(
+            f"[{now_ist().strftime('%H:%M:%S')}] {owner}: stopped the bot "
+            f"running here — their server “{conn.node['name']}” now runs it.")
+    except Exception:
+        pass
+
+
 @router.websocket("/ws")
 async def node_socket(ws: WebSocket):
     node = await run_in_threadpool(_node_from_handshake, ws)
@@ -218,6 +250,9 @@ async def node_socket(ws: WebSocket):
                 continue
             if isinstance(msg, dict):
                 hub.on_message(conn, msg)
+                owner = _paper_bot_to_yield(conn, msg)
+                if owner:
+                    await run_in_threadpool(_yield_to_server, conn, owner)
     except WebSocketDisconnect:
         pass
     except Exception:

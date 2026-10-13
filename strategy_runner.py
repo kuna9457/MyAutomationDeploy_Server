@@ -50,6 +50,7 @@ from config import (Instrument, Mode, Segment, market_hours_for_segment,
                     now_for_segment, now_ist)
 from data_feed import LiveQuote, MarketDataFeed, SimulatedFeed, make_feed
 from strategy import BoundStrategy, Signal, atr as atr_series, run_strategy
+import telegram_signals
 
 # A tick older than this during market hours means the stream has stalled; we
 # stop calling it "live" in the UI rather than pricing PnL off stale data.
@@ -517,6 +518,10 @@ class StrategyRunner:
             if live_price is None:
                 continue
             bar_ts = df.index[-1] if not df.empty else None
+            # The Telegram channel's own SL/TP tracking — in-memory, never
+            # raises, never touches an account.
+            telegram_signals.on_price(inst.symbol, live_price,
+                                      self.feed_is_simulated())
 
             # 1) Accounts manage what they already hold — their own SL/TP/time
             # exit, unchanged. This runs BEFORE the runner's own reference
@@ -577,6 +582,12 @@ class StrategyRunner:
             # account sizes it against its own capital and risk limits and
             # punches its own order.
             self._record_signal(inst, sig, local_dt)
+            # Publish the decision (symbol, side, levels — nothing about how it
+            # was found). Queued: posting can never delay the entries below.
+            telegram_signals.on_signal(
+                inst.symbol, inst.segment.value, sig.side, sig.entry_price,
+                sig.stop_loss, self._effective_target(inst.symbol, sig),
+                bar_ts, self.feed_is_simulated())
             sev = SignalEvent(inst, sig, quote, bar_ts)
             entered = self._broadcast(lambda a, e=sev: a.on_signal(e), accounts)
 
@@ -646,6 +657,8 @@ class StrategyRunner:
         cutoff = config.square_off_time_for(inst.segment, self.mode,
                                             self.square_off_time)
         reason = f"SQUARE-OFF ({cutoff.strftime('%H:%M')})"
+        telegram_signals.on_exit(inst.symbol, live_price, reason,
+                                 self.feed_is_simulated())
         closed = self._broadcast(
             lambda a: a.on_exit(inst, live_price, reason), accounts)
         if any(closed):
@@ -756,6 +769,11 @@ class StrategyRunner:
             return False
 
         self._refs.pop(inst.symbol, None)
+        if reason.startswith("TIME-EXIT"):
+            # Price exits are already tracked by on_price on the published
+            # levels; the clock exit is the one the channel cannot see.
+            telegram_signals.on_exit(inst.symbol, live_price, reason,
+                                     self.feed_is_simulated())
         closed = self._broadcast(
             lambda a: a.on_exit(inst, live_price, reason), accounts)
         return any(closed)

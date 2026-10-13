@@ -39,8 +39,8 @@ from api.auth import (ADMIN_ON_CLIENT_SERVER, CurrentUser,  # noqa: E402
                       create_access_token, get_current_user)
 from api.routers import (account, admin_users, advanced_backtest,  # noqa: E402
                          auditor, backtest, bot, broker, bulk_backtest,
-                         chart, config_router, crudeoil_pipeline_api,
-                         fleet, risk, trades)
+                         chart, commission, config_router,
+                         crudeoil_pipeline_api, fleet, risk, telegram, trades)
 import hub_link  # noqa: E402
 from contextlib import asynccontextmanager  # noqa: E402
 
@@ -131,6 +131,9 @@ app.include_router(backtest.router)
 app.include_router(config_router.router)
 app.include_router(admin_users.router)
 app.include_router(account.router)
+# Weekly profit-share invoices. Reads the trade ledger, writes only its own
+# records. On every server: a client's UI talks to their own.
+app.include_router(commission.router)
 # READ-ONLY LLM review of past trades. Imports nothing from the trading path and
 # cannot act — see AI_AUDITOR_PLAN.md.
 app.include_router(auditor.router)
@@ -150,3 +153,5 @@ app.include_router(bulk_backtest.router)
 # it only dials OUT to a hub — so the routes are not even mounted there.
 if not hub_link.is_worker():
     app.include_router(fleet.router)
+    # Telegram signal channel — admin's, so hub only, like the broadcast.
+    app.include_router(telegram.router)

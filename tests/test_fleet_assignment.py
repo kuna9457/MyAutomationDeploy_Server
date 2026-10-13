@@ -286,10 +286,60 @@ def test_the_hub_refuses_to_run_a_client_that_has_a_server(monkeypatch):
     monkeypatch.setattr(hub_link, "is_worker", lambda: False)
     fleet_registry.create_node("Mumbai", username="c1")
     with pytest.raises(HTTPException) as err:
-        bot.start_bot(StartBotRequest(environment="Paper", capital=100000),
+        bot.start_bot(StartBotRequest(environment="Live", capital=100000),
                       CurrentUser(user_id="id1", username="c1", role="client"))
     assert err.value.status_code == 400
     assert "your own server" in err.value.detail
+
+
+def test_paper_needs_no_server_but_live_and_the_fan_out_still_do(monkeypatch):
+    """Paper sends nothing to a broker, so the static IP is irrelevant: a
+    client can paper trade from the hub as soon as the account exists."""
+    from api.routers import bot
+    monkeypatch.setattr(hub_link, "is_worker", lambda: False)
+    fleet_registry.create_node("Mumbai", username="c1")
+    assert bot._fleet_refusal("c1", Environment.PAPER) == ""
+    assert bot._fleet_refusal("c1", Environment.LIVE) != ""
+    # The admin's start-everyone fan-out passes no environment: unchanged.
+    assert bot._fleet_refusal("c1") != ""
+
+
+def test_paper_on_the_hub_is_refused_while_their_server_runs_their_bot(monkeypatch):
+    from api.routers import bot
+    monkeypatch.setattr(hub_link, "is_worker", lambda: False)
+    fleet_registry.create_node("Mumbai", username="c1")
+    state = {"running": True}
+    monkeypatch.setattr(fleet_broadcast.hub, "client_live",
+                        lambda u: dict(state, node_name="Mumbai"))
+    reason = bot._fleet_refusal("c1", Environment.PAPER)
+    assert "already running" in bot._fleet_refusal_message(reason)
+    state["running"] = False                # connected, but their bot is off
+    assert bot._fleet_refusal("c1", Environment.PAPER) == ""
+
+
+def test_the_hubs_paper_bot_stops_when_the_clients_server_takes_over(monkeypatch):
+    from api import engine_registry
+    from api.routers import fleet
+
+    class Eng:
+        state = type("S", (), {"running": True})()
+
+    conn = type("C", (), {"node": {"name": "Mumbai", "username": "c1"}})()
+    monkeypatch.setattr(engine_registry, "get_engine",
+                        lambda u: Eng() if u == "c1" else None)
+    stopped = _Recorder()
+    monkeypatch.setattr(engine_registry, "stop_engine", stopped)
+
+    def report(username, running):
+        return {"t": "report",
+                "clients": [{"username": username, "running": running}]}
+
+    assert fleet._paper_bot_to_yield(conn, report("c1", False)) == ""
+    assert fleet._paper_bot_to_yield(conn, report("c2", True)) == ""
+    assert fleet._paper_bot_to_yield(conn, {"t": "ack"}) == ""
+    assert fleet._paper_bot_to_yield(conn, report("c1", True)) == "c1"
+    fleet._yield_to_server(conn, "c1")
+    assert stopped.calls == [(("c1",), {})]
 
 
 def test_a_node_refuses_a_client_that_is_not_its_own(worker):
