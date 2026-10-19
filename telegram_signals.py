@@ -106,9 +106,23 @@ def _token() -> str:
         return _token_cache
 
 
+def _normalize_chat_id(raw: str) -> str:
+    """Telegram wants a numeric id (-100…) or "@channelname". Accept what people
+    actually paste: a t.me link or a bare channel name."""
+    v = (raw or "").strip()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if v.lower().startswith(prefix):
+            v = v[len(prefix):].strip("/")
+            break
+    if v and not v.startswith("@") and not v.lstrip("-").isdigit():
+        v = "@" + v
+    return v
+
+
 def _chat_id() -> str:
-    return (str(_cfg().get("chat_id") or "").strip()
-            or (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip())
+    return _normalize_chat_id(
+        str(_cfg().get("chat_id") or "").strip()
+        or (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip())
 
 
 def is_active() -> bool:

@@ -260,7 +260,23 @@ def my_funds(broker: str, user: CurrentUser = Depends(get_current_user)):
     """Real available funds from the CALLER's own connected broker account —
     what the client sidebar shows as "capital you can allocate". Uses the
     exact same broker_api.available_funds() every engine relies on; this
-    just calls it once, outside of a running engine, for display."""
+    just calls it once, outside of a running engine, for display.
+
+    The ADMIN has no per-user broker token — their brokers are the shared
+    .env ones, any of the four — so for them this reads the same account the
+    admin's live engine would trade (make_broker with no token)."""
+    if user.role != "client":
+        try:
+            choice = Broker(broker)
+        except ValueError:
+            raise HTTPException(400, f"Unknown broker '{broker}'.")
+        if choice == Broker.SIMULATED:
+            raise HTTPException(400, "Pick a real broker.")
+        b = broker_api.make_broker(Environment.LIVE, choice)
+        if b.name == "Simulated":
+            raise HTTPException(
+                400, f"Could not connect to {broker} — token missing or expired.")
+        return {"broker": broker, "available_funds": b.available_funds()}
     _require_broker(broker)
     token = user_manager.get_broker_token(user.user_id, broker)
     if not token:

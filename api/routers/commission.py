@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 import commission
+import commission_notify
 from api.auth import CurrentUser, get_current_user, require_admin
 
 router = APIRouter(prefix="/commission", tags=["commission"])
@@ -63,7 +64,11 @@ def mark_my_invoice_paid(week_start: str, req: MarkPaidRequest,
                          user: CurrentUser = Depends(get_current_user)):
     """Scoped to the caller's own username — a client can never mark, or even
     address, another client's invoice."""
-    return _run(commission.mark_paid, user.username, week_start, req.reference)
+    row = _run(commission.mark_paid, user.username, week_start, req.reference)
+    # Confirmation to the client + heads-up to the admin, on a background
+    # thread: the invoice is already saved, so mail can't fail this request.
+    commission_notify.notify_paid(row)
+    return row
 
 
 # -- admin ----------------------------------------------------------------------- #

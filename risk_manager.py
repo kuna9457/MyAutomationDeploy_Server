@@ -168,3 +168,16 @@ def daily_loss_limit(limits: LiveRiskLimits, base_capital: float) -> float:
     if limits.max_daily_loss_pct and limits.max_daily_loss_pct > 0:
         candidates.append(base_capital * limits.max_daily_loss_pct / 100.0)
     return min(candidates) if candidates else 0.0
+
+
+def forget(user_id: str) -> None:
+    """Drop one account's saved limits — used only when the account is deleted."""
+    with _lock:
+        _limits_cache.pop(user_id, None)
+        try:
+            by_user = config_store.load(_KEY)
+            if isinstance(by_user, dict) and user_id in by_user:
+                by_user.pop(user_id)
+                config_store.save(_KEY, by_user)
+        except Exception as exc:
+            print(f"[risk_manager] could not remove limits for {user_id}: {exc}")

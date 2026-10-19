@@ -234,6 +234,14 @@ def _build_feed(mode: Mode, feed_token: str, instruments: list[Instrument],
     except Exception as exc:
         if log:
             log(f"⚠️ Live feed unavailable ({exc}); using simulated feed.")
+            # The failed feed knows WHY each instrument returned nothing (dead
+            # contract key, auth, empty window) — surface it instead of
+            # dropping it with the feed.
+            try:
+                for sym, reason in feed.data_problems():
+                    log(f"   • {sym}: {reason}")
+            except Exception:
+                pass
         feed = SimulatedFeed(mode=mode)
         feed.start(instruments)
         return feed

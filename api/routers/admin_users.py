@@ -179,6 +179,53 @@ def set_client_status(user_id: str, req: SetStatusRequest):
     return {k: v for k, v in user.items() if k not in ("password_hash", "broker_tokens")}
 
 
+@router.delete("/users/{user_id}")
+def delete_client(user_id: str, delete_data: bool = True):
+    """Permanently delete a client account. Two-step on purpose: the client
+    must be DISABLED first (which also stops their bot everywhere).
+
+    Refused while their bot is still running anywhere, or while they hold an
+    OPEN Live position — deleting the owner would orphan a real-money trade
+    that nothing would then manage. Removes the account (with its broker
+    credentials), their server registration and saved risk limits; with
+    `delete_data` (default) also their Paper + Live trades and commission
+    invoices. Cannot be undone."""
+    user = _user_or_404(user_id)
+    username = user["username"]
+    if not username or username == "admin":          # never a whole-book wipe
+        raise HTTPException(400, "Refusing to delete this account.")
+    if user.get("status") != "disabled":
+        raise HTTPException(400, "Disable the client first, then delete.")
+    if _live_view(username)["running"]:
+        raise HTTPException(409, "Their bot is still running — wait for it to "
+                                 "stop (disabling stops it), then try again.")
+    open_live = _db.get_open_trades(Environment.LIVE, user_id=username)
+    if open_live:
+        raise HTTPException(409, f"{username} has {len(open_live)} open Live "
+                                 "position(s). Close them at the broker and in "
+                                 "the bot first.")
+
+    engine_registry.stop_engine(username)
+    out = {"username": username, "server_removed": False,
+           "trades_removed": 0, "invoices_removed": 0}
+    node = fleet_registry.node_for_client(username)
+    if node is not None:
+        fleet_hub.disconnect(node["node_id"])
+        out["server_removed"] = fleet_registry.delete_node(node["node_id"])
+    if delete_data:
+        import commission
+        for env in (Environment.PAPER, Environment.LIVE):
+            out["trades_removed"] += _db.reset_environment(
+                env, user_id=username)["trades_removed"]
+        out["invoices_removed"] = commission.delete_client_invoices(username)
+    import risk_manager
+    risk_manager.forget(username)
+    if not user_manager.delete_user(user_id):
+        raise HTTPException(404, "Client not found.")
+    print(f"[admin] deleted client '{username}': {out}")
+    return out
+
+
 @router.put("/users/{user_id}/password")
 def reset_client_password(user_id: str, req: SetPasswordRequest):
     if len(req.password) < 6:

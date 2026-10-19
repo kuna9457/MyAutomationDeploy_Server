@@ -271,3 +271,84 @@ def test_routes_scope_a_client_to_their_own_invoices(world):
     res = http.post(f"/commission/me/invoices/{LAST}/paid",
                     json={"reference": "UTR9"})
     assert res.status_code == 200 and res.json()["status"] == "paid"
+
+
+# -- payment emails + history ------------------------------------------------ #
+def test_marking_paid_emails_the_client_and_the_admin(world, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import commission_notify
+    import mailer
+    from api.auth import CurrentUser, get_current_user
+    from api.routers import commission as routes
+
+    trades, _ = world
+    trades["Live"].append(_trade("c1", "2026-10-06", 1000.0))
+    commission.set_rate("c1", 20, effective_from=LAST)
+
+    real_get = user_manager.get_user
+    monkeypatch.setattr(user_manager, "get_user", lambda n: (
+        {**(real_get(n) or {}), "email": "Client@Example.com",
+         "display_name": "Client One"} if n == "c1" else real_get(n)))
+    monkeypatch.setenv("COMMISSION_ADMIN_EMAIL", "boss@example.com")
+    monkeypatch.setattr(mailer, "is_configured", lambda: True)
+    sent = []
+    monkeypatch.setattr(mailer, "send",
+                        lambda to, subj, body: sent.append((to, subj, body)) or (True, ""))
+    commission.sync("c1")
+    real_notify = commission_notify.notify_paid
+    monkeypatch.setattr(commission_notify, "notify_paid",
+                        lambda inv: real_notify(inv, background=False))
+
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        user_id="id-c1", username="c1", role="client")
+    res = TestClient(app).post(f"/commission/me/invoices/{LAST}/paid",
+                               json={"reference": "UTR77"})
+    assert res.status_code == 200
+
+    to = {s[0]: s for s in sent}
+    assert set(to) == {"client@example.com", "boss@example.com"}
+    client_subj, client_body = to["client@example.com"][1:]
+    assert "20% commission to WelthWest Algo" in client_subj
+    assert "Rs 200.00" in client_body and "UTR77" in client_body
+    assert "Client One (c1)" in to["boss@example.com"][1]
+
+
+def test_a_mail_failure_never_fails_mark_paid(world, monkeypatch):
+    import commission_notify
+    import mailer
+
+    monkeypatch.setattr(mailer, "is_configured", lambda: True)
+
+    def boom(*a):
+        raise RuntimeError("smtp down")
+    monkeypatch.setattr(mailer, "send", boom)
+    commission_notify.notify_paid(
+        {"invoice_id": "c1:x", "username": "c1", "week_start": LAST,
+         "week_end": LAST, "amount": 1, "pct": 1}, background=False)
+
+
+def test_admin_recipients_fall_back_to_admin_accounts(world, monkeypatch):
+    import commission_notify
+
+    monkeypatch.delenv("COMMISSION_ADMIN_EMAIL", raising=False)
+    monkeypatch.setattr(user_manager, "list_users", lambda role=None: [
+        {"username": "admin", "role": "admin", "email": "Owner@Example.com"}])
+    assert commission_notify.admin_recipients() == ["owner@example.com"]
+
+
+def test_admin_overview_lists_payment_history(world):
+    trades, _ = world
+    trades["Live"].append(_trade("c1", "2026-10-06", 1000.0))
+    trades["Live"].append(_trade("c2", "2026-10-06", 500.0))
+    commission.set_rate("c1", 20, effective_from=LAST)
+    commission.set_rate("c2", 10, effective_from=LAST)
+    commission.sync("c1")
+    commission.mark_paid("c1", LAST, "R1")
+    payments = commission.admin_overview()["payments"]
+    assert [(p["username"], p["amount"], p["paid_ref"]) for p in payments] \
+        == [("c1", 200.0, "R1")]
+    assert payments[0]["display_name"]

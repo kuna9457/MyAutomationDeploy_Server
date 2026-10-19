@@ -431,6 +431,21 @@ def admin_set_status(username: str, week: str, status: str) -> dict:
     return row
 
 
+def delete_client_invoices(username: str) -> int:
+    """Remove every invoice of one client — used only when the account itself
+    is deleted. Returns how many were removed."""
+    if not username:
+        return 0
+    col = _col()
+    if col is not None:
+        return int(col.delete_many({"username": username}).deleted_count)
+    with _lock:
+        data = _read_local()
+        keep = {k: v for k, v in data.items() if v.get("username") != username}
+        _write_local(keep)
+        return len(data) - len(keep)
+
+
 # --------------------------------------------------------------------------- #
 #  Views
 # --------------------------------------------------------------------------- #
@@ -493,9 +508,17 @@ def admin_overview() -> dict:
         row["display_name"] = user.get("display_name") or user["username"]
         row["account_status"] = user.get("status", "active")
         clients.append(row)
+    payments = sorted(
+        ({**inv, "display_name": c["display_name"]}
+         for c in clients for inv in c["invoices"]
+         if inv["status"] in (PAID, VERIFIED)),
+        key=lambda i: i.get("paid_at") or i.get("verified_at") or "",
+        reverse=True)
     return {
         "settings": cfg,
         "backend": backend(),
+        #: Every payment across clients, newest first — the admin's history.
+        "payments": payments,
         "ledger_shared": _ledger_is_shared(),
         "totals": {k: round(sum(c[k] for c in clients), 2)
                    for k in ("total_due", "total_paid", "total_unverified")},

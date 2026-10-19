@@ -168,6 +168,22 @@ def _update(user_id: str, patch: dict[str, Any]) -> Optional[dict]:
     return None
 
 
+def delete_user(user_id: str) -> bool:
+    """Permanently remove one CLIENT account record (credentials and broker
+    tokens go with it — they live on the record). Never deletes an admin."""
+    with _lock:
+        if _db is not None:
+            res = _db["users"].delete_one({"user_id": user_id, "role": "client"})
+            return bool(res.deleted_count)
+        users = _read_local()
+        keep = [u for u in users
+                if not (u["user_id"] == user_id and u.get("role") == "client")]
+        if len(keep) == len(users):
+            return False
+        _write_local(keep)
+        return True
+
+
 def set_status(user_id: str, status: str) -> Optional[dict]:
     return _public(_update(user_id, {"status": status}))
 
