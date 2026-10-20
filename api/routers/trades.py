@@ -27,6 +27,15 @@ router = APIRouter(prefix="/trades", tags=["trades"])
 
 _db = DBManager()
 
+# Which strategy took a trade, and the setup that fired, are the admin's edge. A
+# client's own rows keep every number; these fields are withheld server-side
+# because the UI hiding them does not stop a client reading the raw JSON.
+_STRATEGY_FIELDS = ("strategy", "entry_reason")
+
+
+def _is_client(user: CurrentUser) -> bool:
+    return user.role == "client"
+
 
 def _env(environment: str) -> Environment:
     try:
@@ -61,7 +70,11 @@ def list_trades(environment: str = "Paper", category: str = "",
                 user: CurrentUser = Depends(get_current_user)):
     df = _db.get_trades(_env(environment), user_id=user.username,
                         category=_category(category) or None)
-    return df.to_dict("records") if not df.empty else []
+    if df.empty:
+        return []
+    if _is_client(user):
+        df = df.drop(columns=list(_STRATEGY_FIELDS), errors="ignore")
+    return df.to_dict("records")
 
 
 @router.get("/analytics")
@@ -85,13 +98,20 @@ def daily_pnl(environment: str = "Paper", category: str = "",
               user: CurrentUser = Depends(get_current_user)):
     df = _db.daily_pnl(_env(environment), user_id=user.username,
                        category=_category(category) or None)
-    return df.to_dict("records") if not df.empty else []
+    if df.empty:
+        return []
+    if _is_client(user):
+        df = df.drop(columns=["Strategies"], errors="ignore")
+    return df.to_dict("records")
 
 
 @router.get("/by-strategy")
 def by_strategy(environment: str = "Paper", category: str = "",
                 user: CurrentUser = Depends(get_current_user)):
-    """All-time P&L per strategy, best first — which edge actually earns."""
+    """All-time P&L per strategy, best first — which edge actually earns.
+    Admin only: a client gets nothing, not an anonymised version."""
+    if _is_client(user):
+        return []
     df = _db.strategy_summary(_env(environment), user_id=user.username,
                               category=_category(category) or None)
     return df.to_dict("records") if not df.empty else []
@@ -102,7 +122,9 @@ def daily_strategy_pnl(environment: str = "Paper", category: str = "",
                        user: CurrentUser = Depends(get_current_user)):
     """One row per trading day × strategy: on this day, this strategy traded
     this many symbols and made this much. Each day's rows sum to that day's
-    /daily-pnl total."""
+    /daily-pnl total. Admin only (a client gets nothing)."""
+    if _is_client(user):
+        return []
     df = _db.daily_strategy_pnl(_env(environment), user_id=user.username,
                                 category=_category(category) or None)
     return df.to_dict("records") if not df.empty else []
@@ -110,7 +132,8 @@ def daily_strategy_pnl(environment: str = "Paper", category: str = "",
 
 @router.get("/export")
 def export_excel(environment: str = "Paper", user: CurrentUser = Depends(get_current_user)):
-    path = _db.export_excel(_env(environment), user_id=user.username)
+    path = _db.export_excel(_env(environment), user_id=user.username,
+                            include_strategy=not _is_client(user))
     if not path or not os.path.exists(path):
         raise HTTPException(500, "Export failed.")
     return FileResponse(

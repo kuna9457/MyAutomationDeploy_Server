@@ -781,8 +781,12 @@ class DBManager:
         return out.reset_index(drop=True)
 
     def export_excel(self, env: Environment, path: Optional[str] = None,
-                     user_id: Optional[str] = None) -> str:
-        """High-level analysis workbook: raw trades + a summary sheet."""
+                     user_id: Optional[str] = None,
+                     include_strategy: bool = True) -> str:
+        """High-level analysis workbook: raw trades + a summary sheet.
+
+        `include_strategy=False` (a client's download) leaves out the strategy
+        and entry-reason columns and the per-strategy sheets."""
         if path is None:
             stamp = config.now_ist().strftime("%Y%m%d_%H%M%S")
             path = os.path.join(config.LOCAL_DB_DIR,
@@ -792,6 +796,10 @@ class DBManager:
         daily = self.daily_pnl(env, user_id=user_id)
         by_strategy = self.strategy_summary(env, user_id=user_id)
         daily_by_strategy = self.daily_strategy_pnl(env, user_id=user_id)
+        if not include_strategy:
+            trades = trades.drop(columns=["strategy", "entry_reason"],
+                                 errors="ignore")
+            daily = daily.drop(columns=["Strategies"], errors="ignore")
 
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             (trades if not trades.empty else pd.DataFrame(
@@ -802,9 +810,11 @@ class DBManager:
             daily.to_excel(writer, sheet_name="Daily PnL", index=False)
             # The permanent per-strategy record: which edge earned what, and
             # the same thing broken down day by day.
-            by_strategy.to_excel(writer, sheet_name="By Strategy", index=False)
-            daily_by_strategy.to_excel(
-                writer, sheet_name="Daily by Strategy", index=False)
+            if include_strategy:
+                by_strategy.to_excel(writer, sheet_name="By Strategy",
+                                     index=False)
+                daily_by_strategy.to_excel(
+                    writer, sheet_name="Daily by Strategy", index=False)
             if not trades.empty and "mode" in trades:
                 by_mode = trades[trades["status"] == "CLOSED"].groupby("mode")[
                     "realized_pnl"].agg(["count", "sum", "mean"])

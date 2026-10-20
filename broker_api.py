@@ -29,6 +29,7 @@ than blocking trading on a missing feature).
 """
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -119,6 +120,47 @@ class OrderResult:
 # --------------------------------------------------------------------------- #
 PROT_GTT = "gtt"
 PROT_ORDER = "order"
+
+
+def vwap_of_fills(fills) -> Optional[tuple[float, int]]:
+    """(volume-weighted average price, total quantity) of (price, qty) fills,
+    or None when there is nothing usable. One order can fill in several pieces,
+    so the order's price is the weighted mean — not the last piece, not the first."""
+    total_qty = 0
+    total_val = 0.0
+    for price, qty in fills:
+        try:
+            p, q = float(price), int(float(qty))
+        except (TypeError, ValueError):
+            continue
+        if p > 0 and q > 0:
+            total_qty += q
+            total_val += p * q
+    if total_qty <= 0:
+        return None
+    return round(total_val / total_qty, 4), total_qty
+
+
+def poll_fill(fetch, want_qty: int, timeout: float,
+              interval: float = 0.25) -> Optional[tuple[float, int]]:
+    """Call `fetch()` -> (avg_price, qty) | None until `want_qty` has filled or
+    `timeout` seconds pass. A partial fill seen at the deadline is returned as
+    is (its price is still the real one); nothing seen returns None. `fetch`
+    may raise — an unreadable lookup is the same as no answer."""
+    deadline = time.monotonic() + max(timeout, 0.0)
+    best: Optional[tuple[float, int]] = None
+    while True:
+        try:
+            got = fetch()
+        except Exception:
+            got = None
+        if got is not None:
+            best = got
+            if got[1] >= int(want_qty):
+                return best
+        if time.monotonic() >= deadline:
+            return best
+        time.sleep(interval)
 
 
 def _prot_encode(kind: str, raw_id: str) -> str:
@@ -281,6 +323,32 @@ class BaseBroker:
         broker-side protection for them."""
         return []
 
+    def confirm_fill(self, order_id: str, quantity: int,
+                     timeout: float = 2.5) -> Optional[tuple[float, int]]:
+        """The price the broker ACTUALLY filled this order at, as
+        (average_price, filled_quantity), or None when it can't be read.
+
+        place_*_order returns an order id, not a fill, so OrderResult.filled_price
+        is only what was asked for (the signal price for a market order). This is
+        the read-only follow-up that fetches the real thing. None means "keep the
+        price you already had" — never an error — so a broker that doesn't
+        implement it, or a lookup that times out, behaves exactly as before."""
+        return None
+
+    def day_realized_pnl(self) -> Optional[float]:
+        """Today's REALISED P&L as the broker itself reports it (gross of
+        charges, every position in the account), or None when unavailable.
+        Read-only; used only to cross-check the bot's own ledger."""
+        return None
+
+    def find_exit_fill(self, instrument: Instrument,
+                       exit_side: str) -> Optional[float]:
+        """Average price of the most recent `exit_side` order the broker filled
+        today in this instrument — for an exit the BROKER placed itself (a
+        resting SL/GTT that fired before the bot's own square-off). None when
+        unknown. Read-only."""
+        return None
+
     def square_off(
         self, instrument: Instrument, side: str, quantity: int,
         ref_price: float = 0.0,
@@ -417,6 +485,52 @@ class UpstoxBroker(BaseBroker):
                           ref_price=0.0):
         return self._place(instrument, side, quantity, "LIMIT", limit_price,
                            ref_price)
+
+    def confirm_fill(self, order_id, quantity, timeout=2.5):
+        # LIVE only: the sandbox's fills are simulated, so there is no real
+        # price to prefer over the one the bot already has.
+        if self.sandbox or self._order_api is None or not order_id:
+            return None
+
+        def fetch():
+            resp = self._order_api.get_trades_by_order(order_id, api_version="v2")
+            return vwap_of_fills(
+                (t.average_price, t.quantity)
+                for t in (getattr(resp, "data", None) or []))
+
+        return poll_fill(fetch, quantity, timeout)
+
+    def day_realized_pnl(self):
+        if self.sandbox or self._client is None:
+            return None
+        try:
+            import upstox_client  # type: ignore
+            resp = upstox_client.PortfolioApi(self._client).get_positions(
+                api_version="v2")
+            return round(sum(float(getattr(p, "realised", 0) or 0)
+                             for p in (getattr(resp, "data", None) or [])), 2)
+        except Exception:
+            return None
+
+    def find_exit_fill(self, instrument, exit_side):
+        if self.sandbox or self._order_api is None:
+            return None
+        try:
+            resp = self._order_api.get_trade_history(api_version="v2")
+            rows = [t for t in (getattr(resp, "data", None) or [])
+                    if t.instrument_token == instrument.instrument_key
+                    and str(t.transaction_type).upper() == exit_side]
+            if not rows:
+                return None
+            # Fills of the LATEST such order only — earlier round trips in the
+            # same instrument today are not this exit.
+            rows.sort(key=lambda t: str(t.order_timestamp or ""))
+            last = rows[-1].order_id
+            got = vwap_of_fills((t.average_price, t.quantity)
+                                for t in rows if t.order_id == last)
+            return got[0] if got else None
+        except Exception:
+            return None
 
     def required_margin(self, instrument, quantity, side="BUY", ref_price=0.0):
         # ref_price is ignored: Upstox's margin API prices against its own live
@@ -775,6 +889,49 @@ class ZerodhaBroker(BaseBroker):
                           ref_price=0.0):
         return self._place(instrument, side, quantity, "LIMIT", limit_price,
                            ref_price)
+
+    def confirm_fill(self, order_id, quantity, timeout=2.5):
+        if self._kite is None or not order_id:
+            return None
+
+        def fetch():
+            return vwap_of_fills(
+                (t.get("average_price"), t.get("quantity", t.get("filled")))
+                for t in (self._kite.order_trades(order_id) or []))
+
+        return poll_fill(fetch, quantity, timeout)
+
+    def day_realized_pnl(self):
+        if self._kite is None:
+            return None
+        try:
+            day = (self._kite.positions() or {}).get("day", []) or []
+            return round(sum(float(p.get("realised", 0) or 0) for p in day), 2)
+        except Exception:
+            return None
+
+    def find_exit_fill(self, instrument, exit_side):
+        # A GTT/SL that fired at Kite becomes an ordinary order, so it shows up
+        # in the day's trades like any other.
+        if self._kite is None:
+            return None
+        symbol = self._kite_symbol(instrument)
+        if symbol is None:
+            return None
+        try:
+            rows = [t for t in (self._kite.trades() or [])
+                    if t.get("tradingsymbol") == symbol
+                    and str(t.get("transaction_type", "")).upper() == exit_side]
+            if not rows:
+                return None
+            rows.sort(key=lambda t: str(t.get("fill_timestamp")
+                                        or t.get("order_timestamp") or ""))
+            last = rows[-1].get("order_id")
+            got = vwap_of_fills((t.get("average_price"), t.get("quantity"))
+                                for t in rows if t.get("order_id") == last)
+            return got[0] if got else None
+        except Exception:
+            return None
 
     def required_margin(self, instrument, quantity, side="BUY", ref_price=0.0):
         if self._kite is None:

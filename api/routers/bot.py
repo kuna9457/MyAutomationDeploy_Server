@@ -642,7 +642,37 @@ def bot_status(user: CurrentUser = Depends(get_current_user)):
                        "entry_skip_minutes", "use_limit_entry"):
             run_config.pop(secret, None)
     out["run_config"] = run_config
+    if user.role == "client":
+        _strip_strategy_for_client(out, [e.group_key for e in engines])
     return out
+
+
+def _strip_strategy_for_client(out: dict, group_keys: list[str]) -> None:
+    """Remove every place the status payload names a strategy. The UI already
+    hides these, but a client can read the raw JSON, so they are withheld here
+    too: the board, the per-strategy P&L tables, the day table's strategy
+    column, each signal's setup text, and the `[strategy]` prefix the merged
+    log puts on each line."""
+    for key in ("groups", "strategy_pnl", "daily_strategy_pnl"):
+        out.pop(key, None)
+    out["daily_pnl"] = [{k: v for k, v in row.items() if k != "Strategies"}
+                        for row in (out.get("daily_pnl") or [])]
+    out["last_signals"] = [{k: v for k, v in sig.items() if k != "reason"}
+                           for sig in (out.get("last_signals") or [])]
+    prefixes = tuple(f"[{k}] " for k in group_keys if k)
+
+    def clean(line: str) -> str:
+        for p in prefixes:
+            if line.startswith(p):
+                line = line[len(p):]
+                break
+        # An ENTER line ends with " | <the setup that fired>" — the same text
+        # the signal's `reason` carries.
+        if line.startswith("ENTER ") and " | " in line:
+            line = line.rsplit(" | ", 1)[0]
+        return line
+
+    out["log"] = [clean(line) for line in (out.get("log") or [])]
 
 
 def _client_runner_key() -> str:
@@ -711,6 +741,16 @@ def broker_positions(user: CurrentUser = Depends(get_current_user)):
     if eng is None:
         return []
     return eng.broker_positions()
+
+
+@router.get("/reconcile")
+def reconcile(user: CurrentUser = Depends(get_current_user)):
+    """Today's P&L in our ledger vs the caller's own broker. Read-only, scoped
+    to the caller's own engine."""
+    eng = engine_registry.get_engine(user.username)
+    if eng is None:
+        return {"available": False, "reason": "Bot not started."}
+    return eng.reconcile_day()
 
 
 @router.get("/broker-protection")

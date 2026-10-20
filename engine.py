@@ -1289,6 +1289,37 @@ class TradingEngine:
         return round(round(px / tick) * tick, 2)
 
     # -- order handling ----------------------------------------------------- #
+    def _real_fill(self, inst: Instrument, res, qty: int, assumed: float,
+                   what: str) -> float:
+        """The price the broker actually filled `res` at, else `assumed`.
+
+        An order call returns an id, not a fill, so every price the bot books
+        from it is otherwise the price it ASKED for — which is what made the
+        weekly total drift from the client's own broker P&L. LIVE only: paper and
+        simulated fills are the assumed price by definition. Read-only, and any
+        failure or timeout returns `assumed`, so the trade is booked exactly as
+        it was before this existed."""
+        if self.environment != Environment.LIVE or not getattr(res, "ok", False):
+            return assumed
+        confirm = getattr(self.broker, "confirm_fill", None)
+        if confirm is None or not getattr(res, "order_id", ""):
+            return assumed
+        try:
+            got = confirm(res.order_id, qty)
+        except Exception:
+            got = None
+        if not got or got[0] <= 0:
+            self.state.push_log(
+                f"{inst.symbol}: {what} fill not readable from the broker — "
+                f"booked at {assumed:.2f}; the daily reconcile will flag any gap.")
+            return assumed
+        price = float(got[0])
+        if abs(price - assumed) >= 0.005:
+            self.state.push_log(
+                f"{inst.symbol}: {what} filled @ {price:.2f} (assumed "
+                f"{assumed:.2f}, slippage {price - assumed:+.2f}).")
+        return price
+
     def _enter(self, inst: Instrument, sig, qty: int, risk_amt: float,
                quote: Optional[LiveQuote] = None, qty_clip_note: str = "",
                lev: Optional[float] = None) -> bool:
@@ -1317,7 +1348,8 @@ class TradingEngine:
         # sized its stop off the candle close, but a limit can fill elsewhere, and
         # the RR contract (1:1 scalp, 1:2 intraday, 1:3 swing) is defined from the
         # real entry. Distance is preserved; only the anchor moves.
-        fill = res.filled_price or sig.entry_price
+        fill = self._real_fill(inst, res, qty,
+                               res.filled_price or sig.entry_price, "entry")
         risk_dist = abs(sig.entry_price - sig.stop_loss)
         # Snap the stop to the instrument's tick grid — an off-tick stop price is
         # not a placeable order. Round AWAY from entry (down for a long, up for a
@@ -1600,6 +1632,7 @@ class TradingEngine:
         mult = max(inst.contract_multiplier, 1)
 
         res = self.broker.square_off(inst, side, exit_qty, price)
+        price = self._real_fill(inst, res, exit_qty, price, "partial exit")
 
         # Same entry, same strategy, so analytics group it with its parent;
         # the reason names it a partial. stop_loss is the parent's stop as it
@@ -1909,10 +1942,22 @@ class TradingEngine:
                 "its own protective order likely fired first. Skipping a "
                 "duplicate square-off order.")
             order_id = "already-flat"
+            # The broker's own protective order closed it, so the price to
+            # book is what THAT order filled at — not the level we computed.
+            find = getattr(self.broker, "find_exit_fill", None)
+            if find is not None:
+                try:
+                    px = find(inst, "SELL" if trade["side"] == "BUY" else "BUY")
+                except Exception:
+                    px = None
+                if px and px > 0:
+                    exit_price = float(px)
         else:
             res = self.broker.square_off(inst, trade["side"], trade["quantity"],
                                          exit_price)
             order_id = res.order_id
+            exit_price = self._real_fill(inst, res, trade["quantity"],
+                                         exit_price, "exit")
 
         closed = self.db.close_trade(trade["trade_id"], exit_price,
                                      self.environment, exit_reason=reason)
@@ -1929,6 +1974,29 @@ class TradingEngine:
             f"PnL ₹{pnl:,.2f} (order {order_id})")
         self._recompute_unrealized()
         return pnl
+
+    def reconcile_day(self) -> dict:
+        """Today's realised P&L in the bot's ledger vs the broker's own figure.
+
+        Read-only and LIVE only: it changes nothing, it just makes a gap
+        visible the day it appears instead of at the weekly commission. The
+        broker figure covers the whole account (and is gross of charges), so a
+        hand-placed trade in the same account shows up here as a gap too."""
+        if self.environment != Environment.LIVE:
+            return {"available": False, "reason": "Only Live trades are "
+                    "reconciled against a broker."}
+        ledger = self.db.today_realized(self.environment, user_id=self.user_id)
+        fn = getattr(self.broker, "day_realized_pnl", None)
+        try:
+            broker_val = fn() if fn else None
+        except Exception:
+            broker_val = None
+        if broker_val is None:
+            return {"available": False, "ledger": ledger,
+                    "reason": "This broker does not report day P&L."}
+        gap = round(ledger - broker_val, 2)
+        return {"available": True, "ledger": ledger, "broker": broker_val,
+                "gap": gap, "matches": abs(gap) < 1.0}
 
     def reset_portfolio(self) -> dict:
         """Full reset: permanently delete this environment's entire trade history
