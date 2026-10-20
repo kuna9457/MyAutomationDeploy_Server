@@ -910,6 +910,25 @@ class ZerodhaBroker(BaseBroker):
         except Exception:
             return None
 
+    def day_fills(self) -> Optional[list[dict]]:
+        """Every fill in this Kite account today, raw, or None if unreadable.
+        Read-only; broker_sync.py rebuilds the Live trade log from it."""
+        if self._kite is None:
+            return None
+        try:
+            return list(self._kite.trades() or [])
+        except Exception:
+            return None
+
+    def day_positions(self) -> Optional[dict]:
+        """Kite's {"day": [...], "net": [...]} positions, or None. Read-only."""
+        if self._kite is None:
+            return None
+        try:
+            return self._kite.positions() or {}
+        except Exception:
+            return None
+
     def find_exit_fill(self, instrument, exit_side):
         # A GTT/SL that fired at Kite becomes an ordinary order, so it shows up
         # in the day's trades like any other.

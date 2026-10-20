@@ -27,6 +27,9 @@ from config import Environment
 
 PAPER_COLLECTION = "paper_trades"
 LIVE_COLLECTION = "live_trades"
+#: One record per (account, day, broker) whose Live trades were rebuilt from
+#: the broker's fills — see broker_sync.py and DBManager._apply_broker_overlay.
+BROKER_SYNC_COLLECTION = "broker_syncs"
 
 #: Indexes are created once per process, not once per DBManager — see
 #: DBManager._ensure_indexes.
@@ -112,6 +115,8 @@ class DBManager:
                 coll = self.db[coll_name]
                 coll.create_index("trade_id", unique=True)
                 coll.create_index([("status", 1), ("timestamp", -1)])
+            self.db[BROKER_SYNC_COLLECTION].create_index(
+                [("user_id", 1), ("day", 1), ("broker", 1)], unique=True)
             _indexes_ready = True
         except Exception as exc:
             print(f"[DBManager] Index setup skipped ({exc}).")
@@ -353,12 +358,18 @@ class DBManager:
             return [json.loads(line) for line in fh if line.strip()]
 
     def get_trades(self, env: Environment, user_id: Optional[str] = None,
-                   category: Optional[str] = None) -> pd.DataFrame:
+                   category: Optional[str] = None,
+                   broker_overlay: bool = True) -> pd.DataFrame:
         """`user_id=None` (the default every pre-multi-tenant caller uses)
         returns every trade in the environment, unfiltered — identical to
         Phase 1. Pass a user_id to scope to one account's own trades; trades
         stored before the user_id field existed are treated as "admin" so
-        old data isn't silently dropped from your own history."""
+        old data isn't silently dropped from your own history.
+
+        LIVE: where broker_sync.py has rebuilt an account's day from the
+        broker's fills, the bot's own CLOSED rows for that day are left out so
+        every report reads the broker's numbers (see `_apply_broker_overlay`).
+        `broker_overlay=False` returns the raw ledger, bot rows included."""
         if self.db is not None:
             try:
                 docs = list(self.db[_collection_name(env)].find({}, {"_id": 0}))
@@ -384,6 +395,8 @@ class DBManager:
         # None), so the substitution only sticks once the column can actually
         # hold a Python None.
         df = df.astype(object).where(df.notna(), None)
+        if env == Environment.LIVE and broker_overlay:
+            df = self._apply_broker_overlay(df)
         if user_id is not None:
             owner = df["user_id"] if "user_id" in df.columns else pd.Series("admin", index=df.index)
             owner = owner.fillna("admin")
@@ -413,6 +426,116 @@ class DBManager:
             if category:
                 df = df[df["category"] == category].reset_index(drop=True)
         return df
+
+    # -- broker-sourced Live log (broker_sync.py) ---------------------------- #
+    def _syncs_path(self) -> str:
+        return os.path.join(config.LOCAL_DB_DIR, f"{BROKER_SYNC_COLLECTION}.jsonl")
+
+    def broker_syncs(self) -> list[dict]:
+        """Every broker sync record ({user_id, day, broker, unresolved, ...})."""
+        if self.db is not None:
+            try:
+                return list(self.db[BROKER_SYNC_COLLECTION].find({}, {"_id": 0}))
+            except Exception as exc:
+                self._demote_to_local(exc, "broker-sync read")
+        path = self._syncs_path()
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def broker_sync_record(self, user_id: str, day: str) -> Optional[dict]:
+        for rec in self.broker_syncs():
+            if rec.get("user_id") == user_id and rec.get("day") == day:
+                return rec
+        return None
+
+    def _apply_broker_overlay(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Hide the bot's own CLOSED rows on every (account, day, broker) the
+        broker's fills have been synced for — the broker rows stand in for them.
+
+        Never hidden: OPEN rows (the engine manages positions from them), the
+        broker's own rows, and rows for a ticker the sync left UNRESOLVED (a
+        position that did not start and end flat that day), which have no
+        broker row standing in for them."""
+        syncs = self.broker_syncs()
+        if df.empty or not syncs:
+            return df
+        covered = {(s.get("user_id"), s.get("day"), s.get("broker")):
+                   set(s.get("unresolved") or []) for s in syncs}
+        col = lambda name: (list(df[name]) if name in df.columns  # noqa: E731
+                            else [None] * len(df))
+        keep = []
+        for owner, ts, broker, status, ticker, source in zip(
+                col("user_id"), col("timestamp"), col("broker"), col("status"),
+                col("ticker"), col("source")):
+            unresolved = covered.get((owner or "admin", self._trade_day(ts), broker))
+            keep.append(source == "broker" or status != "CLOSED"
+                        or unresolved is None or ticker in unresolved)
+        return df[keep].reset_index(drop=True)
+
+    def replace_broker_day(self, user_id: str, day: str, broker: str,
+                           docs: list[dict], record: dict) -> None:
+        """Swap in one account's broker-rebuilt trades for one day, then its
+        sync record. Rows first: until the record lands the bot's rows still
+        show, so a crash between the two can only ever over-show, never lose
+        a day."""
+        env = Environment.LIVE
+        query = {"source": "broker", "user_id": user_id, "broker_day": day,
+                 "broker": broker}
+        if self.db is not None:
+            try:
+                coll = self.db[_collection_name(env)]
+                coll.delete_many(query)
+                if docs:
+                    from pymongo.errors import BulkWriteError
+                    try:
+                        coll.insert_many([dict(d) for d in docs], ordered=False)
+                    except BulkWriteError:
+                        # Ids are deterministic per account/day/trip, so a
+                        # duplicate is the same trade written by a concurrent
+                        # sync (two servers) — not a failure.
+                        pass
+                self.db[BROKER_SYNC_COLLECTION].replace_one(
+                    {"user_id": user_id, "day": day, "broker": broker},
+                    dict(record), upsert=True)
+                self.sync_excel_log(env)
+                return
+            except Exception as exc:
+                self._demote_to_local(exc, "broker-sync write")
+        rows = [r for r in self._read_local(env)
+                if not all(r.get(k) == v for k, v in query.items())]
+        rows.extend(docs)
+        with open(self._local_path(env), "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        recs = [r for r in self.broker_syncs()
+                if not (r.get("user_id") == user_id and r.get("day") == day
+                        and r.get("broker") == broker)]
+        recs.append(record)
+        with open(self._syncs_path(), "w", encoding="utf-8") as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+        self.sync_excel_log(env)
+
+    def _clear_broker_syncs(self, user_id: Optional[str]) -> None:
+        """Drop sync records with the trades they described, so a fresh book
+        isn't hidden by a record for rows that no longer exist."""
+        query = {} if user_id is None else {"user_id": user_id}
+        if self.db is not None:
+            try:
+                self.db[BROKER_SYNC_COLLECTION].delete_many(query)
+                return
+            except Exception as exc:
+                self._demote_to_local(exc, "broker-sync reset")
+        path = self._syncs_path()
+        if not os.path.exists(path):
+            return
+        kept = [r for r in self.broker_syncs()
+                if user_id is not None and r.get("user_id") != user_id]
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in kept:
+                fh.write(json.dumps(r) + "\n")
 
     def get_open_trades(self, env: Environment, user_id: Optional[str] = None) -> list[dict]:
         df = self.get_trades(env, user_id=user_id)
@@ -607,6 +730,8 @@ class DBManager:
                     for r in kept:
                         fh.write(json.dumps(r) + "\n")
             self.sync_excel_log(env)   # re-sync (not delete) — other users' trades remain
+        if env == Environment.LIVE:
+            self._clear_broker_syncs(user_id)
         print(f"[DBManager] Reset {_collection_name(env)}"
               f"{f' for user {user_id}' if user_id else ''}: removed {removed} "
               f"trade(s).")

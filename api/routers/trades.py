@@ -18,7 +18,8 @@ import os
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
-from api.auth import CurrentUser, get_current_user
+from api.auth import CurrentUser, get_current_user, require_admin
+import broker_sync
 import config
 from config import Environment
 from db_manager import DBManager
@@ -128,6 +129,36 @@ def daily_strategy_pnl(environment: str = "Paper", category: str = "",
     df = _db.daily_strategy_pnl(_env(environment), user_id=user.username,
                                 category=_category(category) or None)
     return df.to_dict("records") if not df.empty else []
+
+
+_SYNC_FIELDS = ("day", "synced_at", "trades", "manual", "unresolved",
+                "ledger_total", "broker_realised", "gap")
+
+
+@router.get("/broker-sync")
+def broker_sync_status(user: CurrentUser = Depends(get_current_user)):
+    """The caller's last broker sync for today, if any. Read-only."""
+    rec = _db.broker_sync_record(user.username, broker_sync.today())
+    if rec is None:
+        return {"synced": False, "day": broker_sync.today()}
+    return {"synced": True, **{k: rec.get(k) for k in _SYNC_FIELDS},
+            "matches": abs(float(rec.get("gap") or 0)) < 1.0}
+
+
+@router.post("/broker-sync")
+def broker_sync_now(user: CurrentUser = Depends(get_current_user)):
+    """Rebuild the caller's own Live trades for today from their Kite fills."""
+    return broker_sync.sync_user(user.username, db=_db)
+
+
+@router.post("/broker-sync/all")
+def broker_sync_everyone(_admin: CurrentUser = Depends(require_admin)):
+    """Admin: sync every account this server holds a Kite session for."""
+    results = broker_sync.sync_all(db=_db)
+    return {"total": len(results),
+            "synced": [r["username"] for r in results if r.get("ok")],
+            "skipped": [{"username": r["username"], "reason": r.get("reason", "")}
+                        for r in results if not r.get("ok")]}
 
 
 @router.get("/export")

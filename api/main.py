@@ -55,6 +55,10 @@ async def _lifespan(_app: FastAPI):
     import mcx_rollover
     # Roll MCX futures before they expire — now, then every few hours.
     mcx_rollover.start_background()
+    # Rebuild every Kite account's Live trade log from its real fills, through
+    # the session and after the close (broker_sync.py).
+    import broker_sync
+    broker_sync.start_background()
     if hub_link.start_if_worker():
         pass
     else:
